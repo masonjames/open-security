@@ -42,10 +42,10 @@ affects a supported release.
 ## Threat model
 
 Codex Security is a local developer tool. Its default security model is a
-**trusted local operator analyzing a repository the operator has selected and
-trusts on the same machine**. The selected repository, local Git installation,
-operating-system account, and explicitly configured tools are not mutually
-untrusted security principals.
+**trusted local operator analyzing a locally selected repository that the
+operator trusts and either owns or is explicitly authorized to assess**. The
+selected repository, local Git installation, operating-system account, and
+explicitly configured tools are not mutually untrusted security principals.
 
 The operator authorizes the selected checkout, repository scope, standard Git
 operations, local credentials, and explicitly supplied configuration. Normal
@@ -77,13 +77,20 @@ Git operation or model-visible repository content.
   files, scan targets, or output locations.
 - **Credential handling and egress.** Do not disclose API keys, Codex login
   credentials, private source, or sensitive scan state in model prompts, logs,
-  error messages, reports, network requests, or subprocess environments where
-  that disclosure is not necessary for the requested operation. Local access
-  already held by the trusted operator is not itself a disclosure.
-- **Configured Codex controls.** Respect the filesystem, execution, approval,
-  and network restrictions actually configured for the operation. The local
-  product does not claim a stronger repository-isolation boundary than those
-  configured controls provide.
+  error messages, reports, or network requests beyond what the operator
+  authorizes. Scan and workbench subprocesses can inherit the operator's
+  environment; unrelated credentials are not comprehensively filtered. Provide
+  only the credentials needed for the operation. Local access already held by
+  the trusted operator is not itself a disclosure or subprocess-isolation
+  boundary.
+- **Effective scan controls.** Scans use the product's own
+  `codex_security_scan` filesystem profile and noninteractive
+  `approvalPolicy: "never"`. The profile allows reads of the local filesystem
+  and writes to workspace roots and the selected scan state directory. Codex
+  configuration overrides do not replace this approval policy or narrow the
+  scan-owned filesystem profile. Assess the actual scan permissions and
+  independently enforced host or network restrictions, not a stricter override
+  that the scan does not apply.
 - **Target and output authorization.** Do not silently include unrelated host
   files in a scan or model request, and do not write outside the output
   locations authorized by the operator. Assess symlinks and file replacement
@@ -103,8 +110,8 @@ boundaries in an official release. Examples include:
 
 - Unauthorized disclosure of credentials, private source, or scan results to
   another actual security principal, model request, or network destination.
-- Model or remote input that bypasses the operation's configured approval,
-  execution, filesystem, or network policy.
+- Model or remote input that bypasses the scan's effective permissions or an
+  independently enforced host, execution, filesystem, or network restriction.
 - An unexpected scan, patch, file write, or network request outside the action
   and scope authorized by the local operator.
 - Path traversal, symlinks, archives, or file-replacement races that cause an
@@ -187,9 +194,12 @@ services, not findings in unrelated projects.
 
 ## Run scans safely
 
-- Scan only repositories you trust, own, or have explicit permission to assess.
+- Scan only repositories you trust and either own or have explicit permission
+  to assess.
 - Review repository instructions and proposed patches as data; approve a patch
   before applying or merging it.
+- Run scans with only the credentials the operation needs; local subprocesses
+  can inherit other environment variables.
 - Keep credentials and the Codex home outside the scanned repository.
 - Store scan state, findings, reports, logs, and SARIF outside the enclosing
   Git worktree.

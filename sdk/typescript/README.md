@@ -192,6 +192,9 @@ Scans use `gpt-5.6-sol` with extra-high reasoning effort by default. Use
 options for other Codex settings, such as
 `--codex 'model_reasoning_effort="high"'`.
 
+Codex configuration overrides do not replace the scan-owned approval policy or
+filesystem permissions. See [Local security model](#local-security-model).
+
 Scan progress identifies the requested paths and reports actual ranking,
 file-review, validation, and attack-path phases as they become available.
 Completion summarizes findings, severity, coverage, elapsed time, available
@@ -341,18 +344,31 @@ authorization failures stop immediately.
 
 ## Local security model
 
-Codex Security is a locally invoked CLI and SDK. The operator, selected
-repository, local Git installation, and explicitly configured tools run under
-the same trusted operating-system account. Normal Git operations and access to
-scan state shared by that account are not multi-user or sandbox-isolation
-boundaries.
+Codex Security is a locally invoked CLI and SDK. Scan only a repository that
+you trust and either own or are explicitly authorized to assess. The operator,
+selected repository, local Git installation, and explicitly configured tools
+run under the same trusted operating-system account. Normal Git operations and
+access to scan state shared by that account are not multi-user or
+sandbox-isolation boundaries.
 
-The product must still respect the selected target and output paths,
-configured Codex approvals and network controls, and the confidentiality of
-credentials, private source, and scan artifacts. A completed scan must
-accurately represent the documented scan mode, reviewed scope, and coverage.
-Consult the security policy for supported threat models, out-of-scope local
-behaviors, and private vulnerability reporting.
+Scans use the product's own `codex_security_scan` filesystem profile and
+noninteractive `approvalPolicy: "never"`. The profile allows reads of the local
+filesystem and writes to workspace roots and the selected scan state directory.
+`--codex` and SDK `codexOverrides` do not replace this approval policy or narrow
+the scan-owned filesystem profile. Independently enforced host and network
+restrictions still apply.
+
+Scan and workbench subprocesses can inherit the operator's environment. Do not
+assume unrelated API tokens or cloud credentials are removed; run a scan with
+only the environment credentials its operation requires.
+
+The product must still respect the selected target and output paths, its actual
+scan permissions, and independently enforced host and network restrictions. It
+must not disclose credentials, private source, or scan artifacts beyond what
+the operator authorizes. A completed scan must accurately represent the
+documented scan mode, reviewed scope, and coverage. Consult the security policy
+for supported threat models, out-of-scope local behaviors, and private
+vulnerability reporting.
 
 ## Documentation and security
 
