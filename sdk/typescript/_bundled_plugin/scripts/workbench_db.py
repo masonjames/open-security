@@ -547,6 +547,23 @@ def expected_target_kinds(scan: sqlite3.Row) -> list[str]:
     return ["git_worktree"]
 
 
+def authoritative_target_kind(scan: sqlite3.Row) -> str:
+    """Select the single target kind backed by authoritative workbench coordinates."""
+
+    allowed_kinds = expected_target_kinds(scan)
+    if len(allowed_kinds) == 1:
+        return allowed_kinds[0]
+    if (
+        set(allowed_kinds) == {"git_worktree", "git_revision"}
+        and scan["target_revision"] != "unversioned"
+        and scan["target_snapshot_digest"] is None
+    ):
+        return "git_revision"
+    raise SystemExit(
+        "Workbench target contract does not identify one authoritative target kind."
+    )
+
+
 def stored_diff_target(row: sqlite3.Row) -> dict[str, str] | None:
     if not row["diff_target_kind"]:
         return None
@@ -631,6 +648,7 @@ def workbench_completion_binding(scan: sqlite3.Row, completed_at: str) -> dict[s
     if not isinstance(plugin_version, str) or not plugin_version:
         raise SystemExit("plugin.json: expected a nonempty Codex Security plugin version.")
     target: dict[str, Any] = {
+        "kind": authoritative_target_kind(scan),
         "targetId": target_contract["targetId"],
         "displayName": target_contract["displayName"],
     }

@@ -315,6 +315,97 @@ describe("plugin runtime preparation", () => {
     },
   );
 
+  testPosix(
+    "normalizes incompatible and legacy draft target kinds to the workbench binding",
+    async () => {
+      const python = Bun.which("python3") ?? Bun.which("python");
+      expect(python).not.toBeNull();
+      const sourcePlugin = await bundledPluginRoot();
+      const finalizer = join(
+        sourcePlugin,
+        "scripts",
+        "finalize_scan_contract.py",
+      );
+      const workbench = join(sourcePlugin, "scripts", "workbench_db.py");
+      const result = Bun.spawnSync([
+        python!,
+        "-I",
+        "-B",
+        "-c",
+        [
+          "import json, runpy, sys",
+          "module = runpy.run_path(sys.argv[1])",
+          "workbench = runpy.run_path(sys.argv[2])",
+          "legacy_scan = {'mode': 'repository', 'target_revision': 'authoritative', 'target_snapshot_digest': None}",
+          "target_kind = workbench['authoritative_target_kind'](legacy_scan)",
+          "scan = {'target': {'kind': 'git_worktree', 'revision': 'draft', 'snapshotDigest': 'stale'}, 'scope': {}}",
+          "manifest = {'scan': scan}",
+          "binding = {'scanId': 'scan-id', 'startedAt': '2026-07-29T00:00:00Z', 'completedAt': '2026-07-29T00:01:00Z', 'producer': {'name': 'codex-security-plugin', 'version': '1.0.0'}, 'target': {'kind': target_kind, 'targetId': 'target-id', 'displayName': 'repo', 'revision': 'authoritative'}, 'allowedTargetKinds': ['git_worktree', 'git_revision'], 'scope': {'includePaths': ['src/file.ts'], 'excludePaths': []}, 'coverageMode': 'scoped_path'}",
+          "module['_populate_unsealed_manifest_envelope'](manifest, scan, binding)",
+          "print(json.dumps(scan['target'], sort_keys=True))",
+        ].join("\n"),
+        finalizer,
+        workbench,
+      ]);
+
+      expect(new TextDecoder().decode(result.stderr)).toBe("");
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(new TextDecoder().decode(result.stdout))).toEqual({
+        displayName: "repo",
+        kind: "git_revision",
+        revision: "authoritative",
+        targetId: "target-id",
+      });
+    },
+  );
+
+  testPosix(
+    "rejects malformed completion target kinds before mutating the manifest",
+    async () => {
+      const python = Bun.which("python3") ?? Bun.which("python");
+      expect(python).not.toBeNull();
+      const sourcePlugin = await bundledPluginRoot();
+      const finalizer = join(
+        sourcePlugin,
+        "scripts",
+        "finalize_scan_contract.py",
+      );
+      const result = Bun.spawnSync([
+        python!,
+        "-I",
+        "-B",
+        "-c",
+        [
+          "import copy, json, runpy, sys",
+          "module = runpy.run_path(sys.argv[1])",
+          "original = {'scan': {'target': {'kind': 'git_worktree'}, 'scope': {}}}",
+          "cases = [[], ['unknown'], ['git_revision', 'git_revision'], [{}]]",
+          "results = []",
+          "for allowed in cases:",
+          "    manifest = copy.deepcopy(original)",
+          "    try:",
+          "        module['_populate_unsealed_manifest_envelope'](manifest, manifest['scan'], {'allowedTargetKinds': allowed, 'target': {'kind': 'git_revision'}})",
+          "    except module['ContractError'] as error:",
+          "        results.append({'error': str(error), 'unchanged': manifest == original})",
+          "    else:",
+          "        results.append({'error': None, 'unchanged': manifest == original})",
+          "print(json.dumps(results))",
+        ].join("\n"),
+        finalizer,
+      ]);
+
+      expect(new TextDecoder().decode(result.stderr)).toBe("");
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(new TextDecoder().decode(result.stdout))).toEqual(
+        Array.from({ length: 4 }, () => ({
+          error:
+            "completion binding allowedTargetKinds: expected unique supported target kinds",
+          unchanged: true,
+        })),
+      );
+    },
+  );
+
   test("uses a configured plugin directory directly", async () => {
     const root = await temporaryDirectory();
     const ambientHome = join(root, ".codex", "plugins", "cache");

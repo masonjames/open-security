@@ -785,6 +785,31 @@ def _validate_derived_finding_identities(
             raise ContractError(f"{context}.fingerprints: does not match derived fingerprint")
 
 
+def _validate_completion_target_binding(completion_binding: dict[str, Any]) -> None:
+    """Validate workbench-owned target metadata before mutating draft artifacts."""
+
+    allowed_target_kinds = completion_binding.get("allowedTargetKinds")
+    if (
+        not isinstance(allowed_target_kinds, list)
+        or not allowed_target_kinds
+        or any(
+            not isinstance(kind, str) or kind not in TARGET_KINDS
+            for kind in allowed_target_kinds
+        )
+        or len(allowed_target_kinds) != len(set(allowed_target_kinds))
+    ):
+        raise ContractError(
+            "completion binding allowedTargetKinds: expected unique supported target kinds"
+        )
+    target_binding = completion_binding.get("target")
+    if not isinstance(target_binding, dict):
+        raise ContractError("completion binding target: expected an object")
+    if target_binding.get("kind") not in allowed_target_kinds:
+        raise ContractError(
+            "completion binding target.kind: must identify one allowed target kind"
+        )
+
+
 def _populate_unsealed_manifest_envelope(
     manifest: dict[str, Any],
     scan: dict[str, Any],
@@ -792,6 +817,8 @@ def _populate_unsealed_manifest_envelope(
 ) -> None:
     """Populate non-semantic draft fields owned by finalization or the workbench."""
 
+    if completion_binding is not None:
+        _validate_completion_target_binding(completion_binding)
     manifest["documentType"] = "codex-security.scan-manifest"
     manifest["schemaVersion"] = SCHEMA_VERSION
     scan["status"] = "completed"
@@ -825,14 +852,14 @@ def _populate_unsealed_target_binding(
 ) -> None:
     """Replace workbench-owned target coordinates without retaining incompatible drafts."""
 
-    target_kind = target.get("kind")
-    required_coordinates = (
-        TARGET_REQUIRED_COORDINATE_FIELDS.get(target_kind, set())
-        if isinstance(target_kind, str)
-        else set()
-    )
+    draft_target_kind = target.get("kind")
+    target_kind = target_binding["kind"]
+    target["kind"] = target_kind
+    required_coordinates = TARGET_REQUIRED_COORDINATE_FIELDS.get(target_kind, set())
     for field in TARGET_COORDINATE_FIELDS:
-        if field not in target_binding and field not in required_coordinates:
+        if field not in target_binding and (
+            draft_target_kind != target_kind or field not in required_coordinates
+        ):
             target.pop(field, None)
     target.update(copy.deepcopy(target_binding))
 
