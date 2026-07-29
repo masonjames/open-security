@@ -29,12 +29,18 @@ export type {
 export {
   DEFAULT_OPENROUTER_MAX_OUTPUT_TOKENS,
   DEFAULT_OPENROUTER_MIN_REQUEST_INTERVAL_MS,
+  DEFAULT_OPENROUTER_MAX_RETRIES,
+  DEFAULT_OPENROUTER_RETRY_BASE_DELAY_MS,
+  DEFAULT_OPENROUTER_MAX_RETRY_DELAY_MS,
   DEFAULT_OPENROUTER_REASONING_EFFORT,
   DEFAULT_SCAN_PROVIDER,
   OPEN_SECURITY_MAX_COST_USD_ENV,
   OPEN_SECURITY_MODEL_ENV,
   OPEN_SECURITY_OPENROUTER_MAX_OUTPUT_TOKENS_ENV,
   OPEN_SECURITY_OPENROUTER_MIN_REQUEST_INTERVAL_MS_ENV,
+  OPEN_SECURITY_OPENROUTER_MAX_RETRIES_ENV,
+  OPEN_SECURITY_OPENROUTER_RETRY_BASE_DELAY_MS_ENV,
+  OPEN_SECURITY_OPENROUTER_MAX_RETRY_DELAY_MS_ENV,
   OPEN_SECURITY_PROVIDER_ENV,
   OPEN_SECURITY_REASONING_EFFORT_ENV,
   OPENROUTER_API_KEY_ENV,
@@ -43,9 +49,14 @@ export {
   providerCodexOverrides,
   resolveOpenRouterMaxOutputTokens,
   resolveOpenRouterMinRequestIntervalMs,
+  resolveOpenRouterRetryPolicy,
   resolveProviderSelection,
 } from "./provider.js";
-export type { ProviderSelection, ScanProvider } from "./provider.js";
+export type {
+  OpenRouterRetryPolicy,
+  ProviderSelection,
+  ScanProvider,
+} from "./provider.js";
 export type { ScanWorkerPhase, ScanWorkerStatus } from "./worker-progress.js";
 export { CodexLoginHandle } from "./auth.js";
 export type { AccountStatus, LoginResult } from "./auth.js";

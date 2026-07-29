@@ -760,6 +760,220 @@ describe("OpenRouter Responses bridge", () => {
     expect(await second.text()).not.toContain("must-not-cross-bridge");
   });
 
+  test("retries bounded pre-stream 429 responses before exposing SSE", async () => {
+    let requests = 0;
+    let keyReads = 0;
+    const upstream = await startServer((request, response) => {
+      request.resume();
+      requests += 1;
+      if (requests === 1) {
+        response.writeHead(429, {
+          "content-type": "application/json",
+          "retry-after": new Date(0).toUTCString(),
+        });
+        response.end('{"secret":"first-rate-limit"}');
+        return;
+      }
+      if (requests === 2) {
+        response.writeHead(429, { "content-type": "application/json" });
+        response.end('{"secret":"second-rate-limit"}');
+        return;
+      }
+      response.writeHead(200, { "content-type": "text/event-stream" });
+      response.end("data: done\n\n");
+    });
+    const bridge = await createOpenRouterResponsesBridge(
+      {
+        expectedModel: MODEL_ID,
+        getUpstreamApiKey: () => {
+          keyReads += 1;
+          return UPSTREAM_API_KEY;
+        },
+        maxOutputTokens: 16_384,
+        maxRetries: 2,
+        retryBaseDelayMs: 1,
+        maxRetryDelayMs: 100,
+      },
+      { upstreamBaseUrl: new URL(`${upstream.baseUrl}/api/v1/`) },
+    );
+    bridges.push(bridge);
+
+    const response = await bridgeRequest(bridge);
+    expect(response.status).toBe(200);
+    expect(await response.text()).toBe("data: done\n\n");
+    expect(requests).toBe(3);
+    expect(keyReads).toBe(4);
+  });
+
+  test("accepts leading-zero delta-seconds before retrying a 429", async () => {
+    let requests = 0;
+    const upstream = await startServer((request, response) => {
+      request.resume();
+      requests += 1;
+      if (requests === 1) {
+        response.writeHead(429, {
+          "content-type": "application/json",
+          "retry-after": "01",
+        });
+        response.end('{"secret":"first-rate-limit"}');
+        return;
+      }
+      response.writeHead(200, { "content-type": "text/event-stream" });
+      response.end("data: done\n\n");
+    });
+    const bridge = await createOpenRouterResponsesBridge(
+      {
+        expectedModel: MODEL_ID,
+        getUpstreamApiKey: () => UPSTREAM_API_KEY,
+        maxOutputTokens: 16_384,
+        maxRetries: 1,
+        retryBaseDelayMs: 1,
+        maxRetryDelayMs: 1_000,
+      },
+      { upstreamBaseUrl: new URL(`${upstream.baseUrl}/api/v1/`) },
+    );
+    bridges.push(bridge);
+
+    const response = await bridgeRequest(bridge);
+    expect(response.status).toBe(200);
+    expect(await response.text()).toBe("data: done\n\n");
+    expect(requests).toBe(2);
+  });
+
+  test("rejects non-HTTP dates that Date.parse would otherwise accept", async () => {
+    let requests = 0;
+    const upstream = await startServer((request, response) => {
+      request.resume();
+      requests += 1;
+      response.writeHead(429, {
+        "content-type": "application/json",
+        "retry-after": "01/02/2026",
+      });
+      response.end('{"secret":"must-not-cross-bridge"}');
+    });
+    const bridge = await createOpenRouterResponsesBridge(
+      {
+        expectedModel: MODEL_ID,
+        getUpstreamApiKey: () => UPSTREAM_API_KEY,
+        maxOutputTokens: 16_384,
+        maxRetries: 1,
+        retryBaseDelayMs: 1,
+        maxRetryDelayMs: 1_000,
+      },
+      { upstreamBaseUrl: new URL(`${upstream.baseUrl}/api/v1/`) },
+    );
+    bridges.push(bridge);
+
+    const response = await bridgeRequest(bridge);
+    expect(response.status).toBe(429);
+    expect(response.headers.get("retry-after")).toBeNull();
+    expect(await response.text()).not.toContain("must-not-cross-bridge");
+    expect(requests).toBe(1);
+  });
+
+  test("does not replay 503 responses without an idempotency guarantee", async () => {
+    let requests = 0;
+    const upstream = await startServer((request, response) => {
+      request.resume();
+      requests += 1;
+      response.writeHead(503, {
+        "content-type": "application/json",
+        "retry-after": "0",
+      });
+      response.end('{"secret":"possibly-accepted-work"}');
+    });
+    const bridge = await createOpenRouterResponsesBridge(
+      {
+        expectedModel: MODEL_ID,
+        getUpstreamApiKey: () => UPSTREAM_API_KEY,
+        maxOutputTokens: 16_384,
+        maxRetries: 5,
+        retryBaseDelayMs: 1,
+        maxRetryDelayMs: 100,
+      },
+      { upstreamBaseUrl: new URL(`${upstream.baseUrl}/api/v1/`) },
+    );
+    bridges.push(bridge);
+
+    const response = await bridgeRequest(bridge);
+    expect(response.status).toBe(503);
+    expect(await response.text()).not.toContain("possibly-accepted-work");
+    expect(requests).toBe(1);
+  });
+
+  test("does not retry HTTP-date Retry-After beyond the configured delay cap", async () => {
+    let requests = 0;
+    const retryAt = new Date(Date.now() + 60_000).toUTCString();
+    const upstream = await startServer((request, response) => {
+      request.resume();
+      requests += 1;
+      response.writeHead(429, {
+        "content-type": "application/json",
+        "retry-after": retryAt,
+      });
+      response.end('{"secret":"must-not-cross-bridge"}');
+    });
+    const bridge = await createOpenRouterResponsesBridge(
+      {
+        expectedModel: MODEL_ID,
+        getUpstreamApiKey: () => UPSTREAM_API_KEY,
+        maxOutputTokens: 16_384,
+        maxRetries: 2,
+        retryBaseDelayMs: 1,
+        maxRetryDelayMs: 100,
+      },
+      { upstreamBaseUrl: new URL(`${upstream.baseUrl}/api/v1/`) },
+    );
+    bridges.push(bridge);
+
+    const response = await bridgeRequest(bridge);
+    expect(response.status).toBe(429);
+    const retryAfter = Number(response.headers.get("retry-after"));
+    expect(retryAfter).toBeGreaterThanOrEqual(55);
+    expect(retryAfter).toBeLessThanOrEqual(60);
+    expect(await response.text()).not.toContain("must-not-cross-bridge");
+    expect(requests).toBe(1);
+  });
+
+  test("close cancels a pending retry without rereading the key", async () => {
+    let requests = 0;
+    let keyReads = 0;
+    const upstream = await startServer((request, response) => {
+      request.resume();
+      requests += 1;
+      response.writeHead(429, {
+        "content-type": "application/json",
+        "retry-after": "60",
+      });
+      response.end();
+    });
+    const bridge = await createOpenRouterResponsesBridge(
+      {
+        expectedModel: MODEL_ID,
+        getUpstreamApiKey: () => {
+          keyReads += 1;
+          return UPSTREAM_API_KEY;
+        },
+        maxOutputTokens: 16_384,
+        maxRetries: 1,
+        retryBaseDelayMs: 1,
+        maxRetryDelayMs: 60_000,
+      },
+      { upstreamBaseUrl: new URL(`${upstream.baseUrl}/api/v1/`) },
+    );
+    bridges.push(bridge);
+    const request = bridgeRequest(bridge).then(
+      () => undefined,
+      () => undefined,
+    );
+    await waitFor(() => requests === 1);
+    await Promise.race([bridge.close(), timeoutAfter(1_500)]);
+    await Promise.race([request, timeoutAfter(1_000)]);
+    await Bun.sleep(25);
+    expect(requests).toBe(1);
+    expect(keyReads).toBe(2);
+  });
+
   test("rejects a successful non-SSE upstream response with a safe 502", async () => {
     const upstream = await startServer((_request, response) => {
       response.writeHead(200, { "content-type": "application/json" });
@@ -905,6 +1119,40 @@ describe("OpenRouter Responses bridge", () => {
           getUpstreamApiKey: () => UPSTREAM_API_KEY,
           maxOutputTokens: 1_024,
           minRequestIntervalMs,
+        }),
+      ).rejects.toBeInstanceOf(TypeError);
+    }
+    for (const maxRetries of [-1, 6, 1.5, Number.NaN]) {
+      await expect(
+        createOpenRouterResponsesBridge({
+          expectedModel: MODEL_ID,
+          getUpstreamApiKey: () => UPSTREAM_API_KEY,
+          maxOutputTokens: 1_024,
+          maxRetries,
+        }),
+      ).rejects.toBeInstanceOf(TypeError);
+    }
+    for (const retryDelayMs of [-1, 300_001, 1.5, Number.NaN]) {
+      await expect(
+        createOpenRouterResponsesBridge({
+          expectedModel: MODEL_ID,
+          getUpstreamApiKey: () => UPSTREAM_API_KEY,
+          maxOutputTokens: 1_024,
+          retryBaseDelayMs: retryDelayMs,
+        }),
+      ).rejects.toBeInstanceOf(TypeError);
+    }
+    for (const options of [
+      { retryBaseDelayMs: 120_001 },
+      { maxRetryDelayMs: 29_999 },
+      { retryBaseDelayMs: 2, maxRetryDelayMs: 1 },
+    ]) {
+      await expect(
+        createOpenRouterResponsesBridge({
+          expectedModel: MODEL_ID,
+          getUpstreamApiKey: () => UPSTREAM_API_KEY,
+          maxOutputTokens: 1_024,
+          ...options,
         }),
       ).rejects.toBeInstanceOf(TypeError);
     }

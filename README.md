@@ -47,6 +47,9 @@ export OPEN_SECURITY_MODEL="qwen/qwen3.7-flash"
 export OPEN_SECURITY_REASONING_EFFORT="high"
 export OPEN_SECURITY_OPENROUTER_MAX_OUTPUT_TOKENS="16384"
 export OPEN_SECURITY_OPENROUTER_MIN_REQUEST_INTERVAL_MS="10000"
+export OPEN_SECURITY_OPENROUTER_MAX_RETRIES="3"
+export OPEN_SECURITY_OPENROUTER_RETRY_BASE_DELAY_MS="30000"
+export OPEN_SECURITY_OPENROUTER_MAX_RETRY_DELAY_MS="120000"
 export OPEN_SECURITY_MAX_COST_USD="1"
 
 open-security scan . --dry-run --json
@@ -86,6 +89,9 @@ For CI, set `OPENAI_API_KEY` or `CODEX_API_KEY`. If both a stored ChatGPT sign-i
 | `OPEN_SECURITY_REASONING_EFFORT`                   | Default reasoning effort                                                              |
 | `OPEN_SECURITY_OPENROUTER_MAX_OUTPUT_TOKENS`       | OpenRouter standard-scan output reservation cap (`1`–`65536`; default `16384`)        |
 | `OPEN_SECURITY_OPENROUTER_MIN_REQUEST_INTERVAL_MS` | Bridge-local minimum between upstream request starts in ms (`0`–`60000`; default `0`) |
+| `OPEN_SECURITY_OPENROUTER_MAX_RETRIES`             | Pre-stream 429 retry count (`0`–`5`; default `3`)                                     |
+| `OPEN_SECURITY_OPENROUTER_RETRY_BASE_DELAY_MS`     | Missing-header exponential retry base (`1000`–`300000`; default `30000`)              |
+| `OPEN_SECURITY_OPENROUTER_MAX_RETRY_DELAY_MS`      | Maximum accepted or calculated retry delay (`1000`–`300000`; default `120000`)        |
 | `OPEN_SECURITY_MAX_COST_USD`                       | Positive live estimated-cost limit for an individual standard scan                    |
 | `OPEN_SECURITY_STATE_DIR`                          | Workbench state directory; preferred fork name                                        |
 | `OPEN_SECURITY_NO_UPDATE_NOTICE`                   | Disable interactive update notices when set                                           |
@@ -108,6 +114,8 @@ The estimate accounts for input, cached input, cache-write input, and output tok
 For OpenRouter standard scans, `OPEN_SECURITY_OPENROUTER_MAX_OUTPUT_TOKENS` separately limits each Responses request's output reservation. Missing or larger `max_output_tokens` values are clamped to `16384` by default; valid lower values are preserved. This reduces provider-side credit reservations, latency, and rate-limit pressure without replacing the cumulative USD guardrail.
 
 Set `OPEN_SECURITY_OPENROUTER_MIN_REQUEST_INTERVAL_MS` to a decimal integer from `0` through `60000` to pace upstream Responses request starts within one standard-scan bridge. For example, `10000` enforces at least ten seconds between starts. The default `0` disables proactive pacing. This setting is local to one bridge and does not coordinate separate Open Security processes or other API clients; invalid values fail closed.
+
+The bridge retries only pre-stream HTTP `429` responses, where the buffered request can be replayed without exposing partial output. `503` and other potentially accepted failures are not replayed without a documented upstream idempotency guarantee. It honors bounded delta-seconds and HTTP-date `Retry-After` headers; when the header is absent, delays grow exponentially from `OPEN_SECURITY_OPENROUTER_RETRY_BASE_DELAY_MS`. `OPEN_SECURITY_OPENROUTER_MAX_RETRIES` defaults to `3`, and `OPEN_SECURITY_OPENROUTER_MAX_RETRY_DELAY_MS` defaults to `120000`. A delay above that cap is not retried, mid-stream failures are never replayed, closing the client cancels pending waits, and every retry re-enters the same pacing and capacity gates. Set the retry count to `0` to disable this behavior.
 
 The cost environment variable fails closed for `bulk-scan`, `validate`, `patch`, and model-backed `scans match`; these paths do not yet have reliable campaign-wide or turn-level accounting. Cached or empty matching and deterministic `scans compare` remain available without model spend. Deep scans cannot use a cost limit.
 

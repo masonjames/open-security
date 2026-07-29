@@ -602,6 +602,9 @@ describe("CodexSecurity orchestration", () => {
           OPENROUTER_API_KEY: "synthetic-openrouter-key",
           OPENAI_API_KEY: "must-not-be-selected",
           OPEN_SECURITY_OPENROUTER_MIN_REQUEST_INTERVAL_MS: "2500",
+          OPEN_SECURITY_OPENROUTER_MAX_RETRIES: "4",
+          OPEN_SECURITY_OPENROUTER_RETRY_BASE_DELAY_MS: "5000",
+          OPEN_SECURITY_OPENROUTER_MAX_RETRY_DELAY_MS: "60000",
         },
         fetchOpenRouterModel: async (model: string) => {
           requestedModel = model;
@@ -645,6 +648,9 @@ describe("CodexSecurity orchestration", () => {
       maxCostUsd: 1,
       openRouterMaxOutputTokens: 16_384,
       openRouterMinRequestIntervalMs: 2_500,
+      openRouterMaxRetries: 4,
+      openRouterRetryBaseDelayMs: 5_000,
+      openRouterMaxRetryDelayMs: 60_000,
       modelCatalog: {
         source: "https://openrouter.ai/api/v1/models",
         canonicalSlug: "qwen/qwen3.7-flash-20260727",
@@ -2469,6 +2475,9 @@ describe("CodexSecurity orchestration", () => {
           OPENROUTER_API_KEY: "synthetic-openrouter-key",
           OPEN_SECURITY_OPENROUTER_MAX_OUTPUT_TOKENS: "12345",
           OPEN_SECURITY_OPENROUTER_MIN_REQUEST_INTERVAL_MS: "6789",
+          OPEN_SECURITY_OPENROUTER_MAX_RETRIES: "4",
+          OPEN_SECURITY_OPENROUTER_RETRY_BASE_DELAY_MS: "5000",
+          OPEN_SECURITY_OPENROUTER_MAX_RETRY_DELAY_MS: "60000",
           HTTP_PROXY: "http://proxy.invalid",
           https_proxy: "http://proxy.invalid",
           ALL_PROXY: "socks5://proxy.invalid",
@@ -2598,6 +2607,9 @@ describe("CodexSecurity orchestration", () => {
       expectedModel: "qwen/qwen3.7-flash",
       maxOutputTokens: 12_345,
       minRequestIntervalMs: 6_789,
+      maxRetries: 4,
+      retryBaseDelayMs: 5_000,
+      maxRetryDelayMs: 60_000,
     });
     expect(
       (bridgeOptions?.["getUpstreamApiKey"] as (() => string) | undefined)?.(),

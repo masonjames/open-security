@@ -111,6 +111,9 @@ export OPEN_SECURITY_MODEL="qwen/qwen3.7-flash"
 export OPEN_SECURITY_REASONING_EFFORT="high"
 export OPEN_SECURITY_OPENROUTER_MAX_OUTPUT_TOKENS="16384"
 export OPEN_SECURITY_OPENROUTER_MIN_REQUEST_INTERVAL_MS="10000"
+export OPEN_SECURITY_OPENROUTER_MAX_RETRIES="3"
+export OPEN_SECURITY_OPENROUTER_RETRY_BASE_DELAY_MS="30000"
+export OPEN_SECURITY_OPENROUTER_MAX_RETRY_DELAY_MS="120000"
 export OPEN_SECURITY_MAX_COST_USD="1"
 
 open-security scan . --dry-run --json
@@ -140,6 +143,18 @@ request starts. For example, `10000` enforces at least ten seconds between
 starts. The default `0` disables proactive pacing. The setting does not
 coordinate separate Open Security processes or other API clients, and invalid
 values fail closed.
+
+Only pre-stream HTTP `429` responses are replayed through the same pacing and
+capacity gates. `503` and other potentially accepted failures are not replayed
+without a documented upstream idempotency guarantee. The bridge honors bounded
+delta-seconds and HTTP-date `Retry-After` values; without one it uses
+exponential delays from
+`OPEN_SECURITY_OPENROUTER_RETRY_BASE_DELAY_MS` (default `30000`).
+`OPEN_SECURITY_OPENROUTER_MAX_RETRIES` defaults to `3` and accepts `0` through
+`5`; `0` disables retries. `OPEN_SECURITY_OPENROUTER_MAX_RETRY_DELAY_MS`
+defaults to `120000` and caps both server-requested and calculated delays.
+Delays above the cap are forwarded instead of retried. Mid-stream errors are
+never replayed, and client close cancels pending retry waits.
 
 Before starting Codex, the scanner queries OpenRouter's unauthenticated
 `GET https://openrouter.ai/api/v1/models` catalog and the exact model's
@@ -295,7 +310,10 @@ and cannot be overridden through raw Codex configuration. Set
 `65536` to change the standard-scan per-request output reservation cap; the
 default is `16384`. Set `OPEN_SECURITY_OPENROUTER_MIN_REQUEST_INTERVAL_MS` to a
 decimal integer from `0` through `60000` to pace upstream request starts; the
-default is `0` (disabled).
+default is `0` (disabled). Bounded pre-stream retry behavior is configured with
+`OPEN_SECURITY_OPENROUTER_MAX_RETRIES`,
+`OPEN_SECURITY_OPENROUTER_RETRY_BASE_DELAY_MS`, and
+`OPEN_SECURITY_OPENROUTER_MAX_RETRY_DELAY_MS`.
 
 Scan progress identifies the requested paths and reports actual ranking,
 file-review, validation, and attack-path phases as they become available.

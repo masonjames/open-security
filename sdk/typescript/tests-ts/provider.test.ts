@@ -3,6 +3,9 @@ import {
   CODEX_API_KEY_ENV,
   DEFAULT_OPENROUTER_MAX_OUTPUT_TOKENS,
   DEFAULT_OPENROUTER_MIN_REQUEST_INTERVAL_MS,
+  DEFAULT_OPENROUTER_MAX_RETRIES,
+  DEFAULT_OPENROUTER_RETRY_BASE_DELAY_MS,
+  DEFAULT_OPENROUTER_MAX_RETRY_DELAY_MS,
   DEFAULT_OPENROUTER_REASONING_EFFORT,
   DEFAULT_SCAN_PROVIDER,
   helperProcessEnvironment,
@@ -11,6 +14,9 @@ import {
   OPEN_SECURITY_MODEL_ENV,
   OPEN_SECURITY_OPENROUTER_MAX_OUTPUT_TOKENS_ENV,
   OPEN_SECURITY_OPENROUTER_MIN_REQUEST_INTERVAL_MS_ENV,
+  OPEN_SECURITY_OPENROUTER_MAX_RETRIES_ENV,
+  OPEN_SECURITY_OPENROUTER_RETRY_BASE_DELAY_MS_ENV,
+  OPEN_SECURITY_OPENROUTER_MAX_RETRY_DELAY_MS_ENV,
   OPEN_SECURITY_PROVIDER_ENV,
   OPEN_SECURITY_REASONING_EFFORT_ENV,
   OPENAI_API_KEY_ENV,
@@ -22,6 +28,7 @@ import {
   ProviderConfigurationError,
   resolveOpenRouterMaxOutputTokens,
   resolveOpenRouterMinRequestIntervalMs,
+  resolveOpenRouterRetryPolicy,
   resolveProviderSelection,
   validateProviderAuthMode,
 } from "../src/provider.js";
@@ -177,6 +184,45 @@ describe("model provider configuration", () => {
         }),
       ).toThrow(ProviderConfigurationError);
     }
+  });
+
+  test("resolves a bounded OpenRouter retry policy", () => {
+    expect(resolveOpenRouterRetryPolicy({})).toEqual({
+      maxRetries: DEFAULT_OPENROUTER_MAX_RETRIES,
+      retryBaseDelayMs: DEFAULT_OPENROUTER_RETRY_BASE_DELAY_MS,
+      maxRetryDelayMs: DEFAULT_OPENROUTER_MAX_RETRY_DELAY_MS,
+    });
+    expect(
+      resolveOpenRouterRetryPolicy({
+        [OPEN_SECURITY_OPENROUTER_MAX_RETRIES_ENV]: " 5 ",
+        [OPEN_SECURITY_OPENROUTER_RETRY_BASE_DELAY_MS_ENV]: "01000",
+        [OPEN_SECURITY_OPENROUTER_MAX_RETRY_DELAY_MS_ENV]: "300000",
+      }),
+    ).toEqual({
+      maxRetries: 5,
+      retryBaseDelayMs: 1_000,
+      maxRetryDelayMs: 300_000,
+    });
+  });
+
+  test("rejects malformed OpenRouter retry policies", () => {
+    for (const [name, raw] of [
+      [OPEN_SECURITY_OPENROUTER_MAX_RETRIES_ENV, "6"],
+      [OPEN_SECURITY_OPENROUTER_MAX_RETRIES_ENV, "-1"],
+      [OPEN_SECURITY_OPENROUTER_RETRY_BASE_DELAY_MS_ENV, "999"],
+      [OPEN_SECURITY_OPENROUTER_MAX_RETRY_DELAY_MS_ENV, "300001"],
+      [OPEN_SECURITY_OPENROUTER_MAX_RETRY_DELAY_MS_ENV, "1e3"],
+    ] as const) {
+      expect(() => resolveOpenRouterRetryPolicy({ [name]: raw })).toThrow(
+        ProviderConfigurationError,
+      );
+    }
+    expect(() =>
+      resolveOpenRouterRetryPolicy({
+        [OPEN_SECURITY_OPENROUTER_RETRY_BASE_DELAY_MS_ENV]: "60000",
+        [OPEN_SECURITY_OPENROUTER_MAX_RETRY_DELAY_MS_ENV]: "30000",
+      }),
+    ).toThrow("must not exceed");
   });
 
   test("emits a fixed OpenRouter Responses API provider table", () => {

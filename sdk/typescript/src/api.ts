@@ -42,6 +42,7 @@ import {
   providerEnvironmentCredential,
   resolveOpenRouterMaxOutputTokens,
   resolveOpenRouterMinRequestIntervalMs,
+  resolveOpenRouterRetryPolicy,
   resolveProviderSelection,
   type ScanProvider,
 } from "./provider.js";
@@ -224,6 +225,9 @@ export interface ScanPreflight {
   maxCostUsd?: number;
   openRouterMaxOutputTokens?: number;
   openRouterMinRequestIntervalMs?: number;
+  openRouterMaxRetries?: number;
+  openRouterRetryBaseDelayMs?: number;
+  openRouterMaxRetryDelayMs?: number;
   modelCatalog?: ScanPreflightModelCatalog;
 }
 
@@ -363,6 +367,10 @@ export class CodexSecurity {
       options.archiveExisting === true
         ? await planOutputArchive(inputs.outputDir)
         : null;
+    const openRouterRetryPolicy =
+      resolvedModel.provider === "openrouter"
+        ? resolveOpenRouterRetryPolicy(this.#dependencies.environment)
+        : undefined;
     this.#requireOpen();
     return {
       repository: inputs.repository,
@@ -396,6 +404,9 @@ export class CodexSecurity {
               resolveOpenRouterMinRequestIntervalMs(
                 this.#dependencies.environment,
               ),
+            openRouterMaxRetries: openRouterRetryPolicy!.maxRetries,
+            openRouterRetryBaseDelayMs: openRouterRetryPolicy!.retryBaseDelayMs,
+            openRouterMaxRetryDelayMs: openRouterRetryPolicy!.maxRetryDelayMs,
           }
         : {}),
     };
@@ -1304,6 +1315,9 @@ export class CodexSecurity {
       let runtimeConfig = mergedConfig;
       if (provider === "openrouter") {
         const { model } = scanModelConfiguration(mergedConfig);
+        const retryPolicy = resolveOpenRouterRetryPolicy(
+          this.#dependencies.environment,
+        );
         openRouterBridge = await (
           this.#dependencies.createOpenRouterResponsesBridge ??
           createOpenRouterResponsesBridge
@@ -1327,6 +1341,9 @@ export class CodexSecurity {
           minRequestIntervalMs: resolveOpenRouterMinRequestIntervalMs(
             this.#dependencies.environment,
           ),
+          maxRetries: retryPolicy.maxRetries,
+          retryBaseDelayMs: retryPolicy.retryBaseDelayMs,
+          maxRetryDelayMs: retryPolicy.maxRetryDelayMs,
         });
         runtimeConfig = openRouterBridgeRuntimeConfig(
           mergedConfig,

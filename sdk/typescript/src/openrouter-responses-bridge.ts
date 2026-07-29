@@ -28,6 +28,8 @@ const MAX_PACED_QUEUE_REQUESTS = 16;
 const MAX_PACED_QUEUE_BYTES = 64 * 1024 * 1024;
 const MAX_IN_FLIGHT_REQUESTS = 16;
 const MAX_IN_FLIGHT_BODY_BYTES = 64 * 1024 * 1024;
+const MAX_UPSTREAM_RETRIES = 5;
+const MAX_UPSTREAM_RETRY_DELAY_MS = 300_000;
 
 const SAFE_RESPONSES = {
   badGateway: {
@@ -78,6 +80,9 @@ export interface OpenRouterResponsesBridgeOptions {
   readonly getUpstreamApiKey: () => string;
   readonly maxOutputTokens: number;
   readonly minRequestIntervalMs?: number;
+  readonly maxRetries?: number;
+  readonly retryBaseDelayMs?: number;
+  readonly maxRetryDelayMs?: number;
 }
 
 /** @internal Test-only dependency injection. Production callers should omit it. */
@@ -426,14 +431,86 @@ function parseRequestBody(
   }
 }
 
-function retryAfterHeader(response: Response): string | undefined {
-  const value = response.headers.get("retry-after");
-  if (value === null || !/^(?:0|[1-9][0-9]{0,5})$/.test(value)) {
-    return undefined;
-  }
+interface BoundedRetryAfter {
+  readonly delayMs: number;
+  readonly headerValue: string;
+}
 
-  const seconds = Number(value);
-  return seconds <= MAX_RETRY_AFTER_SECONDS ? String(seconds) : undefined;
+function boundedRetryAfter(
+  response: Response,
+): BoundedRetryAfter | null | undefined {
+  const value = response.headers.get("retry-after");
+  if (value === null) return undefined;
+
+  let delayMs: number;
+  if (/^[0-9]+$/.test(value)) {
+    const delaySeconds = Number(value);
+    if (
+      !Number.isSafeInteger(delaySeconds) ||
+      delaySeconds > MAX_RETRY_AFTER_SECONDS
+    ) {
+      return null;
+    }
+    delayMs = delaySeconds * 1_000;
+  } else {
+    // Only the preferred IMF-fixdate form is accepted. Date.parse() also
+    // accepts non-HTTP legacy date strings, so using it without a grammar
+    // gate could turn malformed Retry-After values into immediate replays.
+    if (
+      !/^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun), [0-9]{2} (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) [0-9]{4} [0-9]{2}:[0-9]{2}:[0-9]{2} GMT$/.test(
+        value,
+      )
+    ) {
+      return null;
+    }
+    const retryAt = Date.parse(value);
+    if (!Number.isFinite(retryAt)) return null;
+    delayMs = Math.max(0, retryAt - Date.now());
+  }
+  if (delayMs > MAX_RETRY_AFTER_SECONDS * 1_000) return null;
+  return {
+    delayMs,
+    headerValue: String(Math.ceil(delayMs / 1_000)),
+  };
+}
+
+function retryAfterHeader(response: Response): string | undefined {
+  return boundedRetryAfter(response)?.headerValue;
+}
+
+function upstreamRetryDelayMs(
+  response: Response,
+  retriesPerformed: number,
+  retryBaseDelayMs: number,
+  maxRetryDelayMs: number,
+): number | undefined {
+  if (response.status !== 429) return undefined;
+  const retryAfter = boundedRetryAfter(response);
+  if (retryAfter === null) return undefined;
+  if (retryAfter !== undefined) {
+    return retryAfter.delayMs <= maxRetryDelayMs
+      ? retryAfter.delayMs
+      : undefined;
+  }
+  return Math.min(retryBaseDelayMs * 2 ** retriesPerformed, maxRetryDelayMs);
+}
+
+function waitForRetry(delayMs: number, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) return Promise.reject(requestAbortedError());
+  if (delayMs === 0) return Promise.resolve();
+  return new Promise<void>((resolve, reject) => {
+    const onAbort = (): void => {
+      clearTimeout(timer);
+      reject(requestAbortedError());
+    };
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, delayMs);
+    timer.unref();
+    signal.addEventListener("abort", onAbort, { once: true });
+    if (signal.aborted) onAbort();
+  });
 }
 
 function sendJson(
@@ -623,6 +700,9 @@ interface RequestHandlerContext {
   readonly fetch: typeof globalThis.fetch;
   readonly getUpstreamApiKey: () => string;
   readonly maxOutputTokens: number;
+  readonly maxRetries: number;
+  readonly retryBaseDelayMs: number;
+  readonly maxRetryDelayMs: number;
   readonly requestAdmission: RequestAdmissionController;
   readonly startUpstreamRequest: StartUpstreamRequest;
   readonly upstreamUrl: URL;
@@ -717,57 +797,82 @@ async function handleRequest(
     response.once("close", downstreamClosed);
     response.once("error", abort);
 
-    let headerTimeout: ReturnType<typeof setTimeout> | undefined;
     let invalidUpstreamCredential = false;
     let upstreamResponse: Response;
-    try {
-      upstreamResponse = await context.startUpstreamRequest(
-        controller.signal,
-        Buffer.byteLength(requestBody),
-        () => {
-          let upstreamAuthorization: string;
-          try {
-            upstreamAuthorization = authorizationForApiKey(
-              context.getUpstreamApiKey(),
-            );
-          } catch (error) {
-            invalidUpstreamCredential = true;
-            throw error;
-          }
-          if (controller.signal.aborted) throw requestAbortedError();
-          const upstreamHeaders = new Headers({
-            accept: "text/event-stream",
-            authorization: upstreamAuthorization,
-            "content-type": "application/json",
-            "accept-encoding": "identity",
+    let retriesPerformed = 0;
+    while (true) {
+      let headerTimeout: ReturnType<typeof setTimeout> | undefined;
+      try {
+        upstreamResponse = await context.startUpstreamRequest(
+          controller.signal,
+          Buffer.byteLength(requestBody),
+          () => {
+            let upstreamAuthorization: string;
+            try {
+              upstreamAuthorization = authorizationForApiKey(
+                context.getUpstreamApiKey(),
+              );
+            } catch (error) {
+              invalidUpstreamCredential = true;
+              throw error;
+            }
+            if (controller.signal.aborted) throw requestAbortedError();
+            const upstreamHeaders = new Headers({
+              accept: "text/event-stream",
+              authorization: upstreamAuthorization,
+              "content-type": "application/json",
+              "accept-encoding": "identity",
+            });
+            headerTimeout = setTimeout(abort, UPSTREAM_HEADER_TIMEOUT_MS);
+            headerTimeout.unref();
+            return context.fetch(context.upstreamUrl, {
+              body: requestBody,
+              headers: upstreamHeaders,
+              method: "POST",
+              redirect: "error",
+              signal: controller.signal,
+            });
+          },
+        );
+      } catch (error) {
+        if (headerTimeout !== undefined) clearTimeout(headerTimeout);
+        cleanup();
+        if (invalidUpstreamCredential) {
+          abort();
+          sendJson(response, 401, SAFE_RESPONSES.unauthorized);
+        } else if (error instanceof BridgeCapacityError) {
+          sendJson(response, 429, SAFE_RESPONSES.rateLimited, {
+            "retry-after": String(error.retryAfterSeconds),
           });
-          headerTimeout = setTimeout(abort, UPSTREAM_HEADER_TIMEOUT_MS);
-          headerTimeout.unref();
-          return context.fetch(context.upstreamUrl, {
-            body: requestBody,
-            headers: upstreamHeaders,
-            method: "POST",
-            redirect: "error",
-            signal: controller.signal,
-          });
-        },
-      );
-    } catch (error) {
-      if (headerTimeout !== undefined) clearTimeout(headerTimeout);
-      cleanup();
-      if (invalidUpstreamCredential) {
-        abort();
-        sendJson(response, 401, SAFE_RESPONSES.unauthorized);
-      } else if (error instanceof BridgeCapacityError) {
-        sendJson(response, 429, SAFE_RESPONSES.rateLimited, {
-          "retry-after": String(error.retryAfterSeconds),
-        });
-      } else if (!controller.signal.aborted || !response.destroyed) {
-        sendJson(response, 502, SAFE_RESPONSES.badGateway);
+        } else if (!controller.signal.aborted || !response.destroyed) {
+          sendJson(response, 502, SAFE_RESPONSES.badGateway);
+        }
+        return;
       }
-      return;
+      if (headerTimeout !== undefined) clearTimeout(headerTimeout);
+
+      const retryDelayMs =
+        retriesPerformed < context.maxRetries
+          ? upstreamRetryDelayMs(
+              upstreamResponse,
+              retriesPerformed,
+              context.retryBaseDelayMs,
+              context.maxRetryDelayMs,
+            )
+          : undefined;
+      if (retryDelayMs === undefined) break;
+      discardResponseBody(upstreamResponse);
+      retriesPerformed += 1;
+      try {
+        await waitForRetry(retryDelayMs, controller.signal);
+      } catch {
+        cleanup();
+        if (!controller.signal.aborted || !response.destroyed) {
+          sendJson(response, 502, SAFE_RESPONSES.badGateway);
+        }
+        return;
+      }
     }
-    if (headerTimeout !== undefined) clearTimeout(headerTimeout);
 
     if (!upstreamResponse.ok) {
       const retryAfter = retryAfterHeader(upstreamResponse);
@@ -887,6 +992,32 @@ function validateFactoryOptions(
       "minRequestIntervalMs must be an integer from 0 to 60000",
     );
   }
+  if (
+    options.maxRetries !== undefined &&
+    (!Number.isSafeInteger(options.maxRetries) ||
+      options.maxRetries < 0 ||
+      options.maxRetries > MAX_UPSTREAM_RETRIES)
+  ) {
+    throw new TypeError("maxRetries must be an integer from 0 to 5");
+  }
+  for (const [name, value] of [
+    ["retryBaseDelayMs", options.retryBaseDelayMs],
+    ["maxRetryDelayMs", options.maxRetryDelayMs],
+  ] as const) {
+    if (
+      value !== undefined &&
+      (!Number.isSafeInteger(value) ||
+        value < 0 ||
+        value > MAX_UPSTREAM_RETRY_DELAY_MS)
+    ) {
+      throw new TypeError(`${name} must be an integer from 0 to 300000`);
+    }
+  }
+  const effectiveRetryBaseDelayMs = options.retryBaseDelayMs ?? 30_000;
+  const effectiveMaxRetryDelayMs = options.maxRetryDelayMs ?? 120_000;
+  if (effectiveRetryBaseDelayMs > effectiveMaxRetryDelayMs) {
+    throw new TypeError("retryBaseDelayMs must not exceed maxRetryDelayMs");
+  }
 }
 
 function resolveUpstreamUrl(baseUrl: URL): URL {
@@ -928,6 +1059,9 @@ export async function createOpenRouterResponsesBridge(
     fetch: dependencies.fetch ?? (directFetch as typeof globalThis.fetch),
     getUpstreamApiKey: options.getUpstreamApiKey,
     maxOutputTokens: options.maxOutputTokens,
+    maxRetries: options.maxRetries ?? 0,
+    retryBaseDelayMs: options.retryBaseDelayMs ?? 30_000,
+    maxRetryDelayMs: options.maxRetryDelayMs ?? 120_000,
     requestAdmission,
     startUpstreamRequest: requestScheduler.start,
     upstreamUrl: resolveUpstreamUrl(

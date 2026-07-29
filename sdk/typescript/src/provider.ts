@@ -12,6 +12,9 @@ export const DEFAULT_SCAN_PROVIDER: ScanProvider = "openai";
 export const DEFAULT_OPENROUTER_REASONING_EFFORT = "high" as const;
 export const DEFAULT_OPENROUTER_MAX_OUTPUT_TOKENS = 16_384;
 export const DEFAULT_OPENROUTER_MIN_REQUEST_INTERVAL_MS = 0;
+export const DEFAULT_OPENROUTER_MAX_RETRIES = 3;
+export const DEFAULT_OPENROUTER_RETRY_BASE_DELAY_MS = 30_000;
+export const DEFAULT_OPENROUTER_MAX_RETRY_DELAY_MS = 120_000;
 export const OPEN_SECURITY_PROVIDER_ENV = "OPEN_SECURITY_PROVIDER" as const;
 export const OPEN_SECURITY_MODEL_ENV = "OPEN_SECURITY_MODEL" as const;
 export const OPEN_SECURITY_REASONING_EFFORT_ENV =
@@ -22,6 +25,12 @@ export const OPEN_SECURITY_OPENROUTER_MAX_OUTPUT_TOKENS_ENV =
   "OPEN_SECURITY_OPENROUTER_MAX_OUTPUT_TOKENS" as const;
 export const OPEN_SECURITY_OPENROUTER_MIN_REQUEST_INTERVAL_MS_ENV =
   "OPEN_SECURITY_OPENROUTER_MIN_REQUEST_INTERVAL_MS" as const;
+export const OPEN_SECURITY_OPENROUTER_MAX_RETRIES_ENV =
+  "OPEN_SECURITY_OPENROUTER_MAX_RETRIES" as const;
+export const OPEN_SECURITY_OPENROUTER_RETRY_BASE_DELAY_MS_ENV =
+  "OPEN_SECURITY_OPENROUTER_RETRY_BASE_DELAY_MS" as const;
+export const OPEN_SECURITY_OPENROUTER_MAX_RETRY_DELAY_MS_ENV =
+  "OPEN_SECURITY_OPENROUTER_MAX_RETRY_DELAY_MS" as const;
 export const OPENAI_API_KEY_ENV = "OPENAI_API_KEY" as const;
 export const CODEX_API_KEY_ENV = "CODEX_API_KEY" as const;
 export const OPENROUTER_API_KEY_ENV = "OPENROUTER_API_KEY" as const;
@@ -47,6 +56,9 @@ const OPENROUTER_BRIDGE_PROXY_ENVIRONMENTS = Object.freeze([
 ] as const);
 const MAX_OPENROUTER_OUTPUT_TOKENS = 65_536;
 const MAX_OPENROUTER_MIN_REQUEST_INTERVAL_MS = 60_000;
+const MAX_OPENROUTER_RETRIES = 5;
+const MIN_OPENROUTER_RETRY_DELAY_MS = 1_000;
+const MAX_OPENROUTER_RETRY_DELAY_MS = 300_000;
 
 export class ProviderConfigurationError extends Error {
   public constructor(message: string, options?: ErrorOptions) {
@@ -66,6 +78,12 @@ export interface ProviderSelection {
   provider: ScanProvider;
   model?: string;
   reasoningEffort?: string;
+}
+
+export interface OpenRouterRetryPolicy {
+  maxRetries: number;
+  retryBaseDelayMs: number;
+  maxRetryDelayMs: number;
 }
 
 export interface OpenRouterCodexProviderDefinition {
@@ -188,6 +206,39 @@ export function resolveOpenRouterMinRequestIntervalMs(
     throw invalidOpenRouterMinRequestIntervalMs();
   }
   return value;
+}
+
+/** Resolves bounded, pre-stream-only OpenRouter retry behavior. */
+export function resolveOpenRouterRetryPolicy(
+  environment: ProcessEnvironment = process.env,
+): OpenRouterRetryPolicy {
+  const maxRetries = resolveDecimalEnvironmentInteger(
+    environment,
+    OPEN_SECURITY_OPENROUTER_MAX_RETRIES_ENV,
+    DEFAULT_OPENROUTER_MAX_RETRIES,
+    0,
+    MAX_OPENROUTER_RETRIES,
+  );
+  const retryBaseDelayMs = resolveDecimalEnvironmentInteger(
+    environment,
+    OPEN_SECURITY_OPENROUTER_RETRY_BASE_DELAY_MS_ENV,
+    DEFAULT_OPENROUTER_RETRY_BASE_DELAY_MS,
+    MIN_OPENROUTER_RETRY_DELAY_MS,
+    MAX_OPENROUTER_RETRY_DELAY_MS,
+  );
+  const maxRetryDelayMs = resolveDecimalEnvironmentInteger(
+    environment,
+    OPEN_SECURITY_OPENROUTER_MAX_RETRY_DELAY_MS_ENV,
+    DEFAULT_OPENROUTER_MAX_RETRY_DELAY_MS,
+    MIN_OPENROUTER_RETRY_DELAY_MS,
+    MAX_OPENROUTER_RETRY_DELAY_MS,
+  );
+  if (retryBaseDelayMs > maxRetryDelayMs) {
+    throw new ProviderConfigurationError(
+      `${OPEN_SECURITY_OPENROUTER_RETRY_BASE_DELAY_MS_ENV} must not exceed ${OPEN_SECURITY_OPENROUTER_MAX_RETRY_DELAY_MS_ENV}.`,
+    );
+  }
+  return { maxRetries, retryBaseDelayMs, maxRetryDelayMs };
 }
 
 /** Returns the fixed Codex Responses provider table required by OpenRouter. */
@@ -345,6 +396,35 @@ export function helperProcessEnvironment(
   return filterEnvironment(
     environment,
     (name) => !isEnvironmentName(name, MODEL_PROVIDER_SECRET_ENV_KEYS),
+  );
+}
+
+function resolveDecimalEnvironmentInteger(
+  environment: ProcessEnvironment,
+  name: string,
+  defaultValue: number,
+  minimum: number,
+  maximum: number,
+): number {
+  const raw = environment[name]?.trim();
+  if (!raw) return defaultValue;
+  if (!/^[0-9]+$/u.test(raw)) {
+    throw invalidDecimalEnvironmentInteger(name, minimum, maximum);
+  }
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value < minimum || value > maximum) {
+    throw invalidDecimalEnvironmentInteger(name, minimum, maximum);
+  }
+  return value;
+}
+
+function invalidDecimalEnvironmentInteger(
+  name: string,
+  minimum: number,
+  maximum: number,
+): ProviderConfigurationError {
+  return new ProviderConfigurationError(
+    `${name} must contain decimal digits for an integer from ${minimum} through ${maximum}.`,
   );
 }
 
