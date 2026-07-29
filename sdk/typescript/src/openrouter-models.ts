@@ -611,6 +611,7 @@ function parsePricing(
   modelId: string,
   path = "pricing",
 ): ParsedPricing {
+  validateZeroDiscount(pricing["discount"], modelId, `${path}.discount`);
   const prompt = requiredPrice(pricing["prompt"], modelId, `${path}.prompt`);
   const completion = requiredPrice(
     pricing["completion"],
@@ -636,6 +637,7 @@ function parsePricing(
       "request",
       "input_cache_read",
       "input_cache_write",
+      "discount",
       "overrides",
     ]),
     modelId,
@@ -664,6 +666,7 @@ function parsePricing(
     }
     validateOverrideCondition(value, modelId, index, path);
     const prefix = `${path}.overrides[${index}]`;
+    validateZeroDiscount(value["discount"], modelId, `${prefix}.discount`);
     const overridePrompt = optionalPrice(
       value["prompt"],
       modelId,
@@ -702,6 +705,7 @@ function parsePricing(
           "request",
           "input_cache_read",
           "input_cache_write",
+          "discount",
         ]),
         modelId,
         prefix,
@@ -739,6 +743,18 @@ function parsePricing(
     unsupported: unsupportedPrice,
     overrideCount: overrides.length,
   };
+}
+
+function validateZeroDiscount(
+  value: unknown,
+  modelId: string,
+  path: string,
+): void {
+  if (value === undefined || value === 0 || value === "0") return;
+  throw invalidModel(
+    modelId,
+    `${path} must be zero until discount accounting is supported`,
+  );
 }
 
 function maximumUnsupportedPrice(

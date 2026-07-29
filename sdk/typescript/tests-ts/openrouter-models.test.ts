@@ -60,7 +60,7 @@ function qwenModel(
 
 function providerEndpoint(
   modelId = MODEL_ID,
-  pricing: Record<string, unknown> = qwenPricing(),
+  pricing: Record<string, unknown> = { ...qwenPricing(), discount: 0 },
 ): Record<string, unknown> {
   return {
     name: `Provider | ${modelId}`,
@@ -379,6 +379,39 @@ describe("OpenRouter public model catalog", () => {
         fetch: fixtureFetch([qwenModel()], endpointBody),
       }),
     ).rejects.toMatchObject({ code: "invalid-response" });
+  });
+
+  test("accepts only a zero provider discount until discount accounting is supported", async () => {
+    for (const discount of [0, "0"] as const) {
+      clearOpenRouterModelCatalogCache();
+      await expect(
+        fetchOpenRouterModel(MODEL_ID, {
+          fetch: fixtureFetch(
+            [qwenModel()],
+            providerEndpointsBody(MODEL_ID, [
+              providerEndpoint(MODEL_ID, { ...qwenPricing(), discount }),
+            ]),
+          ),
+        }),
+      ).resolves.toMatchObject({
+        unsupportedPricingNanodollars: 0,
+        providerEndpointsConsidered: 1,
+      });
+    }
+
+    for (const discount of [0.01, "0.01", null]) {
+      clearOpenRouterModelCatalogCache();
+      await expect(
+        fetchOpenRouterModel(MODEL_ID, {
+          fetch: fixtureFetch(
+            [qwenModel()],
+            providerEndpointsBody(MODEL_ID, [
+              providerEndpoint(MODEL_ID, { ...qwenPricing(), discount }),
+            ]),
+          ),
+        }),
+      ).rejects.toMatchObject({ code: "invalid-response" });
+    }
   });
 
   test("requires tools and response format, plus reasoning when requested", () => {
