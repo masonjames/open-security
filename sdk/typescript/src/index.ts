@@ -28,11 +28,13 @@ export type {
 } from "./api.js";
 export {
   DEFAULT_OPENROUTER_MAX_OUTPUT_TOKENS,
+  DEFAULT_OPENROUTER_MIN_REQUEST_INTERVAL_MS,
   DEFAULT_OPENROUTER_REASONING_EFFORT,
   DEFAULT_SCAN_PROVIDER,
   OPEN_SECURITY_MAX_COST_USD_ENV,
   OPEN_SECURITY_MODEL_ENV,
   OPEN_SECURITY_OPENROUTER_MAX_OUTPUT_TOKENS_ENV,
+  OPEN_SECURITY_OPENROUTER_MIN_REQUEST_INTERVAL_MS_ENV,
   OPEN_SECURITY_PROVIDER_ENV,
   OPEN_SECURITY_REASONING_EFFORT_ENV,
   OPENROUTER_API_KEY_ENV,
@@ -40,6 +42,7 @@ export {
   ProviderConfigurationError,
   providerCodexOverrides,
   resolveOpenRouterMaxOutputTokens,
+  resolveOpenRouterMinRequestIntervalMs,
   resolveProviderSelection,
 } from "./provider.js";
 export type { ProviderSelection, ScanProvider } from "./provider.js";

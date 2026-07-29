@@ -1986,8 +1986,8 @@ def _write_sarif_projection_if_possible(
         write_sarif_projection(scan_dir, source_root, schema_dir)
     except (ContractError, OSError) as error:
         print(
-            f"codex-security: warning: automatic SARIF export failed: {error}. "
-            "Run `codex-security export <scan-dir> --export-format sarif` to retry.",
+            f"open-security: warning: automatic SARIF export failed: {error}. "
+            "Run `open-security export <scan-dir> --export-format sarif` to retry.",
             file=sys.stderr,
         )
 

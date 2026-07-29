@@ -46,6 +46,7 @@ export OPEN_SECURITY_PROVIDER="openrouter"
 export OPEN_SECURITY_MODEL="qwen/qwen3.7-flash"
 export OPEN_SECURITY_REASONING_EFFORT="high"
 export OPEN_SECURITY_OPENROUTER_MAX_OUTPUT_TOKENS="16384"
+export OPEN_SECURITY_OPENROUTER_MIN_REQUEST_INTERVAL_MS="10000"
 export OPEN_SECURITY_MAX_COST_USD="1"
 
 open-security scan . --dry-run --json
@@ -78,20 +79,21 @@ For CI, set `OPENAI_API_KEY` or `CODEX_API_KEY`. If both a stored ChatGPT sign-i
 
 ## Configuration environment variables
 
-| Variable                                     | Purpose                                                                        |
-| -------------------------------------------- | ------------------------------------------------------------------------------ |
-| `OPEN_SECURITY_PROVIDER`                     | Default provider: `openai` or `openrouter`                                     |
-| `OPEN_SECURITY_MODEL`                        | Default model ID; required for OpenRouter                                      |
-| `OPEN_SECURITY_REASONING_EFFORT`             | Default reasoning effort                                                       |
-| `OPEN_SECURITY_OPENROUTER_MAX_OUTPUT_TOKENS` | OpenRouter standard-scan output reservation cap (`1`–`65536`; default `16384`) |
-| `OPEN_SECURITY_MAX_COST_USD`                 | Positive live estimated-cost limit for an individual standard scan             |
-| `OPEN_SECURITY_STATE_DIR`                    | Workbench state directory; preferred fork name                                 |
-| `OPEN_SECURITY_NO_UPDATE_NOTICE`             | Disable interactive update notices when set                                    |
-| `OPEN_SECURITY_NPM_REGISTRY`                 | Registry base URL used only for update checks                                  |
-| `OPENROUTER_API_KEY`                         | OpenRouter API credential                                                      |
-| `OPENAI_API_KEY`                             | OpenAI API credential                                                          |
-| `CODEX_API_KEY`                              | Backward-compatible OpenAI API credential alias                                |
-| `CODEX_SECURITY_STATE_DIR`                   | Backward-compatible state-directory alias                                      |
+| Variable                                           | Purpose                                                                               |
+| -------------------------------------------------- | ------------------------------------------------------------------------------------- |
+| `OPEN_SECURITY_PROVIDER`                           | Default provider: `openai` or `openrouter`                                            |
+| `OPEN_SECURITY_MODEL`                              | Default model ID; required for OpenRouter                                             |
+| `OPEN_SECURITY_REASONING_EFFORT`                   | Default reasoning effort                                                              |
+| `OPEN_SECURITY_OPENROUTER_MAX_OUTPUT_TOKENS`       | OpenRouter standard-scan output reservation cap (`1`–`65536`; default `16384`)        |
+| `OPEN_SECURITY_OPENROUTER_MIN_REQUEST_INTERVAL_MS` | Bridge-local minimum between upstream request starts in ms (`0`–`60000`; default `0`) |
+| `OPEN_SECURITY_MAX_COST_USD`                       | Positive live estimated-cost limit for an individual standard scan                    |
+| `OPEN_SECURITY_STATE_DIR`                          | Workbench state directory; preferred fork name                                        |
+| `OPEN_SECURITY_NO_UPDATE_NOTICE`                   | Disable interactive update notices when set                                           |
+| `OPEN_SECURITY_NPM_REGISTRY`                       | Registry base URL used only for update checks                                         |
+| `OPENROUTER_API_KEY`                               | OpenRouter API credential                                                             |
+| `OPENAI_API_KEY`                                   | OpenAI API credential                                                                 |
+| `CODEX_API_KEY`                                    | Backward-compatible OpenAI API credential alias                                       |
+| `CODEX_SECURITY_STATE_DIR`                         | Backward-compatible state-directory alias                                             |
 
 Explicit CLI or SDK values take precedence over environment defaults. Saved scan recipes record the provider and safe model configuration, but never credentials.
 
@@ -104,6 +106,8 @@ The estimate accounts for input, cached input, cache-write input, and output tok
 `--max-cost` and `OPEN_SECURITY_MAX_COST_USD` are live estimated-cost guardrails for individual standard scans. The scanner stops the parent scan and parent-linked delegated workers after the observed estimate crosses the limit, preserving partial results. Requests already in flight can finish above the configured amount, so the limit is not a provider-side spending cap.
 
 For OpenRouter standard scans, `OPEN_SECURITY_OPENROUTER_MAX_OUTPUT_TOKENS` separately limits each Responses request's output reservation. Missing or larger `max_output_tokens` values are clamped to `16384` by default; valid lower values are preserved. This reduces provider-side credit reservations, latency, and rate-limit pressure without replacing the cumulative USD guardrail.
+
+Set `OPEN_SECURITY_OPENROUTER_MIN_REQUEST_INTERVAL_MS` to a decimal integer from `0` through `60000` to pace upstream Responses request starts within one standard-scan bridge. For example, `10000` enforces at least ten seconds between starts. The default `0` disables proactive pacing. This setting is local to one bridge and does not coordinate separate Open Security processes or other API clients; invalid values fail closed.
 
 The cost environment variable fails closed for `bulk-scan`, `validate`, `patch`, and model-backed `scans match`; these paths do not yet have reliable campaign-wide or turn-level accounting. Cached or empty matching and deterministic `scans compare` remain available without model spend. Deep scans cannot use a cost limit.
 

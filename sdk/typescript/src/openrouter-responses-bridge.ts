@@ -8,6 +8,7 @@ import {
 } from "node:http";
 import { request as httpsRequest } from "node:https";
 import type { Socket } from "node:net";
+import { performance } from "node:perf_hooks";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 
@@ -23,6 +24,10 @@ const MAX_RETRY_AFTER_SECONDS = 3_600;
 const MAX_OUTPUT_TOKENS = 65_536;
 const MAX_JSON_DEPTH = 64;
 const MAX_JSON_NODES = 250_000;
+const MAX_PACED_QUEUE_REQUESTS = 16;
+const MAX_PACED_QUEUE_BYTES = 64 * 1024 * 1024;
+const MAX_IN_FLIGHT_REQUESTS = 16;
+const MAX_IN_FLIGHT_BODY_BYTES = 64 * 1024 * 1024;
 
 const SAFE_RESPONSES = {
   badGateway: {
@@ -46,6 +51,13 @@ const SAFE_RESPONSES = {
       type: "invalid_request_error",
     },
   },
+  rateLimited: {
+    error: {
+      code: "rate_limit_exceeded",
+      message: "Bridge request capacity reached. Retry later.",
+      type: "rate_limit_error",
+    },
+  },
   unauthorized: {
     error: {
       code: "invalid_api_key",
@@ -65,6 +77,7 @@ export interface OpenRouterResponsesBridgeOptions {
   readonly expectedModel: string;
   readonly getUpstreamApiKey: () => string;
   readonly maxOutputTokens: number;
+  readonly minRequestIntervalMs?: number;
 }
 
 /** @internal Test-only dependency injection. Production callers should omit it. */
@@ -81,6 +94,50 @@ class RequestValidationError extends Error {
     super("Request validation failed");
     this.name = "RequestValidationError";
   }
+}
+
+class BridgeCapacityError extends Error {
+  constructor(readonly retryAfterSeconds: number) {
+    super("Bridge request capacity reached");
+    this.name = "BridgeCapacityError";
+  }
+}
+
+interface RequestAdmission {
+  release(): void;
+}
+
+interface RequestAdmissionController {
+  tryAcquire(reservedBytes: number): RequestAdmission | undefined;
+}
+
+function createRequestAdmissionController(): RequestAdmissionController {
+  let activeRequests = 0;
+  let reservedBodyBytes = 0;
+  return {
+    tryAcquire(reservedBytes: number): RequestAdmission | undefined {
+      if (
+        !Number.isSafeInteger(reservedBytes) ||
+        reservedBytes < 0 ||
+        reservedBytes > MAX_BODY_BYTES ||
+        activeRequests >= MAX_IN_FLIGHT_REQUESTS ||
+        reservedBytes > MAX_IN_FLIGHT_BODY_BYTES - reservedBodyBytes
+      ) {
+        return undefined;
+      }
+      activeRequests += 1;
+      reservedBodyBytes += reservedBytes;
+      let released = false;
+      return {
+        release(): void {
+          if (released) return;
+          released = true;
+          activeRequests -= 1;
+          reservedBodyBytes -= reservedBytes;
+        },
+      };
+    },
+  };
 }
 
 function rawHeaderValues(
@@ -259,12 +316,10 @@ function parseContentLength(request: IncomingMessage): number | undefined {
   return value;
 }
 
-async function readRequestBody(request: IncomingMessage): Promise<Buffer> {
-  const contentLength = parseContentLength(request);
-  if (contentLength !== undefined && contentLength > MAX_BODY_BYTES) {
-    throw new RequestValidationError(413, SAFE_RESPONSES.invalidRequest);
-  }
-
+async function readRequestBody(
+  request: IncomingMessage,
+  contentLength: number | undefined,
+): Promise<Buffer> {
   const chunks: Buffer[] = [];
   let totalBytes = 0;
   for await (const chunk of request) {
@@ -274,6 +329,9 @@ async function readRequestBody(request: IncomingMessage): Promise<Buffer> {
       throw new RequestValidationError(413, SAFE_RESPONSES.invalidRequest);
     }
     chunks.push(buffer);
+  }
+  if (contentLength !== undefined && totalBytes !== contentLength) {
+    throw new RequestValidationError(400, SAFE_RESPONSES.invalidRequest);
   }
   return Buffer.concat(chunks, totalBytes);
 }
@@ -402,6 +460,161 @@ function discardResponseBody(response: Response): void {
   void response.body?.cancel().catch(() => undefined);
 }
 
+interface PendingUpstreamRequest {
+  readonly onAbort: () => void;
+  readonly reject: (reason: Error) => void;
+  readonly resolve: (response: Response | PromiseLike<Response>) => void;
+  readonly retainedBytes: number;
+  readonly signal: AbortSignal;
+  readonly start: () => Promise<Response>;
+}
+
+type StartUpstreamRequest = (
+  signal: AbortSignal,
+  retainedBytes: number,
+  start: () => Promise<Response>,
+) => Promise<Response>;
+
+interface UpstreamRequestScheduler {
+  readonly start: StartUpstreamRequest;
+  close(): void;
+}
+
+function requestAbortedError(): Error {
+  const error = new Error("Request aborted");
+  error.name = "AbortError";
+  return error;
+}
+
+function createUpstreamRequestScheduler(
+  minRequestIntervalMs: number,
+): UpstreamRequestScheduler {
+  const queue: PendingUpstreamRequest[] = [];
+  let closed = false;
+  let nextStartAt = 0;
+  let queuedBytes = 0;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+
+  const removeQueued = (index: number): PendingUpstreamRequest | undefined => {
+    const [pending] = queue.splice(index, 1);
+    if (pending !== undefined) queuedBytes -= pending.retainedBytes;
+    return pending;
+  };
+  const capacityRetryAfterSeconds = (): number =>
+    Math.max(
+      1,
+      Math.min(
+        MAX_RETRY_AFTER_SECONDS,
+        Math.ceil(Math.max(0, nextStartAt - performance.now()) / 1_000),
+      ),
+    );
+
+  const pump = (): void => {
+    if (timer !== undefined) {
+      clearTimeout(timer);
+      timer = undefined;
+    }
+    if (closed) return;
+
+    while (queue.length > 0) {
+      const pending = queue[0];
+      if (pending === undefined) return;
+      if (pending.signal.aborted) {
+        removeQueued(0);
+        pending.signal.removeEventListener("abort", pending.onAbort);
+        pending.reject(requestAbortedError());
+        continue;
+      }
+
+      const delay = nextStartAt - performance.now();
+      if (delay > 0) {
+        timer = setTimeout(pump, Math.ceil(delay));
+        timer.unref();
+        return;
+      }
+
+      removeQueued(0);
+      pending.signal.removeEventListener("abort", pending.onAbort);
+      if (pending.signal.aborted) {
+        pending.reject(requestAbortedError());
+        continue;
+      }
+
+      try {
+        const started = pending.start();
+        // Record the slot after invoking the transport. This makes the interval
+        // conservative relative to the actual upstream request start time.
+        nextStartAt = performance.now() + minRequestIntervalMs;
+        pending.resolve(started);
+      } catch (error) {
+        // A local failure (for example, an invalid API key) did not start an
+        // upstream request and therefore must not consume a pacing slot.
+        pending.reject(
+          error instanceof Error ? error : new Error("Upstream request failed"),
+        );
+      }
+    }
+  };
+
+  const startRequest: StartUpstreamRequest = (signal, retainedBytes, start) =>
+    new Promise<Response>((resolve, reject) => {
+      if (closed || signal.aborted) {
+        reject(requestAbortedError());
+        return;
+      }
+      if (
+        !Number.isSafeInteger(retainedBytes) ||
+        retainedBytes < 0 ||
+        retainedBytes > MAX_PACED_QUEUE_BYTES
+      ) {
+        reject(new Error("Invalid paced request size"));
+        return;
+      }
+      if (
+        queue.length >= MAX_PACED_QUEUE_REQUESTS ||
+        retainedBytes > MAX_PACED_QUEUE_BYTES - queuedBytes
+      ) {
+        reject(new BridgeCapacityError(capacityRetryAfterSeconds()));
+        return;
+      }
+
+      let pending: PendingUpstreamRequest;
+      const onAbort = (): void => {
+        const index = queue.indexOf(pending);
+        if (index === -1) return;
+        removeQueued(index);
+        signal.removeEventListener("abort", onAbort);
+        reject(requestAbortedError());
+        // Re-evaluate the timer so an emptied queue leaves no scheduled work.
+        pump();
+      };
+      pending = { onAbort, reject, resolve, retainedBytes, signal, start };
+      signal.addEventListener("abort", onAbort, { once: true });
+      queue.push(pending);
+      queuedBytes += retainedBytes;
+      pump();
+    });
+
+  return {
+    start: startRequest,
+    close(): void {
+      if (closed) return;
+      closed = true;
+      if (timer !== undefined) {
+        clearTimeout(timer);
+        timer = undefined;
+      }
+      while (queue.length > 0) {
+        const pending = removeQueued(0);
+        if (pending === undefined) break;
+        pending.signal.removeEventListener("abort", pending.onAbort);
+        pending.reject(requestAbortedError());
+      }
+      queuedBytes = 0;
+    },
+  };
+}
+
 interface RequestHandlerContext {
   readonly activeControllers: Set<AbortController>;
   readonly expectedAuthorization: string;
@@ -410,6 +623,8 @@ interface RequestHandlerContext {
   readonly fetch: typeof globalThis.fetch;
   readonly getUpstreamApiKey: () => string;
   readonly maxOutputTokens: number;
+  readonly requestAdmission: RequestAdmissionController;
+  readonly startUpstreamRequest: StartUpstreamRequest;
   readonly upstreamUrl: URL;
 }
 
@@ -434,13 +649,12 @@ async function handleRequest(
     return;
   }
 
-  let requestBody: string;
+  let contentLength: number | undefined;
   try {
-    requestBody = parseRequestBody(
-      await readRequestBody(request),
-      context.expectedModel,
-      context.maxOutputTokens,
-    );
+    contentLength = parseContentLength(request);
+    if (contentLength !== undefined && contentLength > MAX_BODY_BYTES) {
+      throw new RequestValidationError(413, SAFE_RESPONSES.invalidRequest);
+    }
   } catch (error) {
     if (error instanceof RequestValidationError) {
       sendJson(response, error.status, error.response);
@@ -449,123 +663,167 @@ async function handleRequest(
     sendJson(response, 400, SAFE_RESPONSES.invalidRequest);
     return;
   }
-
-  const controller = new AbortController();
-  context.activeControllers.add(controller);
-  let upstreamStream: Readable | undefined;
-  const abort = (): void => {
-    controller.abort();
-    upstreamStream?.destroy();
-  };
-  const downstreamClosed = (): void => {
-    if (!response.writableEnded) abort();
-  };
-  const cleanup = (): void => {
-    context.activeControllers.delete(controller);
-    request.off("aborted", abort);
-    request.socket.off("close", abort);
-    request.socket.off("end", abort);
-    request.socket.off("error", abort);
-    response.off("close", downstreamClosed);
-    response.off("error", abort);
-  };
-  request.once("aborted", abort);
-  request.socket.once("close", abort);
-  request.socket.once("end", abort);
-  request.socket.once("error", abort);
-  response.once("close", downstreamClosed);
-  response.once("error", abort);
-
-  let upstreamAuthorization: string;
-  try {
-    upstreamAuthorization = authorizationForApiKey(context.getUpstreamApiKey());
-  } catch {
-    abort();
-    cleanup();
-    sendJson(response, 401, SAFE_RESPONSES.unauthorized);
+  const admission = context.requestAdmission.tryAcquire(
+    contentLength ?? MAX_BODY_BYTES,
+  );
+  if (admission === undefined) {
+    request.resume();
+    sendJson(response, 429, SAFE_RESPONSES.rateLimited, {
+      "retry-after": "1",
+    });
     return;
   }
-  const upstreamHeaders = new Headers({
-    accept: "text/event-stream",
-    authorization: upstreamAuthorization,
-    "content-type": "application/json",
-    "accept-encoding": "identity",
-  });
 
-  const headerTimeout = setTimeout(abort, UPSTREAM_HEADER_TIMEOUT_MS);
-  headerTimeout.unref();
-
-  let upstreamResponse: Response;
   try {
-    upstreamResponse = await context.fetch(context.upstreamUrl, {
-      body: requestBody,
-      headers: upstreamHeaders,
-      method: "POST",
-      redirect: "error",
-      signal: controller.signal,
-    });
-  } catch {
-    clearTimeout(headerTimeout);
-    cleanup();
-    if (!controller.signal.aborted || !response.destroyed) {
-      sendJson(response, 502, SAFE_RESPONSES.badGateway);
+    let requestBody: string;
+    try {
+      requestBody = parseRequestBody(
+        await readRequestBody(request, contentLength),
+        context.expectedModel,
+        context.maxOutputTokens,
+      );
+    } catch (error) {
+      if (error instanceof RequestValidationError) {
+        sendJson(response, error.status, error.response);
+        return;
+      }
+      sendJson(response, 400, SAFE_RESPONSES.invalidRequest);
+      return;
     }
-    return;
-  }
-  clearTimeout(headerTimeout);
 
-  if (!upstreamResponse.ok) {
-    const retryAfter = retryAfterHeader(upstreamResponse);
-    discardResponseBody(upstreamResponse);
-    cleanup();
-    sendJson(
-      response,
-      upstreamResponse.status,
-      SAFE_RESPONSES.badGateway,
-      retryAfter === undefined ? {} : { "retry-after": retryAfter },
-    );
-    return;
-  }
+    const controller = new AbortController();
+    context.activeControllers.add(controller);
+    let upstreamStream: Readable | undefined;
+    const abort = (): void => {
+      controller.abort();
+      upstreamStream?.destroy();
+    };
+    const downstreamClosed = (): void => {
+      if (!response.writableEnded) abort();
+    };
+    const cleanup = (): void => {
+      context.activeControllers.delete(controller);
+      request.off("aborted", abort);
+      request.socket.off("close", abort);
+      request.socket.off("end", abort);
+      request.socket.off("error", abort);
+      response.off("close", downstreamClosed);
+      response.off("error", abort);
+    };
+    request.once("aborted", abort);
+    request.socket.once("close", abort);
+    request.socket.once("end", abort);
+    request.socket.once("error", abort);
+    response.once("close", downstreamClosed);
+    response.once("error", abort);
 
-  const upstreamContentType = upstreamResponse.headers.get("content-type");
-  const upstreamContentEncoding =
-    upstreamResponse.headers.get("content-encoding");
-  if (
-    upstreamResponse.body === null ||
-    upstreamContentType === null ||
-    !/^text\/event-stream(?:\s*;|$)/i.test(upstreamContentType) ||
-    (upstreamContentEncoding !== null &&
-      upstreamContentEncoding.trim().toLowerCase() !== "identity")
-  ) {
-    discardResponseBody(upstreamResponse);
-    cleanup();
-    sendJson(response, 502, SAFE_RESPONSES.badGateway);
-    return;
-  }
+    let headerTimeout: ReturnType<typeof setTimeout> | undefined;
+    let invalidUpstreamCredential = false;
+    let upstreamResponse: Response;
+    try {
+      upstreamResponse = await context.startUpstreamRequest(
+        controller.signal,
+        Buffer.byteLength(requestBody),
+        () => {
+          let upstreamAuthorization: string;
+          try {
+            upstreamAuthorization = authorizationForApiKey(
+              context.getUpstreamApiKey(),
+            );
+          } catch (error) {
+            invalidUpstreamCredential = true;
+            throw error;
+          }
+          if (controller.signal.aborted) throw requestAbortedError();
+          const upstreamHeaders = new Headers({
+            accept: "text/event-stream",
+            authorization: upstreamAuthorization,
+            "content-type": "application/json",
+            "accept-encoding": "identity",
+          });
+          headerTimeout = setTimeout(abort, UPSTREAM_HEADER_TIMEOUT_MS);
+          headerTimeout.unref();
+          return context.fetch(context.upstreamUrl, {
+            body: requestBody,
+            headers: upstreamHeaders,
+            method: "POST",
+            redirect: "error",
+            signal: controller.signal,
+          });
+        },
+      );
+    } catch (error) {
+      if (headerTimeout !== undefined) clearTimeout(headerTimeout);
+      cleanup();
+      if (invalidUpstreamCredential) {
+        abort();
+        sendJson(response, 401, SAFE_RESPONSES.unauthorized);
+      } else if (error instanceof BridgeCapacityError) {
+        sendJson(response, 429, SAFE_RESPONSES.rateLimited, {
+          "retry-after": String(error.retryAfterSeconds),
+        });
+      } else if (!controller.signal.aborted || !response.destroyed) {
+        sendJson(response, 502, SAFE_RESPONSES.badGateway);
+      }
+      return;
+    }
+    if (headerTimeout !== undefined) clearTimeout(headerTimeout);
 
-  if (controller.signal.aborted || response.destroyed) {
-    discardResponseBody(upstreamResponse);
-    cleanup();
-    return;
-  }
+    if (!upstreamResponse.ok) {
+      const retryAfter = retryAfterHeader(upstreamResponse);
+      discardResponseBody(upstreamResponse);
+      cleanup();
+      sendJson(
+        response,
+        upstreamResponse.status,
+        SAFE_RESPONSES.badGateway,
+        retryAfter === undefined ? {} : { "retry-after": retryAfter },
+      );
+      return;
+    }
 
-  response.writeHead(upstreamResponse.status, {
-    "cache-control": "no-store",
-    connection: "keep-alive",
-    "content-type": "text/event-stream; charset=utf-8",
-    "x-content-type-options": "nosniff",
-  });
+    const upstreamContentType = upstreamResponse.headers.get("content-type");
+    const upstreamContentEncoding =
+      upstreamResponse.headers.get("content-encoding");
+    if (
+      upstreamResponse.body === null ||
+      upstreamContentType === null ||
+      !/^text\/event-stream(?:\s*;|$)/i.test(upstreamContentType) ||
+      (upstreamContentEncoding !== null &&
+        upstreamContentEncoding.trim().toLowerCase() !== "identity")
+    ) {
+      discardResponseBody(upstreamResponse);
+      cleanup();
+      sendJson(response, 502, SAFE_RESPONSES.badGateway);
+      return;
+    }
 
-  upstreamStream = Readable.fromWeb(upstreamResponse.body);
-  try {
-    await pipeline(upstreamStream, response, {
-      signal: controller.signal,
+    if (controller.signal.aborted || response.destroyed) {
+      discardResponseBody(upstreamResponse);
+      cleanup();
+      return;
+    }
+
+    response.writeHead(upstreamResponse.status, {
+      "cache-control": "no-store",
+      connection: "keep-alive",
+      "content-type": "text/event-stream; charset=utf-8",
+      "x-content-type-options": "nosniff",
     });
-  } catch {
-    abort();
-    if (!response.destroyed) response.destroy();
+
+    upstreamStream = Readable.fromWeb(upstreamResponse.body);
+    try {
+      await pipeline(upstreamStream, response, {
+        signal: controller.signal,
+      });
+    } catch {
+      abort();
+      if (!response.destroyed) response.destroy();
+    } finally {
+      cleanup();
+    }
   } finally {
-    cleanup();
+    admission.release();
   }
 }
 
@@ -619,6 +877,16 @@ function validateFactoryOptions(
   ) {
     throw new TypeError("maxOutputTokens must be an integer from 1 to 65536");
   }
+  if (
+    options.minRequestIntervalMs !== undefined &&
+    (!Number.isSafeInteger(options.minRequestIntervalMs) ||
+      options.minRequestIntervalMs < 0 ||
+      options.minRequestIntervalMs > 60_000)
+  ) {
+    throw new TypeError(
+      "minRequestIntervalMs must be an integer from 0 to 60000",
+    );
+  }
 }
 
 function resolveUpstreamUrl(baseUrl: URL): URL {
@@ -648,6 +916,10 @@ export async function createOpenRouterResponsesBridge(
   const expectedPath = `/${routeToken}/api/v1/responses`;
   const activeControllers = new Set<AbortController>();
   const sockets = new Set<Socket>();
+  const requestAdmission = createRequestAdmissionController();
+  const requestScheduler = createUpstreamRequestScheduler(
+    options.minRequestIntervalMs ?? 0,
+  );
   const context: RequestHandlerContext = {
     activeControllers,
     expectedAuthorization,
@@ -656,6 +928,8 @@ export async function createOpenRouterResponsesBridge(
     fetch: dependencies.fetch ?? (directFetch as typeof globalThis.fetch),
     getUpstreamApiKey: options.getUpstreamApiKey,
     maxOutputTokens: options.maxOutputTokens,
+    requestAdmission,
+    startUpstreamRequest: requestScheduler.start,
     upstreamUrl: resolveUpstreamUrl(
       dependencies.upstreamBaseUrl ?? OPENROUTER_API_BASE_URL,
     ),
@@ -686,6 +960,7 @@ export async function createOpenRouterResponsesBridge(
     address.port < 1 ||
     address.port > 65_535
   ) {
+    requestScheduler.close();
     server.close();
     throw new Error("OpenRouter bridge did not bind to an IPv4 loopback port");
   }
@@ -707,6 +982,7 @@ export async function createOpenRouterResponsesBridge(
         const fallback = setTimeout(finish, CLOSE_TIMEOUT_MS);
         fallback.unref();
 
+        requestScheduler.close();
         for (const controller of activeControllers) controller.abort();
         for (const socket of sockets) socket.destroy();
         server.close(finish);

@@ -219,7 +219,7 @@ describe("CodexSecurity orchestration", () => {
     );
   });
 
-  test("uses a root-read filesystem profile with writable workspace and workbench state", () => {
+  test("uses a root-read, network-denied profile with writable workspace and workbench state", () => {
     const stateDirectory = join(tmpdir(), "codex-security-persistent-state");
     const original = {
       sandbox_mode: "workspace-write",
@@ -230,6 +230,10 @@ describe("CodexSecurity orchestration", () => {
         codex_security_scan: {
           extends: ":workspace",
           filesystem: { ":tmpdir": "write" },
+          network: {
+            enabled: true,
+            allowed_domains: ["exfiltration.invalid"],
+          },
         },
       },
     };
@@ -245,6 +249,7 @@ describe("CodexSecurity orchestration", () => {
             ":workspace_roots": "write",
             [stateDirectory]: "write",
           },
+          network: { enabled: false },
         },
       },
     });
@@ -252,6 +257,14 @@ describe("CodexSecurity orchestration", () => {
       sandbox_mode: "workspace-write",
       allow_login_shell: true,
       default_permissions: "unsafe",
+      permissions: {
+        codex_security_scan: {
+          network: {
+            enabled: true,
+            allowed_domains: ["exfiltration.invalid"],
+          },
+        },
+      },
     });
   });
 
@@ -588,6 +601,7 @@ describe("CodexSecurity orchestration", () => {
         environment: {
           OPENROUTER_API_KEY: "synthetic-openrouter-key",
           OPENAI_API_KEY: "must-not-be-selected",
+          OPEN_SECURITY_OPENROUTER_MIN_REQUEST_INTERVAL_MS: "2500",
         },
         fetchOpenRouterModel: async (model: string) => {
           requestedModel = model;
@@ -630,6 +644,7 @@ describe("CodexSecurity orchestration", () => {
       reasoningEffort: "high",
       maxCostUsd: 1,
       openRouterMaxOutputTokens: 16_384,
+      openRouterMinRequestIntervalMs: 2_500,
       modelCatalog: {
         source: "https://openrouter.ai/api/v1/models",
         canonicalSlug: "qwen/qwen3.7-flash-20260727",
@@ -2439,12 +2454,21 @@ describe("CodexSecurity orchestration", () => {
         codexOverrides: {
           model: "qwen/qwen3.7-flash",
           model_reasoning_effort: "medium",
+          permissions: {
+            codex_security_scan: {
+              network: {
+                enabled: true,
+                allowed_domains: ["exfiltration.invalid"],
+              },
+            },
+          },
         },
       },
       {
         environment: {
           OPENROUTER_API_KEY: "synthetic-openrouter-key",
           OPEN_SECURITY_OPENROUTER_MAX_OUTPUT_TOKENS: "12345",
+          OPEN_SECURITY_OPENROUTER_MIN_REQUEST_INTERVAL_MS: "6789",
           HTTP_PROXY: "http://proxy.invalid",
           https_proxy: "http://proxy.invalid",
           ALL_PROXY: "socks5://proxy.invalid",
@@ -2523,6 +2547,11 @@ describe("CodexSecurity orchestration", () => {
                   responses_websockets_v2: false,
                   remote_compaction_v2: false,
                 },
+                permissions: {
+                  codex_security_scan: {
+                    network: { enabled: false },
+                  },
+                },
               });
               const preflightPath =
                 options.env?.["CODEX_SECURITY_CONFIG_PATH"] ?? "";
@@ -2568,6 +2597,7 @@ describe("CodexSecurity orchestration", () => {
     expect(bridgeOptions).toMatchObject({
       expectedModel: "qwen/qwen3.7-flash",
       maxOutputTokens: 12_345,
+      minRequestIntervalMs: 6_789,
     });
     expect(
       (bridgeOptions?.["getUpstreamApiKey"] as (() => string) | undefined)?.(),

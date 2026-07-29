@@ -365,10 +365,10 @@ def compare_scans(
         if reversed_comparison is not None:
             raise SystemExit(
                 "These scans are in the wrong order. Run "
-                f"'codex-security scans compare {after['id']} {before['id']}'."
+                f"'open-security scans compare {after['id']} {before['id']}'."
             )
         raise SystemExit(
-            "No saved matches for these scans. Run 'codex-security scans match BEFORE AFTER' first."
+            "No saved matches for these scans. Run 'open-security scans match BEFORE AFTER' first."
         )
     if include_matching_inputs and backfill_finding_details is not None:
         backfill_finding_details(connection, before)

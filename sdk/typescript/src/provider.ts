@@ -11,6 +11,7 @@ export type ModelProviderSecretEnvironmentVariable =
 export const DEFAULT_SCAN_PROVIDER: ScanProvider = "openai";
 export const DEFAULT_OPENROUTER_REASONING_EFFORT = "high" as const;
 export const DEFAULT_OPENROUTER_MAX_OUTPUT_TOKENS = 16_384;
+export const DEFAULT_OPENROUTER_MIN_REQUEST_INTERVAL_MS = 0;
 export const OPEN_SECURITY_PROVIDER_ENV = "OPEN_SECURITY_PROVIDER" as const;
 export const OPEN_SECURITY_MODEL_ENV = "OPEN_SECURITY_MODEL" as const;
 export const OPEN_SECURITY_REASONING_EFFORT_ENV =
@@ -19,6 +20,8 @@ export const OPEN_SECURITY_MAX_COST_USD_ENV =
   "OPEN_SECURITY_MAX_COST_USD" as const;
 export const OPEN_SECURITY_OPENROUTER_MAX_OUTPUT_TOKENS_ENV =
   "OPEN_SECURITY_OPENROUTER_MAX_OUTPUT_TOKENS" as const;
+export const OPEN_SECURITY_OPENROUTER_MIN_REQUEST_INTERVAL_MS_ENV =
+  "OPEN_SECURITY_OPENROUTER_MIN_REQUEST_INTERVAL_MS" as const;
 export const OPENAI_API_KEY_ENV = "OPENAI_API_KEY" as const;
 export const CODEX_API_KEY_ENV = "CODEX_API_KEY" as const;
 export const OPENROUTER_API_KEY_ENV = "OPENROUTER_API_KEY" as const;
@@ -43,6 +46,7 @@ const OPENROUTER_BRIDGE_PROXY_ENVIRONMENTS = Object.freeze([
   "ALL_PROXY",
 ] as const);
 const MAX_OPENROUTER_OUTPUT_TOKENS = 65_536;
+const MAX_OPENROUTER_MIN_REQUEST_INTERVAL_MS = 60_000;
 
 export class ProviderConfigurationError extends Error {
   public constructor(message: string, options?: ErrorOptions) {
@@ -161,6 +165,27 @@ export function resolveOpenRouterMaxOutputTokens(
     value > MAX_OPENROUTER_OUTPUT_TOKENS
   ) {
     throw invalidOpenRouterMaxOutputTokens();
+  }
+  return value;
+}
+
+/** Resolves the bridge-local minimum interval between OpenRouter request starts. */
+export function resolveOpenRouterMinRequestIntervalMs(
+  environment: ProcessEnvironment = process.env,
+): number {
+  const raw =
+    environment[OPEN_SECURITY_OPENROUTER_MIN_REQUEST_INTERVAL_MS_ENV]?.trim();
+  if (!raw) return DEFAULT_OPENROUTER_MIN_REQUEST_INTERVAL_MS;
+  if (!/^[0-9]+$/u.test(raw)) {
+    throw invalidOpenRouterMinRequestIntervalMs();
+  }
+  const value = Number(raw);
+  if (
+    !Number.isSafeInteger(value) ||
+    value < 0 ||
+    value > MAX_OPENROUTER_MIN_REQUEST_INTERVAL_MS
+  ) {
+    throw invalidOpenRouterMinRequestIntervalMs();
   }
   return value;
 }
@@ -326,6 +351,12 @@ export function helperProcessEnvironment(
 function invalidOpenRouterMaxOutputTokens(): ProviderConfigurationError {
   return new ProviderConfigurationError(
     `${OPEN_SECURITY_OPENROUTER_MAX_OUTPUT_TOKENS_ENV} must contain decimal digits for an integer from 1 through ${MAX_OPENROUTER_OUTPUT_TOKENS}.`,
+  );
+}
+
+function invalidOpenRouterMinRequestIntervalMs(): ProviderConfigurationError {
+  return new ProviderConfigurationError(
+    `${OPEN_SECURITY_OPENROUTER_MIN_REQUEST_INTERVAL_MS_ENV} must contain decimal digits for an integer from 0 through ${MAX_OPENROUTER_MIN_REQUEST_INTERVAL_MS}.`,
   );
 }
 

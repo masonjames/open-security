@@ -6,6 +6,7 @@ import {
   type ServerResponse,
 } from "node:http";
 import { createConnection, type AddressInfo, type Socket } from "node:net";
+import { performance } from "node:perf_hooks";
 import {
   createOpenRouterResponsesBridge,
   type OpenRouterResponsesBridge,
@@ -71,12 +72,15 @@ async function createBridge(
   upstream: TestServer,
   maxOutputTokens = 16_384,
   fetchImplementation: typeof globalThis.fetch = globalThis.fetch,
+  minRequestIntervalMs = 0,
+  getUpstreamApiKey: () => string = () => UPSTREAM_API_KEY,
 ): Promise<OpenRouterResponsesBridge> {
   const bridge = await createOpenRouterResponsesBridge(
     {
       expectedModel: MODEL_ID,
-      getUpstreamApiKey: () => UPSTREAM_API_KEY,
+      getUpstreamApiKey,
       maxOutputTokens,
+      minRequestIntervalMs,
     },
     {
       fetch: fetchImplementation,
@@ -167,7 +171,7 @@ async function waitFor(condition: () => boolean): Promise<void> {
 function rawHeadersOnlyRequest(
   url: string,
   authorization: string,
-  contentLength: number,
+  contentLength?: number,
 ): Promise<number> {
   const target = new URL(url);
   return new Promise<number>((resolve, reject) => {
@@ -180,7 +184,9 @@ function rawHeadersOnlyRequest(
             `Host: ${target.host}`,
             `Authorization: ${authorization}`,
             "Content-Type: application/json",
-            `Content-Length: ${contentLength}`,
+            contentLength === undefined
+              ? "Transfer-Encoding: chunked"
+              : `Content-Length: ${contentLength}`,
             "Connection: close",
             "",
             "",
@@ -323,6 +329,205 @@ describe("OpenRouter Responses bridge", () => {
     expect(received.map((body) => body["max_output_tokens"])).toEqual([
       8_192, 1_024,
     ]);
+  });
+
+  test("paces concurrent valid upstream starts by the configured interval", async () => {
+    const minRequestIntervalMs = 80;
+    const startedAt: number[] = [];
+    const recordingFetch: typeof globalThis.fetch = Object.assign(
+      (...args: Parameters<typeof globalThis.fetch>) => {
+        startedAt.push(performance.now());
+        return globalThis.fetch(...args);
+      },
+      { preconnect: globalThis.fetch.preconnect },
+    );
+    const upstream = await startServer((_request, response) => {
+      response.writeHead(200, { "content-type": "text/event-stream" });
+      response.end("data: done\n\n");
+    });
+    const bridge = await createBridge(
+      upstream,
+      16_384,
+      recordingFetch,
+      minRequestIntervalMs,
+    );
+
+    const responses = await Promise.all(
+      Array.from({ length: 4 }, () => bridgeRequest(bridge)),
+    );
+    expect(
+      await Promise.all(responses.map((response) => response.text())),
+    ).toEqual(Array.from({ length: 4 }, () => "data: done\n\n"));
+    expect(startedAt).toHaveLength(4);
+    for (let index = 1; index < startedAt.length; index += 1) {
+      expect(
+        (startedAt[index] ?? 0) - (startedAt[index - 1] ?? 0),
+      ).toBeGreaterThanOrEqual(minRequestIntervalMs - 1);
+    }
+  });
+
+  test("bounds the paced queue without starting upstream work or rereading the key", async () => {
+    const minRequestIntervalMs = 10_000;
+    let fetchStarts = 0;
+    let keyReads = 0;
+    const stalledFetch: typeof globalThis.fetch = Object.assign(
+      (...args: Parameters<typeof globalThis.fetch>): Promise<Response> => {
+        fetchStarts += 1;
+        return new Promise<Response>((_resolve, reject) => {
+          const signal = args[1]?.signal;
+          const rejectAbort = (): void => {
+            const error = new Error("Request aborted");
+            error.name = "AbortError";
+            reject(error);
+          };
+          if (signal?.aborted === true) rejectAbort();
+          else signal?.addEventListener("abort", rejectAbort, { once: true });
+        });
+      },
+      { preconnect: globalThis.fetch.preconnect },
+    );
+    const upstream = await startServer((_request, response) => response.end());
+    const bridge = await createBridge(
+      upstream,
+      16_384,
+      stalledFetch,
+      minRequestIntervalMs,
+      () => {
+        keyReads += 1;
+        return UPSTREAM_API_KEY;
+      },
+    );
+    expect(keyReads).toBe(1);
+
+    const body = Buffer.from(validBody());
+    const requests = Array.from({ length: 18 }, () =>
+      rawRequest(
+        `${bridge.baseUrl}/responses`,
+        [
+          "Authorization",
+          bridgeAuthorization(bridge),
+          "Content-Type",
+          "application/json",
+          "Content-Length",
+          String(body.byteLength),
+        ],
+        body,
+      ),
+    );
+    const overflow = await Promise.race(requests);
+    expect(overflow.status).toBe(429);
+    expect(JSON.parse(overflow.body.toString("utf8"))).toEqual({
+      error: {
+        code: "rate_limit_exceeded",
+        message: "Bridge request capacity reached. Retry later.",
+        type: "rate_limit_error",
+      },
+    });
+    expect(Number(overflow.headers["retry-after"])).toBeGreaterThanOrEqual(1);
+    expect(Number(overflow.headers["retry-after"])).toBeLessThanOrEqual(10);
+    expect(fetchStarts).toBe(1);
+    expect(keyReads).toBe(2);
+
+    await bridge.close();
+    await Promise.allSettled(requests);
+  });
+
+  test("reserves declared and chunked body bytes before buffering", async () => {
+    let keyReads = 0;
+    let upstreamRequests = 0;
+    const upstream = await startServer((_request, response) => {
+      upstreamRequests += 1;
+      response.end();
+    });
+
+    for (const contentLength of [24 * 1024 * 1024, undefined] as const) {
+      const bridge = await createBridge(
+        upstream,
+        16_384,
+        globalThis.fetch,
+        10_000,
+        () => {
+          keyReads += 1;
+          return UPSTREAM_API_KEY;
+        },
+      );
+      const heldRequests = Array.from({ length: 2 }, () =>
+        rawHeadersOnlyRequest(
+          `${bridge.baseUrl}/responses`,
+          bridgeAuthorization(bridge),
+          contentLength,
+        ).catch(() => 0),
+      );
+      await Bun.sleep(50);
+
+      const rejectedStatus = await rawHeadersOnlyRequest(
+        `${bridge.baseUrl}/responses`,
+        bridgeAuthorization(bridge),
+        contentLength,
+      );
+      expect(rejectedStatus).toBe(429);
+
+      await bridge.close();
+      await Promise.allSettled(heldRequests);
+    }
+    expect(keyReads).toBe(2);
+    expect(upstreamRequests).toBe(0);
+  });
+
+  test("local request and credential failures do not consume pacing slots", async () => {
+    const minRequestIntervalMs = 500;
+    const startedAt: number[] = [];
+    const recordingFetch: typeof globalThis.fetch = Object.assign(
+      (...args: Parameters<typeof globalThis.fetch>) => {
+        startedAt.push(performance.now());
+        return globalThis.fetch(...args);
+      },
+      { preconnect: globalThis.fetch.preconnect },
+    );
+    const upstream = await startServer((_request, response) => {
+      response.writeHead(200, { "content-type": "text/event-stream" });
+      response.end("data: done\n\n");
+    });
+    let apiKey = UPSTREAM_API_KEY;
+    let keyReads = 0;
+    const bridge = await createOpenRouterResponsesBridge(
+      {
+        expectedModel: MODEL_ID,
+        getUpstreamApiKey: () => {
+          keyReads += 1;
+          return apiKey;
+        },
+        maxOutputTokens: 16_384,
+        minRequestIntervalMs,
+      },
+      {
+        fetch: recordingFetch,
+        upstreamBaseUrl: new URL(`${upstream.baseUrl}/api/v1/`),
+      },
+    );
+    bridges.push(bridge);
+    expect(keyReads).toBe(1);
+
+    const invalidBody = await bridgeRequest(
+      bridge,
+      validBody({ model: "other/model" }),
+    );
+    expect(invalidBody.status).toBe(400);
+    expect(keyReads).toBe(1);
+    expect(startedAt).toHaveLength(0);
+
+    apiKey = " invalid ";
+    const invalidCredential = await bridgeRequest(bridge);
+    expect(invalidCredential.status).toBe(401);
+    expect(keyReads).toBe(2);
+    expect(startedAt).toHaveLength(0);
+
+    apiKey = UPSTREAM_API_KEY;
+    const requestedAt = performance.now();
+    expect(await (await bridgeRequest(bridge)).text()).toBe("data: done\n\n");
+    expect(
+      (startedAt[0] ?? Number.POSITIVE_INFINITY) - requestedAt,
+    ).toBeLessThan(minRequestIntervalMs / 2);
   });
 
   test("uses a generic 404 for every route or method mismatch without upstream access", async () => {
@@ -607,7 +812,10 @@ describe("OpenRouter Responses bridge", () => {
     await waitFor(() => upstreamSignal?.aborted === true);
   });
 
-  test("close is idempotent, aborts active fetches, destroys sockets, and stops accepts", async () => {
+  test("close atomically rejects an overdue paced queue, aborts active fetches, and stops accepts", async () => {
+    const minRequestIntervalMs = 250;
+    let fetchStarts = 0;
+    let keyReads = 0;
     let upstreamStarted: (() => void) | undefined;
     let upstreamSignal: AbortSignal | undefined;
     const started = new Promise<void>((resolve) => {
@@ -615,6 +823,7 @@ describe("OpenRouter Responses bridge", () => {
     });
     const recordingFetch: typeof globalThis.fetch = Object.assign(
       (...args: Parameters<typeof globalThis.fetch>) => {
+        fetchStarts += 1;
         upstreamSignal = args[1]?.signal ?? undefined;
         return globalThis.fetch(...args);
       },
@@ -625,16 +834,44 @@ describe("OpenRouter Responses bridge", () => {
       response.writeHead(200, { "content-type": "text/event-stream" });
       response.write("data: pending\n\n");
     });
-    const bridge = await createBridge(upstream, 16_384, recordingFetch);
+    const bridge = await createBridge(
+      upstream,
+      16_384,
+      recordingFetch,
+      minRequestIntervalMs,
+      () => {
+        keyReads += 1;
+        return UPSTREAM_API_KEY;
+      },
+    );
     const response = await bridgeRequest(bridge);
     await started;
     expect(response.status).toBe(200);
+    expect(keyReads).toBe(2);
+    const queuedRequests = Array.from({ length: 2 }, () =>
+      bridgeRequest(bridge).then(
+        () => undefined,
+        () => undefined,
+      ),
+    );
+    await Bun.sleep(50);
+    expect(fetchStarts).toBe(1);
 
+    // Leave the timer overdue while this event-loop turn remains active, then
+    // begin close before its callback can run.
+    const overdueAt = performance.now() + minRequestIntervalMs + 25;
+    while (performance.now() < overdueAt) {
+      // Intentionally block this test turn.
+    }
     const firstClose = bridge.close();
     const secondClose = bridge.close();
     expect(firstClose).toBe(secondClose);
     await Promise.race([firstClose, timeoutAfter(1_500)]);
     await waitFor(() => upstreamSignal?.aborted === true);
+    await Promise.race([Promise.all(queuedRequests), timeoutAfter(1_000)]);
+    await Bun.sleep(minRequestIntervalMs + 75);
+    expect(fetchStarts).toBe(1);
+    expect(keyReads).toBe(2);
     await expect(fetch(`${bridge.baseUrl}/responses`)).rejects.toBeDefined();
     await Promise.race([
       response.text().then(
@@ -655,6 +892,22 @@ describe("OpenRouter Responses bridge", () => {
         }),
       ).rejects.toBeInstanceOf(TypeError);
     }
+    for (const minRequestIntervalMs of [
+      -1,
+      60_001,
+      1.5,
+      Number.NaN,
+      Number.POSITIVE_INFINITY,
+    ]) {
+      await expect(
+        createOpenRouterResponsesBridge({
+          expectedModel: MODEL_ID,
+          getUpstreamApiKey: () => UPSTREAM_API_KEY,
+          maxOutputTokens: 1_024,
+          minRequestIntervalMs,
+        }),
+      ).rejects.toBeInstanceOf(TypeError);
+    }
     await expect(
       createOpenRouterResponsesBridge({
         expectedModel: " ",
@@ -662,5 +915,13 @@ describe("OpenRouter Responses bridge", () => {
         maxOutputTokens: 1_024,
       }),
     ).rejects.toBeInstanceOf(TypeError);
+
+    const maxIntervalBridge = await createOpenRouterResponsesBridge({
+      expectedModel: MODEL_ID,
+      getUpstreamApiKey: () => UPSTREAM_API_KEY,
+      maxOutputTokens: 1_024,
+      minRequestIntervalMs: 60_000,
+    });
+    bridges.push(maxIntervalBridge);
   });
 });

@@ -41,6 +41,7 @@ import {
   providerAuthentication,
   providerEnvironmentCredential,
   resolveOpenRouterMaxOutputTokens,
+  resolveOpenRouterMinRequestIntervalMs,
   resolveProviderSelection,
   type ScanProvider,
 } from "./provider.js";
@@ -222,6 +223,7 @@ export interface ScanPreflight {
   reasoningEffort: string;
   maxCostUsd?: number;
   openRouterMaxOutputTokens?: number;
+  openRouterMinRequestIntervalMs?: number;
   modelCatalog?: ScanPreflightModelCatalog;
 }
 
@@ -390,6 +392,10 @@ export class CodexSecurity {
             openRouterMaxOutputTokens: resolveOpenRouterMaxOutputTokens(
               this.#dependencies.environment,
             ),
+            openRouterMinRequestIntervalMs:
+              resolveOpenRouterMinRequestIntervalMs(
+                this.#dependencies.environment,
+              ),
           }
         : {}),
     };
@@ -1223,6 +1229,7 @@ export class CodexSecurity {
     }).provider;
     if (provider === "openrouter") {
       resolveOpenRouterMaxOutputTokens(this.#dependencies.environment);
+      resolveOpenRouterMinRequestIntervalMs(this.#dependencies.environment);
     }
     if (mode === "deep" && provider === "openrouter") {
       throw new CodexSecurityError(
@@ -1315,6 +1322,9 @@ export class CodexSecurity {
             return credential.value;
           },
           maxOutputTokens: resolveOpenRouterMaxOutputTokens(
+            this.#dependencies.environment,
+          ),
+          minRequestIntervalMs: resolveOpenRouterMinRequestIntervalMs(
             this.#dependencies.environment,
           ),
         });
@@ -2059,6 +2069,7 @@ export function scanRuntimeCodexConfig(
           ":workspace_roots": "write",
           [stateDirectory]: "write",
         },
+        network: { enabled: false },
       },
     },
   };

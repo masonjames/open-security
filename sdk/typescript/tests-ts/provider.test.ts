@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
   CODEX_API_KEY_ENV,
   DEFAULT_OPENROUTER_MAX_OUTPUT_TOKENS,
+  DEFAULT_OPENROUTER_MIN_REQUEST_INTERVAL_MS,
   DEFAULT_OPENROUTER_REASONING_EFFORT,
   DEFAULT_SCAN_PROVIDER,
   helperProcessEnvironment,
@@ -9,6 +10,7 @@ import {
   openRouterBridgeExecutionEnvironment,
   OPEN_SECURITY_MODEL_ENV,
   OPEN_SECURITY_OPENROUTER_MAX_OUTPUT_TOKENS_ENV,
+  OPEN_SECURITY_OPENROUTER_MIN_REQUEST_INTERVAL_MS_ENV,
   OPEN_SECURITY_PROVIDER_ENV,
   OPEN_SECURITY_REASONING_EFFORT_ENV,
   OPENAI_API_KEY_ENV,
@@ -19,6 +21,7 @@ import {
   providerEnvironmentCredential,
   ProviderConfigurationError,
   resolveOpenRouterMaxOutputTokens,
+  resolveOpenRouterMinRequestIntervalMs,
   resolveProviderSelection,
   validateProviderAuthMode,
 } from "../src/provider.js";
@@ -127,6 +130,50 @@ describe("model provider configuration", () => {
       expect(() =>
         resolveOpenRouterMaxOutputTokens({
           [OPEN_SECURITY_OPENROUTER_MAX_OUTPUT_TOKENS_ENV]: raw,
+        }),
+      ).toThrow(ProviderConfigurationError);
+    }
+  });
+
+  test("resolves a bounded OpenRouter request-start interval", () => {
+    expect(resolveOpenRouterMinRequestIntervalMs({})).toBe(
+      DEFAULT_OPENROUTER_MIN_REQUEST_INTERVAL_MS,
+    );
+    for (const blank of ["", "  ", "\t"]) {
+      expect(
+        resolveOpenRouterMinRequestIntervalMs({
+          [OPEN_SECURITY_OPENROUTER_MIN_REQUEST_INTERVAL_MS_ENV]: blank,
+        }),
+      ).toBe(DEFAULT_OPENROUTER_MIN_REQUEST_INTERVAL_MS);
+    }
+    for (const [raw, expected] of [
+      ["0", 0],
+      [" 10000 ", 10_000],
+      ["060000", 60_000],
+    ] as const) {
+      expect(
+        resolveOpenRouterMinRequestIntervalMs({
+          [OPEN_SECURITY_OPENROUTER_MIN_REQUEST_INTERVAL_MS_ENV]: raw,
+        }),
+      ).toBe(expected);
+    }
+  });
+
+  test("rejects non-decimal and out-of-range request-start intervals", () => {
+    for (const raw of [
+      "60001",
+      "-1",
+      "+0",
+      "1.5",
+      "1e3",
+      "0x10",
+      "1_000",
+      "Infinity",
+      "999999999999999999999999999999999999",
+    ]) {
+      expect(() =>
+        resolveOpenRouterMinRequestIntervalMs({
+          [OPEN_SECURITY_OPENROUTER_MIN_REQUEST_INTERVAL_MS_ENV]: raw,
         }),
       ).toThrow(ProviderConfigurationError);
     }

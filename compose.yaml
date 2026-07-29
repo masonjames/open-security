@@ -19,6 +19,7 @@ services:
       OPENROUTER_API_KEY:
       OPEN_SECURITY_MODEL:
       OPEN_SECURITY_OPENROUTER_MAX_OUTPUT_TOKENS:
+      OPEN_SECURITY_OPENROUTER_MIN_REQUEST_INTERVAL_MS:
       OPEN_SECURITY_PROVIDER:
       OPEN_SECURITY_REASONING_EFFORT:
       # Forwarded so bulk-scan fails closed instead of silently ignoring a cap;

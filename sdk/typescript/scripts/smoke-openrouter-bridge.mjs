@@ -14,9 +14,12 @@ if (bridgeModulePath === undefined || process.argv.length !== 3) {
 const { createOpenRouterResponsesBridge } = await import(
   pathToFileURL(resolve(bridgeModulePath)).href
 );
+const minRequestIntervalMs = 500;
 const upstreamSockets = new Set();
 let heartbeat;
 let upstreamSignal;
+let fetchStarts = 0;
+let keyReads = 0;
 const upstreamApiKey = "sk-or-v1-node-smoke-upstream";
 const upstream = createServer((request, response) => {
   assert.equal(request.headers.authorization, `Bearer ${upstreamApiKey}`);
@@ -38,6 +41,7 @@ assert.notEqual(upstreamAddress, null);
 assert.equal(typeof upstreamAddress, "object");
 
 const recordingFetch = (...args) => {
+  fetchStarts += 1;
   upstreamSignal = args[1]?.signal;
   return globalThis.fetch(...args);
 };
@@ -46,12 +50,18 @@ if (typeof globalThis.fetch.preconnect === "function") {
 }
 
 let bridge;
+let activeSocket;
+let queuedSocket;
 try {
   bridge = await createOpenRouterResponsesBridge(
     {
       expectedModel: "qwen/qwen3.7-flash",
-      getUpstreamApiKey: () => upstreamApiKey,
+      getUpstreamApiKey: () => {
+        keyReads += 1;
+        return upstreamApiKey;
+      },
       maxOutputTokens: 16_384,
+      minRequestIntervalMs,
     },
     {
       fetch: recordingFetch,
@@ -66,40 +76,79 @@ try {
     model: "qwen/qwen3.7-flash",
     stream: true,
   });
-  await new Promise((resolveDisconnect, reject) => {
-    const socket = createConnection(
-      { host: target.hostname, port: Number(target.port) },
-      () => {
-        socket.write(
-          [
-            `POST ${target.pathname} HTTP/1.1`,
-            `Host: ${target.host}`,
-            `Authorization: Bearer ${bridge.credential}`,
-            "Content-Type: application/json",
-            `Content-Length: ${Buffer.byteLength(body)}`,
-            "Connection: keep-alive",
-            "",
-            body,
-          ].join("\r\n"),
-        );
-      },
-    );
+  const requestText = [
+    `POST ${target.pathname} HTTP/1.1`,
+    `Host: ${target.host}`,
+    `Authorization: Bearer ${bridge.credential}`,
+    "Content-Type: application/json",
+    `Content-Length: ${Buffer.byteLength(body)}`,
+    "Connection: keep-alive",
+    "",
+    body,
+  ].join("\r\n");
+
+  activeSocket = createConnection({
+    host: target.hostname,
+    port: Number(target.port),
+  });
+  await new Promise((resolveFirstEvent, reject) => {
+    let firstEventReceived = false;
     let response = "";
-    let disconnected = false;
-    socket.setEncoding("utf8");
-    socket.on("data", (chunk) => {
+    activeSocket.setEncoding("utf8");
+    activeSocket.once("connect", () => activeSocket.write(requestText));
+    activeSocket.on("data", (chunk) => {
       response += chunk;
-      if (!disconnected && response.includes("data: first")) {
-        disconnected = true;
-        socket.resetAndDestroy();
-        resolveDisconnect();
+      if (!firstEventReceived && response.includes("data: first")) {
+        firstEventReceived = true;
+        resolveFirstEvent();
       }
     });
-    socket.once("error", (error) => {
-      if (!disconnected) reject(error);
+    activeSocket.once("error", (error) => {
+      if (!firstEventReceived) reject(error);
+    });
+  });
+  assert.equal(fetchStarts, 1);
+  assert.equal(keyReads, 2);
+
+  queuedSocket = createConnection({
+    host: target.hostname,
+    port: Number(target.port),
+  });
+  await new Promise((resolveDisconnect, reject) => {
+    let settled = false;
+    let disconnectTimer;
+    queuedSocket.once("connect", () => {
+      queuedSocket.write(requestText);
+      disconnectTimer = setTimeout(() => {
+        settled = true;
+        queuedSocket.resetAndDestroy();
+        resolveDisconnect();
+      }, 100);
+    });
+    queuedSocket.once("error", (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(disconnectTimer);
+      reject(error);
     });
   });
 
+  await new Promise((resolveWait) =>
+    setTimeout(resolveWait, minRequestIntervalMs + 100),
+  );
+  assert.equal(
+    fetchStarts,
+    1,
+    "A disconnected paced request unexpectedly started an upstream request.",
+  );
+  assert.equal(
+    keyReads,
+    2,
+    "A disconnected paced request unexpectedly reread the upstream key.",
+  );
+  assert.equal(upstreamSignal?.aborted, false);
+
+  activeSocket.resetAndDestroy();
   const deadline = Date.now() + 2_000;
   while (upstreamSignal?.aborted !== true && Date.now() < deadline) {
     await new Promise((resolveWait) => setTimeout(resolveWait, 10));
@@ -111,6 +160,8 @@ try {
   );
 } finally {
   clearInterval(heartbeat);
+  activeSocket?.destroy();
+  queuedSocket?.destroy();
   await bridge?.close();
   for (const socket of upstreamSockets) socket.destroy();
   upstream.closeAllConnections();
@@ -118,5 +169,5 @@ try {
 }
 
 console.log(
-  "Validated Node downstream-disconnect cancellation for the OpenRouter bridge.",
+  "Validated Node paced-queue and active downstream-disconnect cancellation for the OpenRouter bridge.",
 );

@@ -110,6 +110,7 @@ export OPEN_SECURITY_PROVIDER="openrouter"
 export OPEN_SECURITY_MODEL="qwen/qwen3.7-flash"
 export OPEN_SECURITY_REASONING_EFFORT="high"
 export OPEN_SECURITY_OPENROUTER_MAX_OUTPUT_TOKENS="16384"
+export OPEN_SECURITY_OPENROUTER_MIN_REQUEST_INTERVAL_MS="10000"
 export OPEN_SECURITY_MAX_COST_USD="1"
 
 open-security scan . --dry-run --json
@@ -132,6 +133,13 @@ Its URL exists only in the isolated runtime configuration; it is absent from
 scan recipes and the readable preflight snapshot. Validation, patching, and
 semantic scan matching are disabled for OpenRouter until those direct Codex
 paths use the same credential bridge. They remain available with OpenAI.
+
+Set `OPEN_SECURITY_OPENROUTER_MIN_REQUEST_INTERVAL_MS` to a decimal integer from
+`0` through `60000` to enforce a bridge-local minimum between upstream Responses
+request starts. For example, `10000` enforces at least ten seconds between
+starts. The default `0` disables proactive pacing. The setting does not
+coordinate separate Open Security processes or other API clients, and invalid
+values fail closed.
 
 Before starting Codex, the scanner queries OpenRouter's unauthenticated
 `GET https://openrouter.ai/api/v1/models` catalog and the exact model's
@@ -285,7 +293,9 @@ endpoint, credential variable, and Responses wire API are owned by Open Security
 and cannot be overridden through raw Codex configuration. Set
 `OPEN_SECURITY_OPENROUTER_MAX_OUTPUT_TOKENS` to a decimal integer from `1` through
 `65536` to change the standard-scan per-request output reservation cap; the
-default is `16384`.
+default is `16384`. Set `OPEN_SECURITY_OPENROUTER_MIN_REQUEST_INTERVAL_MS` to a
+decimal integer from `0` through `60000` to pace upstream request starts; the
+default is `0` (disabled).
 
 Scan progress identifies the requested paths and reports actual ranking,
 file-review, validation, and attack-path phases as they become available.
@@ -314,7 +324,9 @@ For OpenRouter standard scans, the output-token cap is enforced before each
 Responses request is forwarded. A missing or larger `max_output_tokens` value is
 clamped, while a valid lower value is preserved. This reduces provider credit
 reservations, latency, and rate-limit pressure; it complements rather than
-replaces the cumulative USD guardrail.
+replaces the cumulative USD guardrail. The request-start interval is a separate
+proactive rate-limit control and does not change token reservations or cost
+accounting.
 
 `OPEN_SECURITY_MAX_COST_USD` fails closed for `bulk-scan`, `validate`, `patch`,
 and model-backed `scans match` operations because those paths do not yet have
