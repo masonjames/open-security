@@ -996,6 +996,14 @@ export async function main(
             exitCode,
           });
         }
+        if (
+          !options.dryRun &&
+          format === "toon" &&
+          !argv.includes("--full-output") &&
+          !argv.includes("--format")
+        ) {
+          return;
+        }
         return outcome.data;
       },
     })
@@ -2194,7 +2202,6 @@ async function runScan(
   let firstSignalAt = 0;
   let progress: Progress | null = null;
   let lastWorkerUpdate = "";
-  let workerCapacity: { planned: number; started: number } | null = null;
   let phase: string | null = null;
   const preparationAbortController = new AbortController();
   const signalListener = (signal: SignalName) => () => {
@@ -2375,10 +2382,7 @@ async function runScan(
             : `dispatch:${status.phase}:${status.planned}:${status.started}`;
         if (update === lastWorkerUpdate) return;
         lastWorkerUpdate = update;
-        if (status.kind === "dispatch") {
-          workerCapacity = { planned: status.planned, started: status.started };
-          phase = scanPhase(status.phase);
-        }
+        if (status.kind === "dispatch") phase = scanPhase(status.phase);
         const message = workerStatusMessage(status);
         if (message === null || progress === null) return;
         progress.stopTimer();
@@ -2468,7 +2472,7 @@ async function runScan(
   ).length;
   const incomplete = result.coverage.completeness !== "complete";
   progress?.stage("Scan complete");
-  printScanSummary(result, progress, errorOutput, workerCapacity);
+  printScanSummary(result, progress, errorOutput);
   if (incomplete) {
     errorOutput.write(
       threshold === undefined
@@ -2539,7 +2543,6 @@ function printScanSummary(
   result: ScanResult,
   progress: Progress | null,
   errorOutput: Writable,
-  workers: { planned: number; started: number } | null,
 ): void {
   const severities = new Map<SeverityLevel, number>();
   for (const finding of result.findings.findings) {
@@ -2566,9 +2569,7 @@ function printScanSummary(
     completed >= started
       ? Math.floor((completed - started) / 1_000)
       : progress?.elapsedSeconds ?? 0;
-  errorOutput.write(
-    `codex-security: Elapsed: ${elapsed}s.${workers === null ? "" : ` Workers: ${workers.started}/${workers.planned}.`}\n`,
-  );
+  errorOutput.write(`codex-security: Elapsed: ${elapsed}s.\n`);
 
   const tokenSummary = formatTokenUsage(result.turnResult.usage);
   if (tokenSummary !== null) {
@@ -2579,12 +2580,11 @@ function printScanSummary(
       `codex-security: Estimated cost: ${formatUsd(result.cost.estimatedUsd)} USD.\n`,
     );
   }
-  const scanDir = cliErrorMessage(result.scanDir);
-  errorOutput.write(`codex-security: Results: ${scanDir}\n`);
   errorOutput.write(
-    result.sarifPath === null
-      ? `codex-security: Next: codex-security export ${quoteCliPath(scanDir)} --export-format sarif\n`
-      : `codex-security: Next: review ${cliErrorMessage(result.reportPath)}\n`,
+    `codex-security: Report: ${cliErrorMessage(result.reportPath)}\n`,
+  );
+  errorOutput.write(
+    `codex-security: Results: ${cliErrorMessage(result.scanDir)}\n`,
   );
 }
 
