@@ -892,6 +892,184 @@ def _populate_unsealed_artifact_envelope(
         coverage["excludePaths"] = copy.deepcopy(scope["excludePaths"])
 
 
+def _legacy_surface_id(path: str) -> str:
+    return f"legacy-{hashlib.sha256(path.encode('utf-8')).hexdigest()[:16]}"
+
+
+def _normalize_unsealed_legacy_coverage(coverage: dict[str, Any]) -> bool:
+    """Translate the compact coverage shape emitted by some compatible providers.
+
+    The adapter is intentionally narrow: a modern ``surfaces`` array wins, and
+    completeness is inferred only when every exact include path is explicitly
+    marked reviewed with no unresolved legacy outcome.
+    """
+
+    legacy_files = coverage.get("filesReviewed")
+    legacy_outcomes = coverage.get("outcomes")
+    if "surfaces" in coverage or not (
+        isinstance(legacy_files, dict) or isinstance(legacy_outcomes, list)
+    ):
+        return False
+
+    include_paths = coverage.get("includePaths")
+    if not isinstance(include_paths, list) or not all(
+        isinstance(path, str) and path for path in include_paths
+    ):
+        return False
+
+    statuses: dict[str, list[str]] = {}
+    summaries: dict[str, str] = {}
+    candidate_counts: dict[str, int] = {}
+
+    if isinstance(legacy_files, dict):
+        for path, status in legacy_files.items():
+            if not (
+                isinstance(path, str)
+                and path
+                and isinstance(status, str)
+                and status
+            ):
+                return False
+            statuses.setdefault(path, []).append(status)
+
+    if isinstance(legacy_outcomes, list):
+        for outcome in legacy_outcomes:
+            if not isinstance(outcome, dict):
+                return False
+            path = outcome.get("path")
+            status = outcome.get("status")
+            if not (
+                isinstance(path, str)
+                and path
+                and isinstance(status, str)
+                and status
+            ):
+                return False
+            statuses.setdefault(path, []).append(status)
+            summary = outcome.get("decisionSummary")
+            if summary is not None:
+                if not isinstance(summary, str) or not summary.strip():
+                    return False
+                summaries[path] = summary.strip()
+            candidate_count = outcome.get("candidateCount")
+            if candidate_count is not None:
+                if (
+                    isinstance(candidate_count, bool)
+                    or not isinstance(candidate_count, int)
+                    or candidate_count < 0
+                ):
+                    return False
+                candidate_counts[path] = candidate_count
+
+    ordered_paths = list(dict.fromkeys([*include_paths, *statuses.keys()]))
+    surfaces: list[dict[str, Any]] = []
+    deferred: list[dict[str, Any]] = []
+    unresolved = False
+    reviewed_includes: set[str] = set()
+    for path in ordered_paths:
+        path_statuses = statuses.get(path, [])
+        reviewed = bool(path_statuses) and all(status == "reviewed" for status in path_statuses)
+        if reviewed and path in include_paths:
+            reviewed_includes.add(path)
+        candidate_count = candidate_counts.get(path, 0)
+        if reviewed:
+            disposition = "reported" if candidate_count > 0 else "no_issue_found"
+        else:
+            disposition = "needs_follow_up"
+            unresolved = True
+
+        surface_id = _legacy_surface_id(path)
+        surface: dict[str, Any] = {
+            "id": surface_id,
+            "label": path,
+            "disposition": disposition,
+            "receiptRefs": [],
+        }
+        summary = summaries.get(path)
+        if summary is not None:
+            surface["notes"] = summary
+        surfaces.append(surface)
+
+        if not reviewed:
+            deferred.append(
+                {
+                    "id": f"deferred-{surface_id}",
+                    "reason": summary or "Legacy coverage did not mark this path reviewed.",
+                    "paths": [path],
+                    "surfaceIds": [surface_id],
+                }
+            )
+
+    if include_paths and reviewed_includes == set(include_paths) and not unresolved:
+        completeness = "complete"
+    elif surfaces:
+        completeness = "partial"
+    else:
+        completeness = "unknown"
+
+    mode = coverage.get("mode")
+    inventory_strategy = {
+        "repository": "repository",
+        "deep_repository": "repository",
+        "scoped_path": "scoped_path",
+        "diff": "diff",
+        "commit": "diff",
+        "branch_diff": "diff",
+        "working_tree": "diff",
+    }.get(mode, "custom")
+    exclude_paths = coverage.get("excludePaths")
+    explicit_exclusions = [
+        {"pattern": path, "reason": "Excluded by the selected scan scope."}
+        for path in exclude_paths
+        if isinstance(path, str) and path
+    ] if isinstance(exclude_paths, list) else []
+
+    coverage["completeness"] = completeness
+    coverage["inventoryStrategy"] = inventory_strategy
+    coverage["surfaces"] = surfaces
+    coverage["explicitExclusions"] = explicit_exclusions
+    coverage["deferred"] = deferred
+    coverage.pop("filesReviewed", None)
+    coverage.pop("outcomes", None)
+    return True
+
+
+def _drop_missing_unsealed_legacy_hardening_ref(
+    scan_dir: Path,
+    scan: dict[str, Any],
+    *,
+    legacy_coverage_normalized: bool,
+) -> None:
+    """Discard only a dangling optional hardening ref from a legacy draft."""
+
+    if not legacy_coverage_normalized:
+        return
+    hardening = scan.get("hardening")
+    if hardening != {"portfolioPath": "hardening/hardening.md"}:
+        return
+    portfolio_path = PurePosixPath("hardening/hardening.md")
+    current = scan_dir
+    for part in portfolio_path.parts[:-1]:
+        current /= part
+        try:
+            metadata = os.lstat(current)
+        except FileNotFoundError:
+            scan.pop("hardening", None)
+            return
+        except OSError:
+            # Leave unreadable or otherwise suspicious paths for strict validation.
+            return
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+            return
+    try:
+        os.lstat(scan_dir / portfolio_path)
+    except FileNotFoundError:
+        scan.pop("hardening", None)
+    except OSError:
+        # Leave unreadable or otherwise suspicious paths for strict validation.
+        return
+
+
 def _normalize_unsealed_open_questions(coverage: dict[str, Any]) -> None:
     """Keep only schema-valid optional open-question rows without inventing content."""
 
@@ -2058,6 +2236,12 @@ def _prepare_scan_finalization(
         _normalize_unsealed_deep_repository_inventory_strategy(
             coverage,
             expected_coverage_mode=expected_coverage_mode,
+        )
+        legacy_coverage_normalized = _normalize_unsealed_legacy_coverage(coverage)
+        _drop_missing_unsealed_legacy_hardening_ref(
+            scan_dir,
+            scan,
+            legacy_coverage_normalized=legacy_coverage_normalized,
         )
         _normalize_unsealed_open_questions(coverage)
 

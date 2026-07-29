@@ -362,6 +362,207 @@ describe("plugin runtime preparation", () => {
   );
 
   testPosix(
+    "normalizes compact legacy coverage drafts conservatively",
+    async () => {
+      const python = Bun.which("python3") ?? Bun.which("python");
+      expect(python).not.toBeNull();
+      const sourcePlugin = await bundledPluginRoot();
+      const finalizer = join(
+        sourcePlugin,
+        "scripts",
+        "finalize_scan_contract.py",
+      );
+      const workbench = join(sourcePlugin, "scripts", "workbench_db.py");
+      const result = Bun.spawnSync([
+        python!,
+        "-I",
+        "-B",
+        "-c",
+        [
+          "import copy, json, os, pathlib, runpy, sys, tempfile",
+          "module = runpy.run_path(sys.argv[1])",
+          "workbench = runpy.run_path(sys.argv[2])",
+          "complete = {'mode': 'scoped_path', 'includePaths': ['src/file.ts'], 'excludePaths': [], 'filesReviewed': {'src/file.ts': 'reviewed'}, 'outcomes': [{'path': 'src/file.ts', 'status': 'reviewed', 'candidateCount': 0, 'decisionSummary': 'No issue found.'}]}",
+          "complete_changed = module['_normalize_unsealed_legacy_coverage'](complete)",
+          "partial = {'mode': 'scoped_path', 'includePaths': ['src/a.ts', 'src/b.ts'], 'excludePaths': ['vendor/**'], 'filesReviewed': {'src/a.ts': 'reviewed', 'src/b.ts': 'skipped'}}",
+          "partial_changed = module['_normalize_unsealed_legacy_coverage'](partial)",
+          "modern = {'mode': 'scoped_path', 'includePaths': ['src/file.ts'], 'excludePaths': [], 'surfaces': [], 'filesReviewed': {'src/file.ts': 'reviewed'}}",
+          "modern_before = copy.deepcopy(modern)",
+          "modern_changed = module['_normalize_unsealed_legacy_coverage'](modern)",
+          "malformed = {'mode': 'scoped_path', 'includePaths': ['src/file.ts'], 'excludePaths': [], 'filesReviewed': {'src/file.ts': 'reviewed'}, 'outcomes': [{'path': 'src/file.ts', 'status': None}]}",
+          "malformed_before = copy.deepcopy(malformed)",
+          "malformed_changed = module['_normalize_unsealed_legacy_coverage'](malformed)",
+          "with tempfile.TemporaryDirectory() as root:",
+          "    root_path = pathlib.Path(root)",
+          "    scan = {'hardening': {'portfolioPath': 'hardening/hardening.md'}}",
+          "    module['_drop_missing_unsealed_legacy_hardening_ref'](root_path, scan, legacy_coverage_normalized=True)",
+          "    missing_legacy_ref_dropped = 'hardening' not in scan",
+          "    current_scan = {'hardening': {'portfolioPath': 'hardening/hardening.md'}}",
+          "    module['_drop_missing_unsealed_legacy_hardening_ref'](root_path, current_scan, legacy_coverage_normalized=False)",
+          "    current_ref_preserved = 'hardening' in current_scan",
+          "    metadata_scan = {'hardening': {'portfolioPath': 'hardening/hardening.md', 'metadata': {'source': 'model'}}}",
+          "    module['_drop_missing_unsealed_legacy_hardening_ref'](root_path, metadata_scan, legacy_coverage_normalized=True)",
+          "    metadata_preserved = 'hardening' in metadata_scan",
+          "    (root_path / 'outside').mkdir()",
+          "    os.symlink(root_path / 'outside', root_path / 'hardening')",
+          "    symlink_scan = {'hardening': {'portfolioPath': 'hardening/hardening.md'}}",
+          "    module['_drop_missing_unsealed_legacy_hardening_ref'](root_path, symlink_scan, legacy_coverage_normalized=True)",
+          "    symlink_ref_preserved = 'hardening' in symlink_scan",
+          "completion_allowed = [workbench['_scan_allows_completion'](row) for row in [{'status': 'running', 'canceled_at': None}, {'status': 'failed', 'canceled_at': None}, {'status': 'failed', 'canceled_at': '2026-07-29T00:00:00Z'}, {'status': 'complete', 'canceled_at': None}]]",
+          "admission_matches = [workbench['_scan_completion_admission_matches'](row, status='running', updated_at='before') for row in [{'status': 'running', 'canceled_at': None, 'updated_at': 'before'}, {'status': 'failed', 'canceled_at': None, 'updated_at': 'after'}, {'status': 'running', 'canceled_at': None, 'updated_at': 'after'}]]",
+          "print(json.dumps({'completeChanged': complete_changed, 'complete': complete, 'partialChanged': partial_changed, 'partial': partial, 'modernChanged': modern_changed, 'modernUnchanged': modern == modern_before, 'malformedChanged': malformed_changed, 'malformedUnchanged': malformed == malformed_before, 'missingLegacyRefDropped': missing_legacy_ref_dropped, 'currentRefPreserved': current_ref_preserved, 'metadataPreserved': metadata_preserved, 'symlinkRefPreserved': symlink_ref_preserved, 'completionAllowed': completion_allowed, 'admissionMatches': admission_matches}, sort_keys=True))",
+        ].join("\n"),
+        finalizer,
+        workbench,
+      ]);
+
+      expect(new TextDecoder().decode(result.stderr)).toBe("");
+      expect(result.exitCode).toBe(0);
+      const payload = JSON.parse(new TextDecoder().decode(result.stdout)) as {
+        completeChanged: boolean;
+        complete: Record<string, unknown>;
+        partialChanged: boolean;
+        partial: Record<string, unknown>;
+        modernChanged: boolean;
+        modernUnchanged: boolean;
+        malformedChanged: boolean;
+        malformedUnchanged: boolean;
+        missingLegacyRefDropped: boolean;
+        currentRefPreserved: boolean;
+        metadataPreserved: boolean;
+        symlinkRefPreserved: boolean;
+        completionAllowed: boolean[];
+        admissionMatches: boolean[];
+      };
+      expect(payload).toMatchObject({
+        completeChanged: true,
+        complete: {
+          completeness: "complete",
+          inventoryStrategy: "scoped_path",
+          explicitExclusions: [],
+          deferred: [],
+        },
+        partialChanged: true,
+        partial: {
+          completeness: "partial",
+          inventoryStrategy: "scoped_path",
+          explicitExclusions: [
+            {
+              pattern: "vendor/**",
+              reason: "Excluded by the selected scan scope.",
+            },
+          ],
+        },
+        modernChanged: false,
+        modernUnchanged: true,
+        malformedChanged: false,
+        malformedUnchanged: true,
+        missingLegacyRefDropped: true,
+        currentRefPreserved: true,
+        metadataPreserved: true,
+        symlinkRefPreserved: true,
+        completionAllowed: [true, true, false, false],
+        admissionMatches: [true, false, false],
+      });
+      expect(payload.complete).not.toHaveProperty("filesReviewed");
+      expect(payload.complete).not.toHaveProperty("outcomes");
+      expect(payload.complete["surfaces"]).toEqual([
+        {
+          id: expect.stringMatching(/^legacy-[a-f0-9]{16}$/),
+          label: "src/file.ts",
+          disposition: "no_issue_found",
+          receiptRefs: [],
+          notes: "No issue found.",
+        },
+      ]);
+      expect(payload.partial["deferred"]).toEqual([
+        {
+          id: expect.stringMatching(/^deferred-legacy-[a-f0-9]{16}$/),
+          reason: "Legacy coverage did not mark this path reviewed.",
+          paths: ["src/b.ts"],
+          surfaceIds: [expect.stringMatching(/^legacy-[a-f0-9]{16}$/)],
+        },
+      ]);
+    },
+  );
+
+  testPosix(
+    "recovers a failed workbench scan without reviving a canceled scan",
+    async () => {
+      const python = Bun.which("python3") ?? Bun.which("python");
+      expect(python).not.toBeNull();
+      const sourcePlugin = await bundledPluginRoot();
+      const workbench = join(sourcePlugin, "scripts", "workbench_db.py");
+      const repository = join(sourcePlugin, "..", "..", "..");
+      const result = Bun.spawnSync([
+        python!,
+        "-I",
+        "-B",
+        "-c",
+        [
+          "import argparse, json, os, pathlib, runpy, sys, tempfile",
+          "repository = pathlib.Path(sys.argv[2]).resolve()",
+          "target_path = 'sdk/typescript/src/errors.ts'",
+          "with tempfile.TemporaryDirectory() as root:",
+          "    root_path = pathlib.Path(root).resolve()",
+          "    os.environ['CODEX_SECURITY_STATE_DIR'] = str(root_path / 'state')",
+          "    module = runpy.run_path(sys.argv[1])",
+          "    database_isolated = module['database_path']().is_relative_to(root_path / 'state')",
+          "    connection = module['connect']()",
+          "    recipe = json.dumps({'repository': str(repository), 'mode': 'standard', 'config': {}, 'target': {'kind': 'paths', 'paths': [target_path]}})",
+          "    def register(name):",
+          "        scan_dir = root_path / name",
+          "        scan_dir.mkdir(mode=0o700)",
+          "        registered = module['register_cli_scan'](connection, argparse.Namespace(repository=str(repository), scan_dir=str(scan_dir), recipe_json=recipe, parent_scan_id=None))",
+          "        return registered['scanId'], scan_dir",
+          "    scan_id, scan_dir = register('recoverable')",
+          "    manifest = {'scan': {'target': {'kind': 'git_revision', 'targetId': 'draft', 'displayName': 'draft', 'revision': '0' * 40}, 'scope': {'includePaths': [target_path], 'excludePaths': []}}}",
+          "    findings = {'findings': []}",
+          "    coverage = {'filesReviewed': {target_path: 'reviewed'}, 'outcomes': [{'path': target_path, 'status': 'reviewed', 'candidateCount': 0, 'decisionSummary': 'No issue found.'}]}",
+          "    for filename, payload in [('scan-manifest.json', manifest), ('findings.json', findings), ('coverage.json', coverage)]:",
+          "        (scan_dir / filename).write_text(json.dumps(payload), encoding='utf-8')",
+          "    cost = {'model': 'qwen/qwen3.7-flash', 'inputTokens': 11, 'cachedInputTokens': 2, 'cacheWriteInputTokens': 0, 'outputTokens': 3, 'estimatedUsd': 0.001}",
+          "    module['fail_scan'](connection, argparse.Namespace(scan_id=scan_id, cost_json=json.dumps(cost), claim_token=None, message='artifact validation failed'))",
+          "    completed = module['complete_scan'](connection, argparse.Namespace(scan_id=scan_id, cost_json=None, claim_token=None))",
+          "    row = module['require_scan'](connection, scan_id)",
+          "    sealed_manifest = json.loads((scan_dir / 'scan-manifest.json').read_text(encoding='utf-8'))",
+          "    canceled_id, _ = register('canceled')",
+          "    module['cancel_scan'](connection, argparse.Namespace(scan_id=canceled_id, thread_id=None))",
+          "    try:",
+          "        module['complete_scan'](connection, argparse.Namespace(scan_id=canceled_id, cost_json=None, claim_token=None))",
+          "    except SystemExit as error:",
+          "        canceled_error = str(error)",
+          "    else:",
+          "        canceled_error = None",
+          "    print(json.dumps({'status': completed['scan']['progress']['status'], 'failureMessage': completed['scan']['failureMessage'], 'cost': completed['scan']['cost'], 'completedAtMatches': row['completed_at'] == sealed_manifest['scan']['completedAt'], 'canceledError': canceled_error, 'databaseIsolated': database_isolated}, sort_keys=True))",
+          "    connection.close()",
+        ].join("\n"),
+        workbench,
+        repository,
+      ]);
+
+      expect(new TextDecoder().decode(result.stderr)).toBe("");
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(new TextDecoder().decode(result.stdout))).toEqual({
+        canceledError:
+          "Only a running or non-canceled failed scan can be completed.",
+        completedAtMatches: true,
+        databaseIsolated: true,
+        cost: {
+          cacheWriteInputTokens: 0,
+          cachedInputTokens: 2,
+          estimatedUsd: 0.001,
+          inputTokens: 11,
+          model: "qwen/qwen3.7-flash",
+          outputTokens: 3,
+        },
+        failureMessage: null,
+        status: "complete",
+      });
+    },
+  );
+
+  testPosix(
     "rejects malformed completion target kinds before mutating the manifest",
     async () => {
       const python = Bun.which("python3") ?? Bun.which("python");

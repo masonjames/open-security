@@ -1398,6 +1398,25 @@ def complete_scan(connection: sqlite3.Connection, args: argparse.Namespace) -> d
         return complete_scan_locked(connection, scan_id, args.claim_token, cost_json)
 
 
+def _scan_allows_completion(scan: sqlite3.Row) -> bool:
+    return scan["status"] == "running" or (
+        scan["status"] == "failed" and scan["canceled_at"] is None
+    )
+
+
+def _scan_completion_admission_matches(
+    scan: sqlite3.Row,
+    *,
+    status: str,
+    updated_at: str,
+) -> bool:
+    return (
+        _scan_allows_completion(scan)
+        and scan["status"] == status
+        and scan["updated_at"] == updated_at
+    )
+
+
 def complete_scan_locked(
     connection: sqlite3.Connection,
     scan_id: str,
@@ -1420,8 +1439,10 @@ def complete_scan_locked(
         manifest_digest = published_manifest_digest(scan_dir, manifest)
         pin_legacy_manifest_digest(connection, scan["id"], manifest_digest)
         return scan_context(connection, scan["id"])
-    if scan["status"] != "running":
-        raise SystemExit("Only a running scan can be completed.")
+    if not _scan_allows_completion(scan):
+        raise SystemExit("Only a running or non-canceled failed scan can be completed.")
+    admitted_status = scan["status"]
+    admitted_updated_at = scan["updated_at"]
     handoff.require_current_continuation(
         scan,
         claim_token,
@@ -1434,14 +1455,14 @@ def complete_scan_locked(
     if warning is not None:
         warnings.append(warning)
     scan_dir = require_canonical_scan_directory(Path(scan["scan_dir"]))
-    completion_timestamp = now()
-    completion_binding = workbench_completion_binding(scan, completion_timestamp)
-    if scan["recipe_json"] is not None:
-        manifest = read_json_object(artifact_path(scan_dir, ARTIFACTS["manifest"], required=True))
-        manifest_scan = manifest.get("scan")
-        if isinstance(manifest_scan, dict) and manifest_scan.get("sealedAt") is not None:
-            completion_binding["startedAt"] = manifest_scan.get("startedAt")
-            completion_binding["completedAt"] = manifest_scan.get("completedAt")
+    operation_timestamp = now()
+    completion_binding = workbench_completion_binding(scan, operation_timestamp)
+    manifest = read_json_object(artifact_path(scan_dir, ARTIFACTS["manifest"], required=True))
+    manifest_scan = manifest.get("scan")
+    if isinstance(manifest_scan, dict) and manifest_scan.get("sealedAt") is not None:
+        completion_binding["startedAt"] = manifest_scan.get("startedAt")
+        completion_binding["completedAt"] = manifest_scan.get("completedAt")
+    scan_completed_at = completion_binding["completedAt"]
     try:
         prepared = _prepare_scan_finalization(
             scan_dir,
@@ -1461,13 +1482,17 @@ def complete_scan_locked(
     manifest_digest = published_manifest_digest(scan_dir, manifest)
     connection.execute("BEGIN IMMEDIATE")
     try:
-        timestamp = completion_timestamp
+        timestamp = operation_timestamp
         scan = require_scan(connection, scan["id"])
         if scan["status"] == "complete":
             connection.commit()
             return scan_context(connection, scan["id"])
-        if scan["status"] != "running":
-            raise SystemExit("Only a running scan can be completed.")
+        if not _scan_completion_admission_matches(
+            scan,
+            status=admitted_status,
+            updated_at=admitted_updated_at,
+        ):
+            raise SystemExit("Scan state changed while completion was in progress.")
         if scan["recipe_json"] is None:
             deep_scan.require_deep_scan_ready_for_parent_completion(connection, scan)
         handoff.require_current_continuation(
@@ -1495,24 +1520,32 @@ def complete_scan_locked(
             """,
             (finding_count, len(artifacts), len(artifacts), timestamp, scan["id"]),
         )
+        effective_cost_json = (
+            cost_json
+            if cost_json is not None
+            else scan["cost_json"] if scan["status"] == "failed" else None
+        )
         updated = connection.execute(
             """
             UPDATE scans
             SET status = 'complete', phase = 'reporting', completed_at = ?, updated_at = ?,
-                seal_manifest_digest = ?, cost_json = ?, completion_warnings_json = ?
-            WHERE id = ? AND status = 'running'
+                seal_manifest_digest = ?, cost_json = ?, completion_warnings_json = ?,
+                failure_message = NULL, canceled_at = NULL
+            WHERE id = ? AND status = ? AND updated_at = ? AND canceled_at IS NULL
             """,
             (
-                timestamp,
+                scan_completed_at,
                 timestamp,
                 manifest_digest,
-                cost_json,
+                effective_cost_json,
                 json.dumps(warnings),
                 scan["id"],
+                admitted_status,
+                admitted_updated_at,
             ),
         )
         if updated.rowcount != 1:
-            raise SystemExit("Only a running scan can be completed.")
+            raise SystemExit("Only a running or non-canceled failed scan can be completed.")
         connection.commit()
     except BaseException:
         connection.rollback()
@@ -1706,6 +1739,25 @@ def coverage_for_comparison(scan: sqlite3.Row) -> dict[str, Any]:
 def fail_scan(connection: sqlite3.Connection, args: argparse.Namespace) -> dict[str, Any]:
     scan_id = require_uuid(args.scan_id, "scan-id")
     cost_json = parse_scan_cost(args.cost_json)
+    message = optional_text(args.message, maximum=2400)
+    with scan_completion_lock(scan_id):
+        return fail_scan_locked(
+            connection,
+            scan_id,
+            claim_token=args.claim_token,
+            cost_json=cost_json,
+            message=message,
+        )
+
+
+def fail_scan_locked(
+    connection: sqlite3.Connection,
+    scan_id: str,
+    *,
+    claim_token: str | None,
+    cost_json: str | None,
+    message: str | None,
+) -> dict[str, Any]:
     connection.execute("BEGIN IMMEDIATE")
     try:
         timestamp = now()
@@ -1717,7 +1769,7 @@ def fail_scan(connection: sqlite3.Connection, args: argparse.Namespace) -> dict[
             raise SystemExit("A completed scan cannot be marked failed.")
         handoff.require_current_continuation(
             scan,
-            args.claim_token,
+            claim_token,
             error_message="Scan failure is owned by another continuation.",
         )
         updated = connection.execute(
@@ -1727,22 +1779,11 @@ def fail_scan(connection: sqlite3.Connection, args: argparse.Namespace) -> dict[
                 cost_json = ?
             WHERE id = ? AND status = 'running'
             """,
-            (
-                optional_text(args.message, maximum=2400),
-                timestamp,
-                timestamp,
-                cost_json,
-                scan["id"],
-            ),
+            (message, timestamp, timestamp, cost_json, scan["id"]),
         )
         if updated.rowcount != 1:
             raise SystemExit("Only a running scan can be marked failed.")
-        deep_scan.fail_from_parent_scan(
-            connection,
-            scan["id"],
-            optional_text(args.message, maximum=2400),
-            timestamp,
-        )
+        deep_scan.fail_from_parent_scan(connection, scan["id"], message, timestamp)
         progress_updated = connection.execute(
             "UPDATE scan_progress SET updated_at = ? WHERE scan_id = ?",
             (timestamp, scan["id"]),
@@ -1759,6 +1800,16 @@ def fail_scan(connection: sqlite3.Connection, args: argparse.Namespace) -> dict[
 def cancel_scan(connection: sqlite3.Connection, args: argparse.Namespace) -> dict[str, Any]:
     scan_id = require_uuid(args.scan_id, "scan-id")
     thread_id = optional_text(args.thread_id, maximum=512)
+    with scan_completion_lock(scan_id):
+        return cancel_scan_locked(connection, scan_id, thread_id=thread_id)
+
+
+def cancel_scan_locked(
+    connection: sqlite3.Connection,
+    scan_id: str,
+    *,
+    thread_id: str | None,
+) -> dict[str, Any]:
     connection.execute("BEGIN IMMEDIATE")
     try:
         timestamp = now()
