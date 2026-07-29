@@ -1806,7 +1806,7 @@ describe("CLI", () => {
       "Tokens: 1,250 input, 200 cached, 30 output.",
     );
     expect(stderr.text()).toContain("Estimated cost: $0.00625 USD.");
-    expect(stderr.text()).toContain("Report: /tmp/scan/report.md");
+    expect(stderr.text()).toContain(`Report: ${result.reportPath}`);
     expect(stderr.text()).toContain("Results: /tmp/scan");
     expect(stderr.text()).not.toContain("Next:");
   });
@@ -2008,7 +2008,7 @@ describe("CLI", () => {
       "Tokens: 1,250 input, 200 cached, 30 output.",
     );
     expect(stderr.text()).toContain("Estimated cost: $0.00625 USD.");
-    expect(stderr.text()).toContain("Report: /tmp/scan/report.md");
+    expect(stderr.text()).toContain(`Report: ${result.reportPath}`);
     expect(stderr.text()).toContain("Results: /tmp/scan");
     expect(stderr.text()).not.toContain("Next:");
   });
