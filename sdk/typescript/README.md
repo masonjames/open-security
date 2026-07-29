@@ -36,6 +36,13 @@ later. Scanning and exporting findings also require Python 3.10 or later. If
 you use Python 3.10, install the `tomli` package. Select another interpreter
 with `--python`, `pythonPath`, or `PYTHON` when needed.
 
+When a newer version is available, the CLI shows the update command for your
+installation method. Set `OPEN_SECURITY_NO_UPDATE_NOTICE=1` to hide the notice;
+the legacy `CODEX_SECURITY_NO_UPDATE_NOTICE=1` alias remains supported. Notices
+are also disabled in CI and when stderr is not a terminal. Set
+`OPEN_SECURITY_NPM_REGISTRY` to use a private or mirrored registry for the
+check; `CODEX_SECURITY_NPM_REGISTRY` remains a compatibility alias.
+
 ## Run a scan from TypeScript
 
 Sign in with `open-security login` or set `OPENAI_API_KEY` or
@@ -220,6 +227,7 @@ open-security scans rerun SCAN_ID
 open-security scans match PREVIOUS_SCAN_ID CURRENT_SCAN_ID
 open-security scans match --all
 open-security scans compare PREVIOUS_SCAN_ID CURRENT_SCAN_ID
+open-security findings false-positive OCCURRENCE_ID --reason "The route already checks permissions"
 open-security export /path/outside/repository/results --export-format sarif --output /path/outside/repository/results.sarif
 open-security export /path/outside/repository/results --export-format csv --output /path/outside/repository/findings.csv
 open-security export /path/outside/repository/results --export-format json --output /path/outside/repository/findings.json
@@ -348,17 +356,22 @@ Every scan history command accepts a full scan ID or a unique prefix of at
 least eight characters.
 
 Scan history uses the existing Open Security workbench database at
-`$CODEX_HOME/state/plugins/codex-security/workbench.sqlite3`. Set
-`CODEX_SECURITY_STATE_DIR` to place the database elsewhere. Scan credentials
-are never stored in the scan configuration.
+`$CODEX_HOME/state/plugins/codex-security/workbench.sqlite3`. Set the preferred
+`OPEN_SECURITY_STATE_DIR` variable to place the database elsewhere; the legacy
+`CODEX_SECURITY_STATE_DIR` alias remains supported. Scan credentials are never
+stored in the scan configuration.
 
 The scan sandbox permits writes to the selected state directory so SQLite can
 maintain its database and journal files. If the host itself cannot write to the
 default directory, select a writable directory outside the scanned repository:
 
 ```bash
-export CODEX_SECURITY_STATE_DIR=/path/to/writable/codex-security-state
+export OPEN_SECURITY_STATE_DIR=/path/to/writable/open-security-state
 ```
+
+Use `open-security findings false-positive OCCURRENCE_ID --reason TEXT` to mark
+a finding as a false positive and explain why. Later scans dismiss a matching
+finding only when the same reason still applies.
 
 `scans rerun SCAN_ID` repeats the original configuration against the current
 checkout so a fixed vulnerability can be checked again.

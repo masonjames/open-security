@@ -928,7 +928,8 @@ describe("runtime directories and plugin Python boundary", () => {
     expect(message).toContain("Could not save the Codex Security scan");
     expect(message).toContain(join(stateDirectory, "workbench.sqlite3"));
     expect(message).toContain("SQLite journal files are writable");
-    expect(message).toContain("CODEX_SECURITY_STATE_DIR");
+    expect(message).toContain("OPEN_SECURITY_STATE_DIR");
+    expect(message).toContain("legacy CODEX_SECURITY_STATE_DIR");
     expect(message).not.toContain("Traceback");
   });
 

@@ -78,18 +78,20 @@ For CI, set `OPENAI_API_KEY` or `CODEX_API_KEY`. If both a stored ChatGPT sign-i
 
 ## Configuration environment variables
 
-| Variable                         | Purpose                                                            |
-| -------------------------------- | ------------------------------------------------------------------ |
-| `OPEN_SECURITY_PROVIDER`         | Default provider: `openai` or `openrouter`                         |
-| `OPEN_SECURITY_MODEL`            | Default model ID; required for OpenRouter                          |
-| `OPEN_SECURITY_REASONING_EFFORT` | Default reasoning effort                                           |
+| Variable                                     | Purpose                                                                        |
+| -------------------------------------------- | ------------------------------------------------------------------------------ |
+| `OPEN_SECURITY_PROVIDER`                     | Default provider: `openai` or `openrouter`                                     |
+| `OPEN_SECURITY_MODEL`                        | Default model ID; required for OpenRouter                                      |
+| `OPEN_SECURITY_REASONING_EFFORT`             | Default reasoning effort                                                       |
 | `OPEN_SECURITY_OPENROUTER_MAX_OUTPUT_TOKENS` | OpenRouter standard-scan output reservation cap (`1`–`65536`; default `16384`) |
-| `OPEN_SECURITY_MAX_COST_USD`     | Positive live estimated-cost limit for an individual standard scan |
-| `OPEN_SECURITY_STATE_DIR`        | Workbench state directory; preferred fork name                     |
-| `OPENROUTER_API_KEY`             | OpenRouter API credential                                          |
-| `OPENAI_API_KEY`                 | OpenAI API credential                                              |
-| `CODEX_API_KEY`                  | Backward-compatible OpenAI API credential alias                    |
-| `CODEX_SECURITY_STATE_DIR`       | Backward-compatible state-directory alias                          |
+| `OPEN_SECURITY_MAX_COST_USD`                 | Positive live estimated-cost limit for an individual standard scan             |
+| `OPEN_SECURITY_STATE_DIR`                    | Workbench state directory; preferred fork name                                 |
+| `OPEN_SECURITY_NO_UPDATE_NOTICE`             | Disable interactive update notices when set                                    |
+| `OPEN_SECURITY_NPM_REGISTRY`                 | Registry base URL used only for update checks                                  |
+| `OPENROUTER_API_KEY`                         | OpenRouter API credential                                                      |
+| `OPENAI_API_KEY`                             | OpenAI API credential                                                          |
+| `CODEX_API_KEY`                              | Backward-compatible OpenAI API credential alias                                |
+| `CODEX_SECURITY_STATE_DIR`                   | Backward-compatible state-directory alias                                      |
 
 Explicit CLI or SDK values take precedence over environment defaults. Saved scan recipes record the provider and safe model configuration, but never credentials.
 

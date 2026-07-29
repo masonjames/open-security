@@ -106,4 +106,9 @@ export {
   validateMode,
 } from "./targets.js";
 export type { NormalizedTarget, ScanMode, ScanTarget } from "./targets.js";
-export { BUNDLED_PLUGIN_VERSION, VERSION } from "./version.js";
+export {
+  BUNDLED_PLUGIN_VERSION,
+  OPEN_SECURITY_NO_UPDATE_NOTICE_ENV,
+  OPEN_SECURITY_NPM_REGISTRY_ENV,
+  VERSION,
+} from "./version.js";

@@ -158,7 +158,7 @@ export async function runWorkbench(
         ? `${failure}: cannot open the workbench database at ${join(
             codexSecurityStateDirectory(options.environment),
             "workbench.sqlite3",
-          )}. Ensure the state directory and SQLite journal files are writable, or set CODEX_SECURITY_STATE_DIR to a writable directory outside the scanned repository.`
+          )}. Ensure the state directory and SQLite journal files are writable, or set OPEN_SECURITY_STATE_DIR (or legacy CODEX_SECURITY_STATE_DIR) to a writable directory outside the scanned repository.`
         : `${failure}: ${detail}`,
       { cause: error },
     );

@@ -223,6 +223,19 @@ if (
 ) {
   throw new Error("npm package does not contain the expected public metadata.");
 }
+const versionModule = tar([
+  "-xOf",
+  archive,
+  "package/dist/version.js",
+]).toString("utf8");
+if (
+  versionModule.includes("@openai/codex-security") ||
+  versionModule.includes("Codex Security update available")
+) {
+  throw new Error(
+    "npm package contains an upstream-branded update notification.",
+  );
+}
 
 const internalMarker =
   /(?:internal\.api\.openai\.org|gateway\.[a-z0-9.-]*internal|\.openai\.org|openai\.firewall\.socket\.dev|socket\x2dfirewall\x2dregistry|openai\.(?:enterprise\.)?slack\.com|app\.slack\.com\/client|(?:app\.notion\.com\/p|notion\.so)\/openai|linear\.app\/openai|(?:github\.com[:/]|api\.github\.com\/repos\/|raw\.githubusercontent\.com\/)openai\/openai(?:\.git)?(?:[^a-z0-9_-]|$)|LicenseRef\x2dProprietary|\/Users\/|\/home\/dev-user|flow\.apps\.openai\.org|(?:^|[^a-z0-9_-])go\/[a-z0-9_-]+)/iu;

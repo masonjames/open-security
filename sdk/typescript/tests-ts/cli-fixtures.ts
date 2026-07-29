@@ -13,6 +13,7 @@ import type {
   SeverityLevel,
 } from "../src/index.js";
 import { CodexSecurityError, ScanResult } from "../src/index.js";
+import type { UpdateNotice } from "../src/version.js";
 
 type MainDependencies = NonNullable<Parameters<typeof main>[3]>;
 
@@ -249,6 +250,7 @@ export function dependencies(
     fetchOpenRouterModel?: NonNullable<
       MainDependencies["fetchOpenRouterModel"]
     >;
+    onUpdateCheck?: () => Promise<UpdateNotice | undefined>;
     currentDirectory?: string;
     preflight?: ScanPreflight;
     environment?: NodeJS.ProcessEnv;
@@ -297,6 +299,7 @@ export function dependencies(
       return security;
     },
     environment: options.environment ?? {},
+    checkForUpdate: async () => await options.onUpdateCheck?.(),
     currentDirectory: () => options.currentDirectory ?? "/current/repository",
     now: () => 0,
     setInterval: () => ({}) as NodeJS.Timeout,
