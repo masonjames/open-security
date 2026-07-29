@@ -3451,16 +3451,19 @@ if (args === "login --with-api-key") {
         },
       },
     );
-    await client.loginApiKey("secret-key");
-    const login = await client.loginChatGPT();
-    await expect(login.wait()).resolves.toMatchObject({ success: true });
-    await client.run(repository);
-    expect((codexOptions as CodexOptions | null)?.apiKey).toBeUndefined();
-    expect((codexOptions as CodexOptions | null)?.env).toMatchObject({
-      OPENAI_API_KEY: "ambient-key",
-      CODEX_API_KEY: "secondary-ambient-key",
-    });
-    await client.close();
+    try {
+      await client.loginApiKey("secret-key");
+      const login = await client.loginChatGPT();
+      await expect(login.wait()).resolves.toMatchObject({ success: true });
+      await client.run(repository);
+      expect((codexOptions as CodexOptions | null)?.apiKey).toBeUndefined();
+      expect((codexOptions as CodexOptions | null)?.env).toMatchObject({
+        OPENAI_API_KEY: "ambient-key",
+        CODEX_API_KEY: "secondary-ambient-key",
+      });
+    } finally {
+      await client.close();
+    }
   });
 
   test("aborts and waits for an in-flight API-key login during close", async () => {
