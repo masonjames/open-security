@@ -1,14 +1,48 @@
 export { CodexSecurity } from "./api.js";
 export { estimateScanCost } from "./cost.js";
-export type { ScanCost } from "./cost.js";
+export type { ModelPricingNanodollars, ScanCost } from "./cost.js";
+export {
+  assertOpenRouterScanCapabilities,
+  fetchOpenRouterModel,
+  OPENROUTER_MODEL_CATALOG_TTL_MS,
+  OPENROUTER_MODELS_URL,
+  OpenRouterModelCatalogError,
+  OpenRouterModelCompatibilityError,
+} from "./openrouter-models.js";
+export type {
+  OpenRouterCatalogFetch,
+  OpenRouterModelCatalogErrorCode,
+  OpenRouterModelCatalogOptions,
+  OpenRouterModelMetadata,
+  OpenRouterScanCapabilityRequirements,
+  OpenRouterTokenPricingNanodollars,
+} from "./openrouter-models.js";
 export type {
   CodexSecurityMetadata,
   ScanAuthMode,
   ScanAuthentication,
   ScanOptions,
   ScanPreflight,
+  ScanPreflightModelCatalog,
   ScanReconnectDetails,
 } from "./api.js";
+export {
+  DEFAULT_OPENROUTER_MAX_OUTPUT_TOKENS,
+  DEFAULT_OPENROUTER_REASONING_EFFORT,
+  DEFAULT_SCAN_PROVIDER,
+  OPEN_SECURITY_MAX_COST_USD_ENV,
+  OPEN_SECURITY_MODEL_ENV,
+  OPEN_SECURITY_OPENROUTER_MAX_OUTPUT_TOKENS_ENV,
+  OPEN_SECURITY_PROVIDER_ENV,
+  OPEN_SECURITY_REASONING_EFFORT_ENV,
+  OPENROUTER_API_KEY_ENV,
+  OPENROUTER_BASE_URL,
+  ProviderConfigurationError,
+  providerCodexOverrides,
+  resolveOpenRouterMaxOutputTokens,
+  resolveProviderSelection,
+} from "./provider.js";
+export type { ProviderSelection, ScanProvider } from "./provider.js";
 export type { ScanWorkerPhase, ScanWorkerStatus } from "./worker-progress.js";
 export { CodexLoginHandle } from "./auth.js";
 export type { AccountStatus, LoginResult } from "./auth.js";
@@ -48,6 +82,7 @@ export {
   extractPluginZip,
   importAmbientAuth,
   MARKETPLACE_NAME,
+  OPEN_SECURITY_STATE_DIR_ENV,
   pluginExecutionEnvironment,
   pluginMetadata,
   PLUGIN_NAME,

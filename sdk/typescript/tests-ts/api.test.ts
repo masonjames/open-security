@@ -98,6 +98,14 @@ async function copyCompletedScan(root: string): Promise<string> {
   return scanDir;
 }
 
+function syntheticOpenRouterBridge() {
+  return {
+    baseUrl: "http://127.0.0.1:45678/synthetic-opaque-route/api/v1",
+    credential: "synthetic-ephemeral-bridge-key",
+    async close() {},
+  };
+}
+
 async function writeUsageSession(
   codexHome: string,
   threadId: string,
@@ -487,6 +495,7 @@ describe("CodexSecurity orchestration", () => {
       }),
     ).resolves.toEqual({
       repository,
+      provider: "openai",
       target: { kind: "paths", paths: ["src"] },
       mode: "deep",
       outputDir: output,
@@ -548,6 +557,205 @@ describe("CodexSecurity orchestration", () => {
     await client.close();
   });
 
+  test("preflights OpenRouter model capability and conservative public pricing", async () => {
+    const root = await temporaryDirectory();
+    const repository = join(root, "repository");
+    await mkdir(repository);
+    let requestedModel = "";
+    let runtimeStarted = false;
+    const client = new TestClient(
+      {
+        provider: "openrouter",
+        codexOverrides: {
+          model: "qwen/qwen3.7-flash",
+          model_reasoning_effort: "high",
+        },
+      },
+      {
+        environment: {
+          OPENROUTER_API_KEY: "synthetic-openrouter-key",
+          OPENAI_API_KEY: "must-not-be-selected",
+        },
+        fetchOpenRouterModel: async (model: string) => {
+          requestedModel = model;
+          return {
+            id: model,
+            canonicalSlug: "qwen/qwen3.7-flash-20260727",
+            name: "Qwen: Qwen3.7 Flash",
+            contextLength: 1_000_000,
+            supportedParameters: ["tools", "response_format", "reasoning"],
+            tokenPricingNanodollars: {
+              input: 200,
+              cachedInput: 40,
+              cacheWriteInput: 250,
+              output: 800,
+            },
+            requestPricingNanodollars: 0,
+            unsupportedPricingNanodollars: 0,
+            pricingOverridesConsidered: 2,
+            providerEndpointsConsidered: 1,
+            fetchedAt: Date.UTC(2026, 6, 28),
+          };
+        },
+        prepareRuntime: async () => {
+          runtimeStarted = true;
+          throw new Error("runtime should not initialize");
+        },
+      },
+    );
+
+    await expect(
+      client.preflight(repository, { maxCostUsd: 1 }),
+    ).resolves.toMatchObject({
+      provider: "openrouter",
+      authentication: {
+        method: "api_key",
+        source: "OPENROUTER_API_KEY",
+        verified: false,
+      },
+      model: "qwen/qwen3.7-flash",
+      reasoningEffort: "high",
+      maxCostUsd: 1,
+      openRouterMaxOutputTokens: 16_384,
+      modelCatalog: {
+        source: "https://openrouter.ai/api/v1/models",
+        canonicalSlug: "qwen/qwen3.7-flash-20260727",
+        contextLength: 1_000_000,
+        fetchedAt: "2026-07-28T00:00:00.000Z",
+        conservativePricing: true,
+        requestPricingNanodollars: 0,
+        unsupportedPricingNanodollars: 0,
+        providerEndpointsConsidered: 1,
+        pricingOverridesConsidered: 2,
+        tokenPricingNanodollars: {
+          input: 200,
+          cachedInput: 40,
+          cacheWriteInput: 250,
+          output: 800,
+        },
+      },
+    });
+    expect(requestedModel).toBe("qwen/qwen3.7-flash");
+    expect(runtimeStarted).toBe(false);
+    await client.close();
+  });
+
+  test("fails closed when OpenRouter advertises untracked non-token pricing", async () => {
+    const root = await temporaryDirectory();
+    const repository = join(root, "repository");
+    await mkdir(repository);
+
+    for (const pricing of [
+      { requestPricingNanodollars: 1, unsupportedPricingNanodollars: 0 },
+      { requestPricingNanodollars: 0, unsupportedPricingNanodollars: 1 },
+    ]) {
+      let runtimeStarted = false;
+      const client = new TestClient(
+        {
+          provider: "openrouter",
+          codexOverrides: { model: "example/priced-model" },
+        },
+        {
+          environment: {
+            OPENROUTER_API_KEY: "synthetic-openrouter-key",
+          },
+          fetchOpenRouterModel: async (model: string) => ({
+            id: model,
+            canonicalSlug: null,
+            name: "Priced example",
+            contextLength: 128_000,
+            supportedParameters: ["tools", "response_format", "reasoning"],
+            tokenPricingNanodollars: {
+              input: 1,
+              cachedInput: 1,
+              cacheWriteInput: 1,
+              output: 1,
+            },
+            ...pricing,
+            pricingOverridesConsidered: 0,
+            providerEndpointsConsidered: 1,
+            fetchedAt: Date.UTC(2026, 6, 28),
+          }),
+          prepareRuntime: async () => {
+            runtimeStarted = true;
+            throw new Error("runtime should not initialize");
+          },
+        },
+      );
+
+      await expect(client.preflight(repository)).rejects.toThrow(
+        "non-token pricing",
+      );
+      expect(runtimeStarted).toBe(false);
+      await client.close();
+    }
+  });
+
+  test("rejects invalid OpenRouter output-token clamps before runtime or catalog work", async () => {
+    const root = await temporaryDirectory();
+    const repository = join(root, "repository");
+    await mkdir(repository);
+    let runtimeStarted = false;
+    let catalogRequested = false;
+    const client = new TestClient(
+      {
+        provider: "openrouter",
+        codexOverrides: { model: "qwen/qwen3.7-flash" },
+      },
+      {
+        environment: {
+          OPENROUTER_API_KEY: "synthetic-openrouter-key",
+          OPEN_SECURITY_OPENROUTER_MAX_OUTPUT_TOKENS: "0",
+        },
+        fetchOpenRouterModel: async () => {
+          catalogRequested = true;
+          throw new Error("catalog should not be requested");
+        },
+        prepareRuntime: async () => {
+          runtimeStarted = true;
+          throw new Error("runtime should not initialize");
+        },
+      },
+    );
+
+    await expect(client.preflight(repository)).rejects.toThrow(
+      "OPEN_SECURITY_OPENROUTER_MAX_OUTPUT_TOKENS",
+    );
+    expect(catalogRequested).toBe(false);
+    expect(runtimeStarted).toBe(false);
+    await client.close();
+  });
+
+  test("applies SDK cost-limit environment defaults and lets explicit options win", async () => {
+    const root = await temporaryDirectory();
+    const repository = join(root, "repository");
+    await mkdir(repository);
+    const client = new TestClient(
+      {},
+      { environment: { OPEN_SECURITY_MAX_COST_USD: "3.5" } },
+    );
+
+    await expect(client.preflight(repository)).resolves.toMatchObject({
+      maxCostUsd: 3.5,
+    });
+    await expect(
+      client.preflight(repository, { maxCostUsd: 2 }),
+    ).resolves.toMatchObject({ maxCostUsd: 2 });
+    await client.close();
+
+    const invalid = new TestClient(
+      {},
+      { environment: { OPEN_SECURITY_MAX_COST_USD: "invalid" } },
+    );
+    await expect(invalid.preflight(repository)).rejects.toThrow(
+      "OPEN_SECURITY_MAX_COST_USD",
+    );
+    await expect(
+      invalid.preflight(repository, { maxCostUsd: 2 }),
+    ).resolves.toMatchObject({ maxCostUsd: 2 });
+    await invalid.close();
+  });
+
   test("validates cost limits and pricing before starting a scan", async () => {
     const root = await temporaryDirectory();
     const repository = join(root, "repository");
@@ -573,6 +781,41 @@ describe("CodexSecurity orchestration", () => {
       ).rejects.toThrow("cost limit must be a positive USD amount");
     }
 
+    await expect(
+      client.preflight(repository, { mode: "deep", maxCostUsd: 5 }),
+    ).rejects.toThrow("Cost limits are not supported for deep scans");
+
+    let catalogRequested = false;
+    let deepRuntimeStarted = false;
+    const openRouter = new TestClient(
+      {
+        provider: "openrouter",
+        codexOverrides: { model: "qwen/qwen3.7-flash" },
+      },
+      {
+        environment: { OPENROUTER_API_KEY: "synthetic-openrouter-key" },
+        fetchOpenRouterModel: async () => {
+          catalogRequested = true;
+          throw new Error("catalog should not be requested");
+        },
+        prepareRuntime: async () => {
+          deepRuntimeStarted = true;
+          throw new Error("runtime should not initialize");
+        },
+      },
+    );
+    for (const operation of [
+      () => openRouter.preflight(repository, { mode: "deep" }),
+      () => openRouter.run(repository, { mode: "deep", maxCostUsd: 5 }),
+    ]) {
+      await expect(operation()).rejects.toThrow(
+        "Deep scans with OpenRouter are not yet supported",
+      );
+    }
+    expect(catalogRequested).toBe(false);
+    expect(deepRuntimeStarted).toBe(false);
+    await openRouter.close();
+
     const unpriced = new TestClient(
       { codexOverrides: { model: "unknown-model" } },
       { environment: {} },
@@ -582,6 +825,38 @@ describe("CodexSecurity orchestration", () => {
     ).rejects.toThrow("cost limit is not available for the configured model");
     expect(runtimeStarted).toBe(false);
     await unpriced.close();
+
+    const zeroPriced = new TestClient(
+      {
+        provider: "openrouter",
+        codexOverrides: { model: "free/example-model" },
+      },
+      {
+        environment: { OPENROUTER_API_KEY: "synthetic-openrouter-key" },
+        fetchOpenRouterModel: async (model: string) => ({
+          id: model,
+          canonicalSlug: null,
+          name: "Zero-priced example",
+          contextLength: 128_000,
+          supportedParameters: ["tools", "response_format", "reasoning"],
+          tokenPricingNanodollars: {
+            input: 0,
+            cachedInput: 0,
+            cacheWriteInput: 0,
+            output: 0,
+          },
+          requestPricingNanodollars: 0,
+          unsupportedPricingNanodollars: 0,
+          pricingOverridesConsidered: 0,
+          providerEndpointsConsidered: 1,
+          fetchedAt: Date.UTC(2026, 6, 28),
+        }),
+      },
+    );
+    await expect(
+      zeroPriced.preflight(repository, { maxCostUsd: 5 }),
+    ).resolves.toMatchObject({ maxCostUsd: 5 });
+    await zeroPriced.close();
     await client.close();
   });
 
@@ -1827,6 +2102,9 @@ describe("CodexSecurity orchestration", () => {
       },
       {
         environment: { CODEX_HOME: ambientHome },
+        createOpenRouterResponsesBridge: async () => {
+          throw new Error("OpenAI runtime must not start an OpenRouter bridge");
+        },
         resolvePluginPython: async () => interpreter!,
         prepareOutputDir: async () => scanDir,
         repositoryRevision: async () => "deadbeef",
@@ -1934,6 +2212,166 @@ describe("CodexSecurity orchestration", () => {
     }
     expect(existsSync(capturedConfigPath!)).toBe(false);
     expect(existsSync(capturedCodexHome!)).toBe(false);
+  });
+
+  test("routes a real OpenRouter runtime through one private bridge and closes it", async () => {
+    const root = await temporaryDirectory();
+    const repository = join(root, "repository");
+    const scanDir = join(root, "scan");
+    await mkdir(repository);
+    await mkdir(scanDir, { mode: 0o700 });
+    const interpreter =
+      Bun.which("python3") ?? Bun.which("python") ?? Bun.which("py");
+    expect(interpreter).not.toBeNull();
+
+    const bridgeBaseUrl =
+      "http://127.0.0.1:45678/synthetic-opaque-route/api/v1";
+    let bridgeClosed = 0;
+    let bridgeOptions: Record<string, unknown> | undefined;
+    let recipe = "";
+    let capturedCodexHome = "";
+    const client = new TestClient(
+      {
+        provider: "openrouter",
+        pluginPath: PLUGIN_ROOT,
+        codexOverrides: {
+          model: "qwen/qwen3.7-flash",
+          model_reasoning_effort: "medium",
+        },
+      },
+      {
+        environment: {
+          OPENROUTER_API_KEY: "synthetic-openrouter-key",
+          OPEN_SECURITY_OPENROUTER_MAX_OUTPUT_TOKENS: "12345",
+          HTTP_PROXY: "http://proxy.invalid",
+          https_proxy: "http://proxy.invalid",
+          ALL_PROXY: "socks5://proxy.invalid",
+          NO_PROXY: "existing.example",
+          no_proxy: "other.example",
+        },
+        createOpenRouterResponsesBridge: async (
+          options: Record<string, unknown>,
+        ) => {
+          bridgeOptions = options;
+          return {
+            baseUrl: bridgeBaseUrl,
+            credential: "synthetic-ephemeral-bridge-key",
+            async close() {
+              bridgeClosed += 1;
+            },
+          };
+        },
+        fetchOpenRouterModel: async (model: string) => ({
+          id: model,
+          canonicalSlug: "qwen/qwen3.7-flash-20260727",
+          name: "Qwen: Qwen3.7 Flash",
+          contextLength: 1_000_000,
+          supportedParameters: ["tools", "response_format", "reasoning"],
+          tokenPricingNanodollars: {
+            input: 200,
+            cachedInput: 40,
+            cacheWriteInput: 250,
+            output: 800,
+          },
+          requestPricingNanodollars: 0,
+          unsupportedPricingNanodollars: 0,
+          pricingOverridesConsidered: 2,
+          providerEndpointsConsidered: 1,
+          fetchedAt: Date.UTC(2026, 6, 28),
+        }),
+        resolvePluginPython: async () => interpreter!,
+        prepareOutputDir: async () => scanDir,
+        repositoryRevision: async () => "deadbeef",
+        runWorkbench: async (_options: unknown, args: readonly string[]) => {
+          if (args[0] === "register-cli-scan") {
+            recipe = args[args.indexOf("--recipe-json") + 1] ?? "";
+            return {
+              scanId: "scan_example_001",
+              targetId: "target_sha256_example",
+              scanDir,
+            };
+          }
+          return {};
+        },
+        createCodex: (options: CodexOptions) => ({
+          startThread: () => ({
+            id: null,
+            async runStreamed() {
+              capturedCodexHome = options.env?.["CODEX_HOME"] ?? "";
+              expect(capturedCodexHome).not.toBe("");
+              const runtimeConfig = parseToml(
+                await readFile(join(capturedCodexHome, "config.toml"), "utf8"),
+              ) as Record<string, unknown>;
+              expect(runtimeConfig).toMatchObject({
+                model_provider: "openrouter",
+                model_providers: {
+                  openrouter: {
+                    name: "OpenRouter",
+                    base_url: bridgeBaseUrl,
+                    env_key: "OPENROUTER_API_KEY",
+                    wire_api: "responses",
+                  },
+                },
+                features: {
+                  enable_request_compression: false,
+                  responses_websockets: false,
+                  responses_websockets_v2: false,
+                  remote_compaction_v2: false,
+                },
+              });
+              const preflightPath =
+                options.env?.["CODEX_SECURITY_CONFIG_PATH"] ?? "";
+              const preflightConfig = await readFile(preflightPath, "utf8");
+              expect(preflightConfig).not.toContain("synthetic-opaque-route");
+              expect(recipe).not.toContain("synthetic-opaque-route");
+              const modelEnvironment = options.env as Record<string, string>;
+              expect(modelEnvironment["HTTP_PROXY"]).toBeUndefined();
+              expect(modelEnvironment["https_proxy"]).toBeUndefined();
+              expect(modelEnvironment["ALL_PROXY"]).toBeUndefined();
+              expect(modelEnvironment["OPENROUTER_API_KEY"]).toBe(
+                "synthetic-ephemeral-bridge-key",
+              );
+              expect(modelEnvironment["OPENROUTER_API_KEY"]).not.toBe(
+                "synthetic-openrouter-key",
+              );
+              expect(modelEnvironment["NO_PROXY"]).toContain("127.0.0.1");
+              expect(modelEnvironment["NO_PROXY"]).toContain("localhost");
+              expect(modelEnvironment["no_proxy"]).toBe(
+                modelEnvironment["NO_PROXY"],
+              );
+              await copyCompletedScan(root);
+              const manifestPath = join(scanDir, "scan-manifest.json");
+              const manifest = JSON.parse(
+                await readFile(manifestPath, "utf8"),
+              ) as { scan: { producer: { version: string } } };
+              const pluginManifest = JSON.parse(
+                await readFile(
+                  join(PLUGIN_ROOT, ".codex-plugin", "plugin.json"),
+                  "utf8",
+                ),
+              ) as { version: string };
+              manifest.scan.producer.version = pluginManifest.version;
+              await writeFile(manifestPath, JSON.stringify(manifest));
+              return { events: completedEvents() };
+            },
+          }),
+        }),
+      },
+    );
+
+    await expect(client.run(repository)).resolves.toBeDefined();
+    expect(bridgeOptions).toMatchObject({
+      expectedModel: "qwen/qwen3.7-flash",
+      maxOutputTokens: 12_345,
+    });
+    expect(
+      (bridgeOptions?.["getUpstreamApiKey"] as (() => string) | undefined)?.(),
+    ).toBe("synthetic-openrouter-key");
+    expect(bridgeClosed).toBe(0);
+    await client.close();
+    await client.close();
+    expect(bridgeClosed).toBe(1);
+    expect(existsSync(capturedCodexHome)).toBe(false);
   });
 
   test("rejects a shell-visible plugin root inside CODEX_HOME", async () => {
@@ -2509,15 +2947,741 @@ if (process.argv.slice(2).join(" ") !== "login --with-api-key") {
       (codexOptions as CodexOptions | null)?.codexPathOverride,
     ).toBeUndefined();
     expect((codexOptions as CodexOptions | null)?.env).toMatchObject({
-      OpenAi_Api_Key: "forwarded-openai-key",
-      codex_api_key: "forwarded-codex-key",
+      OPENAI_API_KEY: "forwarded-openai-key",
+      CODEX_API_KEY: "forwarded-codex-key",
     });
-    expect(pythonEnvironment).toMatchObject({
-      openai_api_key: "stale-key",
-      OPENAI_API_KEY: "ambient-key",
-      Codex_Api_Key: "secondary-key",
-    });
+    expect((codexOptions as CodexOptions | null)?.env).not.toHaveProperty(
+      "OpenAi_Api_Key",
+    );
+    expect((codexOptions as CodexOptions | null)?.env).not.toHaveProperty(
+      "codex_api_key",
+    );
+    expect(pythonEnvironment).toEqual({});
     expect(pythonProtectedRoot).toBe(await realpath(repository));
+    await client.close();
+  });
+
+  test("gives the model process only an ephemeral OpenRouter bridge credential", async () => {
+    const root = await temporaryDirectory();
+    const repository = join(root, "repository");
+    const codexHome = join(root, "codex-home");
+    const scanDir = join(root, "scan");
+    await mkdir(repository);
+    await mkdir(codexHome);
+    await mkdir(scanDir, { mode: 0o700 });
+    let codexOptions: CodexOptions | null = null;
+    let pythonEnvironment: Record<string, string | undefined> | undefined;
+    let loginAttempted = false;
+    let modelTurns = 0;
+    const client = new TestClient(
+      {
+        provider: "openrouter",
+        codexOverrides: { model: "qwen/qwen3.7-flash" },
+      },
+      {
+        environment: {
+          OPENROUTER_API_KEY: "synthetic-openrouter-key",
+          OPENAI_API_KEY: "must-not-be-forwarded",
+          CODEX_API_KEY: "must-not-be-forwarded-either",
+        },
+        fetchOpenRouterModel: async (model: string) => ({
+          id: model,
+          canonicalSlug: "qwen/qwen3.7-flash-20260727",
+          name: "Qwen: Qwen3.7 Flash",
+          contextLength: 1_000_000,
+          supportedParameters: ["tools", "response_format", "reasoning"],
+          tokenPricingNanodollars: {
+            input: 200,
+            cachedInput: 40,
+            cacheWriteInput: 250,
+            output: 800,
+          },
+          requestPricingNanodollars: 0,
+          unsupportedPricingNanodollars: 0,
+          pricingOverridesConsidered: 2,
+          providerEndpointsConsidered: 1,
+          fetchedAt: Date.UTC(2026, 6, 28),
+        }),
+        prepareRuntime: async () => ({
+          codexHome,
+          plugin: {
+            pluginRoot: PLUGIN_ROOT,
+            marketplaceRoot: PLUGIN_ROOT,
+            installedRoot: PLUGIN_ROOT,
+            marketplaceName: "codex-security-sdk",
+            name: "codex-security",
+            version: "0.1.0",
+          },
+          environment: {
+            CODEX_HOME: codexHome,
+            OPENROUTER_API_KEY: "synthetic-openrouter-key",
+            OPENAI_API_KEY: "must-not-be-forwarded",
+            CODEX_API_KEY: "must-not-be-forwarded-either",
+          },
+          credentialsAvailable: true,
+          openRouterBridge: syntheticOpenRouterBridge(),
+        }),
+        resolveCodexCommand: () => {
+          loginAttempted = true;
+          throw new Error("OpenRouter must not invoke Codex login");
+        },
+        resolvePluginPython: async (options: {
+          environment?: Record<string, string | undefined>;
+        }) => {
+          pythonEnvironment = options.environment;
+          return "/managed/python";
+        },
+        prepareOutputDir: async () => scanDir,
+        repositoryRevision: async () => "deadbeef",
+        createCodex: (options: CodexOptions) => {
+          codexOptions = options;
+          return {
+            startThread: () => ({
+              id: null,
+              async runStreamed() {
+                modelTurns += 1;
+                await copyCompletedScan(root);
+                return { events: completedEvents() };
+              },
+            }),
+          };
+        },
+      },
+    );
+
+    const result = await client.run(repository, { maxCostUsd: 1 });
+    expect(loginAttempted).toBe(false);
+    expect(modelTurns).toBe(1);
+    expect(pythonEnvironment).toEqual({});
+    expect((codexOptions as CodexOptions | null)?.env).toMatchObject({
+      OPENROUTER_API_KEY: "synthetic-ephemeral-bridge-key",
+    });
+    expect(
+      (codexOptions as CodexOptions | null)?.env?.["OPENROUTER_API_KEY"],
+    ).not.toBe("synthetic-openrouter-key");
+    expect((codexOptions as CodexOptions | null)?.env).not.toHaveProperty(
+      "OPENAI_API_KEY",
+    );
+    expect((codexOptions as CodexOptions | null)?.env).not.toHaveProperty(
+      "CODEX_API_KEY",
+    );
+    expect(result.cost?.model).toBe("qwen/qwen3.7-flash");
+    await client.close();
+  });
+
+  test("recovers malformed OpenRouter scan drafts once on the same thread", async () => {
+    const root = await temporaryDirectory();
+    const repository = join(root, "repository");
+    const codexHome = join(root, "codex-home");
+    const scanDir = join(root, "scan");
+    await mkdir(repository);
+    await mkdir(codexHome);
+    await mkdir(scanDir, { mode: 0o700 });
+    await writeFile(join(scanDir, "scan-manifest.json"), "");
+    await writeFile(join(scanDir, "findings.json"), "{");
+    await writeFile(join(scanDir, "coverage.json"), "{}\n");
+    const prompts: string[] = [];
+    const workbenchCommands: string[][] = [];
+    let threadStarts = 0;
+    let scanStarts = 0;
+
+    async function* turnEvents(
+      finalResponse: string,
+      usage: {
+        input_tokens: number;
+        cached_input_tokens: number;
+        output_tokens: number;
+        reasoning_output_tokens: number;
+      },
+    ): AsyncGenerator<ThreadEvent> {
+      yield { type: "thread.started", thread_id: "thread-1" };
+      yield { type: "turn.started" };
+      yield {
+        type: "item.completed",
+        item: {
+          id: `message-${prompts.length}`,
+          type: "agent_message",
+          text: finalResponse,
+        },
+      };
+      yield { type: "turn.completed", usage };
+    }
+
+    const client = new TestClient(
+      {
+        provider: "openrouter",
+        codexOverrides: { model: "qwen/qwen3.7-flash" },
+      },
+      {
+        environment: { OPENROUTER_API_KEY: "synthetic-openrouter-key" },
+        fetchOpenRouterModel: async (model: string) => ({
+          id: model,
+          canonicalSlug: "qwen/qwen3.7-flash-20260727",
+          name: "Qwen: Qwen3.7 Flash",
+          contextLength: 1_000_000,
+          supportedParameters: ["tools", "response_format", "reasoning"],
+          tokenPricingNanodollars: {
+            input: 200,
+            cachedInput: 40,
+            cacheWriteInput: 250,
+            output: 800,
+          },
+          requestPricingNanodollars: 0,
+          unsupportedPricingNanodollars: 0,
+          pricingOverridesConsidered: 2,
+          providerEndpointsConsidered: 1,
+          fetchedAt: Date.UTC(2026, 6, 28),
+        }),
+        prepareRuntime: async () => ({
+          codexHome,
+          plugin: {
+            pluginRoot: PLUGIN_ROOT,
+            marketplaceRoot: PLUGIN_ROOT,
+            installedRoot: PLUGIN_ROOT,
+            marketplaceName: "codex-security-sdk",
+            name: "codex-security",
+            version: "0.1.0",
+          },
+          environment: {
+            CODEX_HOME: codexHome,
+            OPENROUTER_API_KEY: "synthetic-openrouter-key",
+          },
+          credentialsAvailable: true,
+          openRouterBridge: syntheticOpenRouterBridge(),
+        }),
+        resolvePluginPython: async () => "/managed/python",
+        prepareOutputDir: async () => scanDir,
+        repositoryRevision: async () => "deadbeef",
+        runWorkbench: async (_options: unknown, args: readonly string[]) => {
+          workbenchCommands.push([...args]);
+          return args[0] === "register-cli-scan"
+            ? {
+                scanId: "scan_example_001",
+                targetId: "target_sha256_example",
+                scanDir,
+              }
+            : {};
+        },
+        createCodex: () => ({
+          startThread: () => {
+            threadStarts += 1;
+            return {
+              id: null,
+              async runStreamed(input: string) {
+                prompts.push(input);
+                if (prompts.length === 1) {
+                  return {
+                    events: turnEvents("private inventory summary", {
+                      input_tokens: 10,
+                      cached_input_tokens: 2,
+                      output_tokens: 3,
+                      reasoning_output_tokens: 1,
+                    }),
+                  };
+                }
+                await copyCompletedScan(root);
+                return {
+                  events: turnEvents("recovery complete", {
+                    input_tokens: 20,
+                    cached_input_tokens: 4,
+                    output_tokens: 6,
+                    reasoning_output_tokens: 2,
+                  }),
+                };
+              },
+            };
+          },
+        }),
+      },
+    );
+
+    const result = await client.run(repository, {
+      maxCostUsd: 1,
+      onScanStarted: () => {
+        scanStarts += 1;
+      },
+    });
+
+    expect(threadStarts).toBe(1);
+    expect(scanStarts).toBe(1);
+    expect(prompts).toHaveLength(2);
+    expect(prompts[1]).toContain("Continue this exact scan");
+    expect(prompts[1]).toContain("scan-manifest.json");
+    expect(prompts[1]).not.toContain("private inventory summary");
+    expect(prompts[1]).not.toContain("synthetic-openrouter-key");
+    expect(prompts[1]).not.toContain(repository);
+    expect(prompts[1]).not.toContain(scanDir);
+    expect(workbenchCommands.map(([command]) => command)).toEqual([
+      "register-cli-scan",
+      "complete-scan",
+    ]);
+    expect(result.turnResult).toMatchObject({
+      status: "completed",
+      finalResponse: "recovery complete",
+      usage: {
+        input_tokens: 30,
+        cached_input_tokens: 6,
+        output_tokens: 9,
+        reasoning_output_tokens: 3,
+      },
+    });
+    expect(result.cost).toMatchObject({
+      model: "qwen/qwen3.7-flash",
+      inputTokens: 30,
+      cachedInputTokens: 6,
+      outputTokens: 9,
+    });
+    await client.close();
+  });
+
+  test("does not start OpenRouter artifact recovery after caller cancellation", async () => {
+    const root = await temporaryDirectory();
+    const repository = join(root, "repository");
+    const codexHome = join(root, "codex-home");
+    const scanDir = join(root, "scan");
+    await mkdir(repository);
+    await mkdir(codexHome);
+    await mkdir(scanDir, { mode: 0o700 });
+    const workbenchCommands: string[][] = [];
+    const controller = new AbortController();
+    let modelTurns = 0;
+    let markInitialTurnConsumed!: () => void;
+    let releaseInitialTurn!: () => void;
+    const initialTurnConsumed = new Promise<void>((resolve) => {
+      markInitialTurnConsumed = resolve;
+    });
+    const initialTurnReleased = new Promise<void>((resolve) => {
+      releaseInitialTurn = resolve;
+    });
+
+    async function* initialTurnEvents(): AsyncGenerator<ThreadEvent> {
+      yield { type: "thread.started", thread_id: "thread-1" };
+      yield { type: "turn.started" };
+      yield {
+        type: "turn.completed",
+        usage: {
+          input_tokens: 10,
+          cached_input_tokens: 2,
+          output_tokens: 3,
+          reasoning_output_tokens: 1,
+        },
+      };
+      markInitialTurnConsumed();
+      await initialTurnReleased;
+    }
+
+    const client = new TestClient(
+      {
+        provider: "openrouter",
+        codexOverrides: { model: "qwen/qwen3.7-flash" },
+      },
+      {
+        environment: { OPENROUTER_API_KEY: "synthetic-openrouter-key" },
+        fetchOpenRouterModel: async (model: string) => ({
+          id: model,
+          canonicalSlug: null,
+          name: "Qwen: Qwen3.7 Flash",
+          contextLength: 1_000_000,
+          supportedParameters: ["tools", "response_format", "reasoning"],
+          tokenPricingNanodollars: {
+            input: 200,
+            cachedInput: 40,
+            cacheWriteInput: 250,
+            output: 800,
+          },
+          requestPricingNanodollars: 0,
+          unsupportedPricingNanodollars: 0,
+          pricingOverridesConsidered: 1,
+          providerEndpointsConsidered: 1,
+          fetchedAt: Date.UTC(2026, 6, 28),
+        }),
+        prepareRuntime: async () => ({
+          codexHome,
+          plugin: {
+            pluginRoot: PLUGIN_ROOT,
+            marketplaceRoot: PLUGIN_ROOT,
+            installedRoot: PLUGIN_ROOT,
+            marketplaceName: "codex-security-sdk",
+            name: "codex-security",
+            version: "0.1.0",
+          },
+          environment: {
+            CODEX_HOME: codexHome,
+            OPENROUTER_API_KEY: "synthetic-openrouter-key",
+          },
+          credentialsAvailable: true,
+          openRouterBridge: syntheticOpenRouterBridge(),
+        }),
+        resolvePluginPython: async () => "/managed/python",
+        prepareOutputDir: async () => scanDir,
+        repositoryRevision: async () => "deadbeef",
+        runWorkbench: async (_options: unknown, args: readonly string[]) => {
+          workbenchCommands.push([...args]);
+          return args[0] === "register-cli-scan"
+            ? {
+                scanId: "scan_example_001",
+                targetId: "target_sha256_example",
+                scanDir,
+              }
+            : {};
+        },
+        createCodex: () => ({
+          startThread: () => ({
+            id: null,
+            async runStreamed() {
+              modelTurns += 1;
+              return { events: initialTurnEvents() };
+            },
+          }),
+        }),
+      },
+    );
+
+    const scan = client.run(repository, {
+      maxCostUsd: 1,
+      signal: controller.signal,
+    });
+    await initialTurnConsumed;
+    controller.abort();
+    releaseInitialTurn();
+
+    await expect(scan).rejects.toBeInstanceOf(ScanInterruptedError);
+    expect(modelTurns).toBe(1);
+    expect(workbenchCommands.map(([command]) => command)).toEqual([
+      "register-cli-scan",
+      "fail-scan",
+    ]);
+    expect(
+      workbenchCommands.some(([command]) => command === "complete-scan"),
+    ).toBe(false);
+    await client.close();
+  });
+
+  test("preserves a rejected OpenRouter artifact recovery turn", async () => {
+    const root = await temporaryDirectory();
+    const repository = join(root, "repository");
+    const codexHome = join(root, "codex-home");
+    const scanDir = join(root, "scan");
+    await mkdir(repository);
+    await mkdir(codexHome);
+    await mkdir(scanDir, { mode: 0o700 });
+    const workbenchCommands: string[][] = [];
+    const recoveryFailure = new Error("synthetic recovery transport failure");
+    let modelTurns = 0;
+
+    const client = new TestClient(
+      {
+        provider: "openrouter",
+        codexOverrides: { model: "qwen/qwen3.7-flash" },
+      },
+      {
+        environment: { OPENROUTER_API_KEY: "synthetic-openrouter-key" },
+        fetchOpenRouterModel: async (model: string) => ({
+          id: model,
+          canonicalSlug: null,
+          name: "Qwen: Qwen3.7 Flash",
+          contextLength: 1_000_000,
+          supportedParameters: ["tools", "response_format", "reasoning"],
+          tokenPricingNanodollars: {
+            input: 200,
+            cachedInput: 40,
+            cacheWriteInput: 250,
+            output: 800,
+          },
+          requestPricingNanodollars: 0,
+          unsupportedPricingNanodollars: 0,
+          pricingOverridesConsidered: 1,
+          providerEndpointsConsidered: 1,
+          fetchedAt: Date.UTC(2026, 6, 28),
+        }),
+        prepareRuntime: async () => ({
+          codexHome,
+          plugin: {
+            pluginRoot: PLUGIN_ROOT,
+            marketplaceRoot: PLUGIN_ROOT,
+            installedRoot: PLUGIN_ROOT,
+            marketplaceName: "codex-security-sdk",
+            name: "codex-security",
+            version: "0.1.0",
+          },
+          environment: {
+            CODEX_HOME: codexHome,
+            OPENROUTER_API_KEY: "synthetic-openrouter-key",
+          },
+          credentialsAvailable: true,
+          openRouterBridge: syntheticOpenRouterBridge(),
+        }),
+        resolvePluginPython: async () => "/managed/python",
+        prepareOutputDir: async () => scanDir,
+        repositoryRevision: async () => "deadbeef",
+        runWorkbench: async (_options: unknown, args: readonly string[]) => {
+          workbenchCommands.push([...args]);
+          return args[0] === "register-cli-scan"
+            ? {
+                scanId: "scan_example_001",
+                targetId: "target_sha256_example",
+                scanDir,
+              }
+            : {};
+        },
+        createCodex: () => ({
+          startThread: () => ({
+            id: null,
+            async runStreamed() {
+              modelTurns += 1;
+              if (modelTurns === 1) return { events: completedEvents() };
+              throw recoveryFailure;
+            },
+          }),
+        }),
+      },
+    );
+
+    let rejection: unknown = null;
+    try {
+      await client.run(repository, { maxCostUsd: 1 });
+    } catch (error) {
+      rejection = error;
+    }
+
+    expect(rejection).toBe(recoveryFailure);
+    expect(modelTurns).toBe(2);
+    expect(workbenchCommands.map(([command]) => command)).toEqual([
+      "register-cli-scan",
+      "fail-scan",
+    ]);
+    expect(workbenchCommands[1]).toContain(
+      "synthetic recovery transport failure",
+    );
+    expect(
+      workbenchCommands.some(([command]) => command === "complete-scan"),
+    ).toBe(false);
+    await client.close();
+  });
+
+  test("bounds OpenRouter artifact recovery to one continuation", async () => {
+    const root = await temporaryDirectory();
+    const repository = join(root, "repository");
+    const codexHome = join(root, "codex-home");
+    const scanDir = join(root, "scan");
+    await mkdir(repository);
+    await mkdir(codexHome);
+    await mkdir(scanDir, { mode: 0o700 });
+    const workbenchCommands: string[][] = [];
+    let modelTurns = 0;
+
+    async function* turnEvents(): AsyncGenerator<ThreadEvent> {
+      yield { type: "thread.started", thread_id: "thread-1" };
+      yield { type: "turn.started" };
+      yield {
+        type: "turn.completed",
+        usage: {
+          input_tokens: 10,
+          cached_input_tokens: 2,
+          output_tokens: 3,
+          reasoning_output_tokens: 1,
+        },
+      };
+    }
+
+    const client = new TestClient(
+      {
+        provider: "openrouter",
+        codexOverrides: { model: "qwen/qwen3.7-flash" },
+      },
+      {
+        environment: { OPENROUTER_API_KEY: "synthetic-openrouter-key" },
+        fetchOpenRouterModel: async (model: string) => ({
+          id: model,
+          canonicalSlug: null,
+          name: "Qwen: Qwen3.7 Flash",
+          contextLength: 1_000_000,
+          supportedParameters: ["tools", "response_format", "reasoning"],
+          tokenPricingNanodollars: {
+            input: 200,
+            cachedInput: 40,
+            cacheWriteInput: 250,
+            output: 800,
+          },
+          requestPricingNanodollars: 0,
+          unsupportedPricingNanodollars: 0,
+          pricingOverridesConsidered: 1,
+          providerEndpointsConsidered: 1,
+          fetchedAt: Date.UTC(2026, 6, 28),
+        }),
+        prepareRuntime: async () => ({
+          codexHome,
+          plugin: {
+            pluginRoot: PLUGIN_ROOT,
+            marketplaceRoot: PLUGIN_ROOT,
+            installedRoot: PLUGIN_ROOT,
+            marketplaceName: "codex-security-sdk",
+            name: "codex-security",
+            version: "0.1.0",
+          },
+          environment: {
+            CODEX_HOME: codexHome,
+            OPENROUTER_API_KEY: "synthetic-openrouter-key",
+          },
+          credentialsAvailable: true,
+          openRouterBridge: syntheticOpenRouterBridge(),
+        }),
+        resolvePluginPython: async () => "/managed/python",
+        prepareOutputDir: async () => scanDir,
+        repositoryRevision: async () => "deadbeef",
+        runWorkbench: async (_options: unknown, args: readonly string[]) => {
+          workbenchCommands.push([...args]);
+          return args[0] === "register-cli-scan"
+            ? {
+                scanId: "scan_example_001",
+                targetId: "target_sha256_example",
+                scanDir,
+              }
+            : {};
+        },
+        createCodex: () => ({
+          startThread: () => ({
+            id: null,
+            async runStreamed() {
+              modelTurns += 1;
+              return { events: turnEvents() };
+            },
+          }),
+        }),
+      },
+    );
+
+    await expect(client.run(repository, { maxCostUsd: 1 })).rejects.toThrow(
+      "artifact recovery ended without the required canonical scan files",
+    );
+    expect(modelTurns).toBe(2);
+    expect(workbenchCommands.map(([command]) => command)).toEqual([
+      "register-cli-scan",
+      "fail-scan",
+    ]);
+    await client.close();
+  });
+
+  test("enforces the SDK environment cost ceiling before starting OpenRouter artifact recovery", async () => {
+    const root = await temporaryDirectory();
+    const repository = join(root, "repository");
+    const codexHome = join(root, "codex-home");
+    const scanDir = join(root, "scan");
+    await mkdir(repository);
+    await mkdir(codexHome);
+    await mkdir(scanDir, { mode: 0o700 });
+    const workbenchCommands: string[][] = [];
+    let modelTurns = 0;
+
+    const client = new TestClient(
+      {
+        provider: "openrouter",
+        codexOverrides: { model: "qwen/qwen3.7-flash" },
+      },
+      {
+        environment: {
+          OPENROUTER_API_KEY: "synthetic-openrouter-key",
+          OPEN_SECURITY_MAX_COST_USD: "0.000001",
+        },
+        fetchOpenRouterModel: async (model: string) => ({
+          id: model,
+          canonicalSlug: null,
+          name: "Qwen: Qwen3.7 Flash",
+          contextLength: 1_000_000,
+          supportedParameters: ["tools", "response_format", "reasoning"],
+          tokenPricingNanodollars: {
+            input: 200,
+            cachedInput: 40,
+            cacheWriteInput: 250,
+            output: 800,
+          },
+          requestPricingNanodollars: 0,
+          unsupportedPricingNanodollars: 0,
+          pricingOverridesConsidered: 1,
+          providerEndpointsConsidered: 1,
+          fetchedAt: Date.UTC(2026, 6, 28),
+        }),
+        prepareRuntime: async () => ({
+          codexHome,
+          plugin: {
+            pluginRoot: PLUGIN_ROOT,
+            marketplaceRoot: PLUGIN_ROOT,
+            installedRoot: PLUGIN_ROOT,
+            marketplaceName: "codex-security-sdk",
+            name: "codex-security",
+            version: "0.1.0",
+          },
+          environment: {
+            CODEX_HOME: codexHome,
+            OPENROUTER_API_KEY: "synthetic-openrouter-key",
+          },
+          credentialsAvailable: true,
+          openRouterBridge: syntheticOpenRouterBridge(),
+        }),
+        resolvePluginPython: async () => "/managed/python",
+        prepareOutputDir: async () => scanDir,
+        repositoryRevision: async () => "deadbeef",
+        runWorkbench: async (_options: unknown, args: readonly string[]) => {
+          workbenchCommands.push([...args]);
+          return args[0] === "register-cli-scan"
+            ? {
+                scanId: "scan_example_001",
+                targetId: "target_sha256_example",
+                scanDir,
+              }
+            : {};
+        },
+        createCodex: () => ({
+          startThread: () => ({
+            id: null,
+            async runStreamed() {
+              modelTurns += 1;
+              return { events: completedEvents() };
+            },
+          }),
+        }),
+      },
+    );
+
+    await expect(client.run(repository)).rejects.toBeInstanceOf(
+      ScanCostLimitExceededError,
+    );
+    expect(modelTurns).toBe(1);
+    expect(workbenchCommands.map(([command]) => command)).toEqual([
+      "register-cli-scan",
+      "fail-scan",
+    ]);
+    await client.close();
+  });
+
+  test("keeps OpenRouter authentication environment-only", async () => {
+    let runtimeStarted = false;
+    const client = new TestClient(
+      {
+        provider: "openrouter",
+        codexOverrides: { model: "qwen/qwen3.7-flash" },
+      },
+      {
+        environment: { OPENROUTER_API_KEY: "synthetic-openrouter-key" },
+        prepareRuntime: async () => {
+          runtimeStarted = true;
+          throw new Error("runtime should not initialize");
+        },
+      },
+    );
+
+    for (const operation of [
+      () => client.loginApiKey("synthetic-openrouter-key"),
+      () => client.loginChatGPT(),
+      () => client.loginChatGPTDeviceCode(),
+      () => client.account(),
+      () => client.logout(),
+    ]) {
+      await expect(operation()).rejects.toThrow(
+        "OpenRouter authentication is environment-only",
+      );
+    }
+    expect(runtimeStarted).toBe(false);
     await client.close();
   });
 
@@ -3037,6 +4201,40 @@ appendFileSync(${JSON.stringify(keyLog)}, apiKey.trim() + "\\n");
         rm: originalRm,
       }));
     }
+  });
+
+  test("closes the OpenRouter bridge when runtime preparation fails", async () => {
+    const root = await temporaryDirectory();
+    const repository = join(root, "repository");
+    await mkdir(repository);
+    let bridgeClosed = 0;
+    const client = new TestClient(
+      {
+        provider: "openrouter",
+        pluginPath: PLUGIN_ROOT,
+        codexOverrides: { model: "qwen/qwen3.7-flash" },
+      },
+      {
+        environment: { OPENROUTER_API_KEY: "synthetic-openrouter-key" },
+        createOpenRouterResponsesBridge: async () => ({
+          baseUrl: "http://127.0.0.1:45678/synthetic-opaque-route/api/v1",
+          credential: "synthetic-ephemeral-bridge-key",
+          async close() {
+            bridgeClosed += 1;
+          },
+        }),
+        bootstrapPlugin: async () => {
+          throw new Error("SYNTHETIC_BRIDGE_BOOTSTRAP_FAILED");
+        },
+      },
+    );
+
+    await expect(client.run(repository)).rejects.toThrow(
+      "SYNTHETIC_BRIDGE_BOOTSTRAP_FAILED",
+    );
+    expect(bridgeClosed).toBe(1);
+    await client.close();
+    expect(bridgeClosed).toBe(1);
   });
 
   test("attempts both preparation cleanups and preserves the preparation and cleanup failures", async () => {

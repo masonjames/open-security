@@ -5,7 +5,11 @@ import type {
   FindingsDocument,
   ScanManifest,
 } from "./models.js";
-import { estimateScanCost, type ScanCost } from "./cost.js";
+import {
+  estimateScanCost,
+  type ModelPricingNanodollars,
+  type ScanCost,
+} from "./cost.js";
 
 export interface TurnResultMetadata {
   id?: string;
@@ -25,6 +29,7 @@ export interface ScanResultOptions {
   threadId: string;
   turnResult: TurnResultMetadata;
   sarifPath?: string | null;
+  pricing?: Readonly<ModelPricingNanodollars>;
 }
 
 export class ScanResult {
@@ -47,6 +52,7 @@ export class ScanResult {
     this.cost = estimateScanCost(
       options.turnResult.model,
       options.turnResult.usage,
+      options.pricing,
     );
     if (options.sarifPath !== undefined) {
       this.sarifPath = options.sarifPath;

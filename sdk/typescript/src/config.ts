@@ -3,6 +3,14 @@ import { mkdir, open, rename, unlink } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { stringify } from "smol-toml";
 import { ConfigurationError } from "./errors.js";
+import {
+  OPENROUTER_API_KEY_ENV,
+  OPENROUTER_BASE_URL,
+  providerCodexOverrides,
+  resolveProviderSelection,
+  type ScanProvider,
+} from "./provider.js";
+import type { ProcessEnvironment } from "./runtime.js";
 
 export type JsonPrimitive = string | number | boolean | null;
 export type JsonValue = JsonPrimitive | JsonValue[] | JsonObject;
@@ -11,6 +19,7 @@ export interface JsonObject {
 }
 
 export interface CodexSecurityConfig {
+  provider?: ScanProvider;
   pluginPath?: string;
   codexOverrides?: JsonObject;
   pythonPath?: string;
@@ -60,6 +69,7 @@ export function scanModelConfiguration(
 
 export async function mergedCodexConfig(
   config: CodexSecurityConfig,
+  environment: ProcessEnvironment = {},
 ): Promise<JsonObject> {
   if (config.codexOverrides !== undefined && !isObject(config.codexOverrides)) {
     throw new ConfigurationError("codexOverrides must be an object.");
@@ -68,7 +78,79 @@ export async function mergedCodexConfig(
   const overrides = cloneJson(config.codexOverrides ?? {});
   validateOverrides(overrides);
   validateNativeMultiAgentV2Overrides(overrides);
-  return deepMerge(cloneJson(DEFAULT_CODEX_CONFIG), overrides);
+
+  const explicitModel =
+    typeof overrides["model"] === "string" ? overrides["model"] : undefined;
+  const explicitReasoning =
+    typeof overrides["model_reasoning_effort"] === "string"
+      ? overrides["model_reasoning_effort"]
+      : undefined;
+  const selection = resolveProviderSelection({
+    provider: config.provider,
+    model: explicitModel,
+    reasoningEffort: explicitReasoning,
+    environment,
+  });
+  if (selection.provider === "openrouter" && selection.model === undefined) {
+    throw new ConfigurationError(
+      "OpenRouter scans require an explicit model via --model, codexOverrides.model, or OPEN_SECURITY_MODEL.",
+    );
+  }
+  validateProviderOwnedOverrides(selection.provider, overrides);
+
+  const providerDefaults = structuredClone(
+    providerCodexOverrides(selection.provider),
+  ) as JsonObject;
+  const environmentDefaults: JsonObject = {
+    ...(selection.model === undefined ? {} : { model: selection.model }),
+    ...(selection.reasoningEffort === undefined
+      ? {}
+      : { model_reasoning_effort: selection.reasoningEffort }),
+  };
+  return deepMerge(
+    deepMerge(
+      deepMerge(cloneJson(DEFAULT_CODEX_CONFIG), providerDefaults),
+      environmentDefaults,
+    ),
+    overrides,
+  );
+}
+
+/**
+ * Builds the internal runtime configuration for the loopback OpenRouter bridge.
+ * The persisted canonical provider table remains owned by Open Security and the
+ * caller's already-merged configuration is never mutated.
+ */
+export function openRouterBridgeRuntimeConfig(
+  config: Readonly<JsonObject>,
+  baseUrl: string,
+): JsonObject {
+  validateCanonicalOpenRouterConfig(config);
+  if (baseUrl.trim().length === 0) {
+    throw new ConfigurationError(
+      "The OpenRouter bridge base URL must be nonempty.",
+    );
+  }
+
+  const runtime = structuredClone(config) as JsonObject;
+  const modelProviders = runtime["model_providers"] as JsonObject;
+  const openrouter = modelProviders["openrouter"] as JsonObject;
+  openrouter["base_url"] = baseUrl;
+
+  const features = runtime["features"];
+  if (!isObject(features)) {
+    throw new ConfigurationError(
+      "The merged OpenRouter configuration must contain a features table.",
+    );
+  }
+  runtime["features"] = {
+    ...features,
+    enable_request_compression: false,
+    responses_websockets: false,
+    responses_websockets_v2: false,
+    remote_compaction_v2: false,
+  };
+  return runtime;
 }
 
 export async function writeCodexConfig(
@@ -106,6 +188,26 @@ export async function writeCodexConfig(
   }
 }
 
+function validateCanonicalOpenRouterConfig(config: Readonly<JsonObject>): void {
+  const modelProviders = config["model_providers"];
+  const openrouter =
+    isObject(modelProviders) && isObject(modelProviders["openrouter"])
+      ? modelProviders["openrouter"]
+      : undefined;
+  if (
+    config["model_provider"] !== "openrouter" ||
+    openrouter === undefined ||
+    openrouter["name"] !== "OpenRouter" ||
+    openrouter["env_key"] !== OPENROUTER_API_KEY_ENV ||
+    openrouter["wire_api"] !== "responses" ||
+    openrouter["base_url"] !== OPENROUTER_BASE_URL
+  ) {
+    throw new ConfigurationError(
+      "The OpenRouter bridge requires the canonical Open Security provider configuration.",
+    );
+  }
+}
+
 function validateOverrideKeys(value: JsonValue): void {
   if (Array.isArray(value)) {
     for (const item of value) validateOverrideKeys(item);
@@ -117,6 +219,42 @@ function validateOverrideKeys(value: JsonValue): void {
       throw new ConfigurationError(`Invalid Codex override key: ${key}.`);
     }
     validateOverrideKeys(item);
+  }
+}
+
+function validateProviderOwnedOverrides(
+  provider: ScanProvider,
+  overrides: JsonObject,
+): void {
+  if ("model_provider" in overrides || "model_providers" in overrides) {
+    throw new ConfigurationError(
+      provider === "openrouter"
+        ? "Open Security owns OpenRouter model_provider configuration; select the provider with --provider or OPEN_SECURITY_PROVIDER."
+        : "Open Security owns model_provider configuration; select the provider with --provider or OPEN_SECURITY_PROVIDER.",
+    );
+  }
+
+  const profiles = overrides["profiles"];
+  if (!isObject(profiles)) return;
+  const providerOwnedProfileKeys =
+    provider === "openrouter"
+      ? ([
+          "model",
+          "model_reasoning_effort",
+          "model_provider",
+          "model_providers",
+        ] as const)
+      : (["model_provider", "model_providers"] as const);
+  for (const [name, profile] of Object.entries(profiles)) {
+    if (!isObject(profile)) continue;
+    const owned = providerOwnedProfileKeys.find((key) => key in profile);
+    if (owned !== undefined) {
+      throw new ConfigurationError(
+        provider === "openrouter"
+          ? `OpenRouter profile ${name} cannot override ${owned}; set the model and reasoning effort at the scan root.`
+          : `Codex profile ${name} cannot override ${owned}; select the model provider at the scan root.`,
+      );
+    }
   }
 }
 

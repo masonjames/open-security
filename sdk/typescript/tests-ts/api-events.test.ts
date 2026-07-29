@@ -86,6 +86,199 @@ describe("one-shot scan events", () => {
     expect(result.turnResult.status).toBe("completed");
   });
 
+  test("runs one same-thread continuation and aggregates both turns", async () => {
+    const scanDir = await copyCompletedScan(await temporaryDirectory());
+    let continuationCalls = 0;
+    let scanStarts = 0;
+    let finalizedUsage: unknown = null;
+
+    async function* recoveryEvents(): AsyncGenerator<ThreadEvent> {
+      yield { type: "thread.started", thread_id: "thread-1" };
+      yield { type: "turn.started" };
+      yield {
+        type: "item.completed",
+        item: {
+          id: "message-2",
+          type: "agent_message",
+          text: "recovery complete",
+        },
+      };
+      yield {
+        type: "turn.completed",
+        usage: {
+          input_tokens: 20,
+          cached_input_tokens: 4,
+          output_tokens: 6,
+          reasoning_output_tokens: 2,
+        },
+      };
+    }
+
+    const result = await runScanEvents({
+      thread: {
+        id: null,
+        async runStreamed() {
+          throw new Error("runStreamed should not be called by runScanEvents");
+        },
+      },
+      events: completedEvents(),
+      signal: new AbortController().signal,
+      scanDir,
+      pluginRoot: PLUGIN_ROOT,
+      expectation: {
+        repository: "/repository",
+        repositoryRevision: "deadbeef",
+        target: { kind: "repository", paths: [] },
+        mode: "standard",
+        pluginVersion: "0.1.0",
+      },
+      onInitialTurnCompleted: async (turn) => {
+        continuationCalls += 1;
+        expect(turn).toMatchObject({
+          threadId: "thread-1",
+          finalResponse: "scan complete",
+          usage: {
+            input_tokens: 10,
+            cached_input_tokens: 2,
+            output_tokens: 3,
+            reasoning_output_tokens: 1,
+          },
+        });
+        return { events: recoveryEvents() };
+      },
+      onFinalize: async (usage) => {
+        finalizedUsage = usage;
+        return usage;
+      },
+      onScanStarted: () => {
+        scanStarts += 1;
+      },
+    });
+
+    expect(continuationCalls).toBe(1);
+    expect(scanStarts).toBe(1);
+    expect(finalizedUsage).toEqual({
+      input_tokens: 30,
+      cached_input_tokens: 6,
+      cache_write_input_tokens: 0,
+      output_tokens: 9,
+      reasoning_output_tokens: 3,
+      total_tokens: 39,
+    });
+    expect(result.threadId).toBe("thread-1");
+    expect(result.turnResult).toMatchObject({
+      status: "completed",
+      finalResponse: "recovery complete",
+      usage: finalizedUsage,
+    });
+  });
+
+  test("fails closed if artifact recovery changes the thread ID", async () => {
+    const scanDir = await copyCompletedScan(await temporaryDirectory());
+    let continuationCalls = 0;
+    let advancedPastThreadChange = false;
+
+    async function* recoveryEvents(): AsyncGenerator<ThreadEvent> {
+      yield { type: "thread.started", thread_id: "thread-2" };
+      advancedPastThreadChange = true;
+      yield {
+        type: "turn.completed",
+        usage: {
+          input_tokens: 20,
+          cached_input_tokens: 4,
+          output_tokens: 6,
+          reasoning_output_tokens: 2,
+        },
+      };
+    }
+
+    await expect(
+      runScanEvents({
+        thread: {
+          id: null,
+          async runStreamed() {
+            throw new Error(
+              "runStreamed should not be called by runScanEvents",
+            );
+          },
+        },
+        events: completedEvents(),
+        signal: new AbortController().signal,
+        scanDir,
+        pluginRoot: PLUGIN_ROOT,
+        expectation: {
+          repository: "/repository",
+          repositoryRevision: "deadbeef",
+          target: { kind: "repository", paths: [] },
+          mode: "standard",
+          pluginVersion: "0.1.0",
+        },
+        onInitialTurnCompleted: async () => {
+          continuationCalls += 1;
+          return { events: recoveryEvents() };
+        },
+      }),
+    ).rejects.toMatchObject({
+      name: IncompleteScanError.name,
+      message: "Codex Security artifact recovery changed the active thread ID.",
+    });
+    expect(continuationCalls).toBe(1);
+    expect(advancedPastThreadChange).toBe(false);
+  });
+
+  test("fails when artifact recovery usage cannot be aggregated", async () => {
+    const scanDir = await copyCompletedScan(await temporaryDirectory());
+    let finalized = false;
+
+    async function* recoveryEvents(): AsyncGenerator<ThreadEvent> {
+      yield { type: "thread.started", thread_id: "thread-1" };
+      yield { type: "turn.started" };
+      yield {
+        type: "turn.completed",
+        usage: {
+          input_tokens: 20,
+          cached_input_tokens: 4,
+          reasoning_output_tokens: 2,
+        },
+      } as ThreadEvent;
+    }
+
+    await expect(
+      runScanEvents({
+        thread: {
+          id: null,
+          async runStreamed() {
+            throw new Error(
+              "runStreamed should not be called by runScanEvents",
+            );
+          },
+        },
+        events: completedEvents(),
+        signal: new AbortController().signal,
+        scanDir,
+        pluginRoot: PLUGIN_ROOT,
+        expectation: {
+          repository: "/repository",
+          repositoryRevision: "deadbeef",
+          target: { kind: "repository", paths: [] },
+          mode: "standard",
+          pluginVersion: "0.1.0",
+        },
+        onInitialTurnCompleted: async () => ({
+          events: recoveryEvents(),
+        }),
+        onFinalize: async () => {
+          finalized = true;
+        },
+      }),
+    ).rejects.toMatchObject({
+      name: IncompleteScanError.name,
+      message:
+        "Codex Security did not report complete token usage across artifact recovery turns.",
+    });
+    expect(finalized).toBe(false);
+  });
+
   test("reports a scan as started only after the thread starts", async () => {
     const scanDir = await copyCompletedScan(await temporaryDirectory());
     const milestones: string[] = [];

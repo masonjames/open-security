@@ -41,12 +41,14 @@ import {
   PluginPythonUnavailableError,
 } from "./errors.js";
 import type { JsonObject } from "./config.js";
+import { helperProcessEnvironment } from "./provider.js";
 import { resolveTrustedExecutable } from "./trusted-executable.js";
 
 const execFile = promisify(execFileCallback);
 
 export const MARKETPLACE_NAME = "codex-security-sdk";
 export const PLUGIN_NAME = "codex-security";
+export const OPEN_SECURITY_STATE_DIR_ENV = "OPEN_SECURITY_STATE_DIR" as const;
 
 const MAX_ZIP_ENTRIES = 4_096;
 const MAX_ZIP_CENTRAL_DIRECTORY = 16 * 1024 * 1024;
@@ -103,7 +105,9 @@ export function codexSecurityStateDirectory(
       )?.[1]
       ?.trim();
   };
-  const configured = environmentValue("CODEX_SECURITY_STATE_DIR");
+  const configured =
+    environmentValue(OPEN_SECURITY_STATE_DIR_ENV) ??
+    environmentValue("CODEX_SECURITY_STATE_DIR");
   if (configured !== undefined) return resolve(expandHome(configured));
   const codexHome = environmentValue("CODEX_HOME") ?? join(homedir(), ".codex");
   return resolve(expandHome(codexHome), "state", "plugins", "codex-security");
@@ -133,13 +137,7 @@ export async function runWorkbench(
         ...args,
       ],
       {
-        env: Object.fromEntries(
-          Object.entries(options.environment).filter(
-            ([name]) =>
-              name.toUpperCase() !== "OPENAI_API_KEY" &&
-              name.toUpperCase() !== "CODEX_API_KEY",
-          ),
-        ),
+        env: helperProcessEnvironment(options.environment),
         encoding: "utf8",
         maxBuffer: 4 * 1024 * 1024,
         windowsHide: true,
@@ -692,7 +690,7 @@ export async function createMarketplace(
   throwIfSignalAborted(signal);
   const manifest = {
     name: MARKETPLACE_NAME,
-    interface: { displayName: "Codex Security SDK" },
+    interface: { displayName: "Open Security SDK" },
     plugins: [
       {
         name: PLUGIN_NAME,

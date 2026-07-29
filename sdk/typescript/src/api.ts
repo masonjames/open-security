@@ -14,20 +14,50 @@ import {
 } from "./auth.js";
 import {
   mergedCodexConfig,
+  openRouterBridgeRuntimeConfig,
   scanModelConfiguration,
   type CodexSecurityConfig,
   type JsonObject,
   writeCodexConfig,
 } from "./config.js";
-import { estimateScanCost, ScanCostTracker, type ScanCost } from "./cost.js";
+import {
+  aggregateScanTokenUsage,
+  estimateScanCost,
+  scanCostLimitFromEnvironment,
+  ScanCostTracker,
+  type ModelPricingNanodollars,
+  type ScanCost,
+} from "./cost.js";
+import {
+  assertOpenRouterScanCapabilities,
+  fetchOpenRouterModel,
+  OPENROUTER_MODELS_URL,
+  type OpenRouterModelMetadata,
+} from "./openrouter-models.js";
+import {
+  helperProcessEnvironment,
+  modelProviderExecutionEnvironment,
+  openRouterBridgeExecutionEnvironment,
+  providerAuthentication,
+  providerEnvironmentCredential,
+  resolveOpenRouterMaxOutputTokens,
+  resolveProviderSelection,
+  type ScanProvider,
+} from "./provider.js";
 import {
   loadContract,
+  requireScanJsonObject,
   requireScanFile,
   type ScanExpectation,
 } from "./contract.js";
 import {
+  createOpenRouterResponsesBridge,
+  type OpenRouterResponsesBridge,
+} from "./openrouter-responses-bridge.js";
+import {
   AuthenticationRequiredError,
   CodexSecurityError,
+  ContractValidationError,
   IncompleteScanError,
   OutputDirectoryError,
   OutputInsideProtectedRootError,
@@ -109,6 +139,8 @@ interface PreparedRuntime {
   environment: Record<string, string>;
   credentialsAvailable: boolean;
   effectiveConfig?: JsonObject;
+  provider?: ScanProvider;
+  openRouterBridge?: OpenRouterResponsesBridge;
 }
 
 export interface ScanOptions {
@@ -142,7 +174,7 @@ export type ScanAuthMode = "auto" | "chatgpt" | "api-key";
 export type ScanAuthentication =
   | {
       method: "api_key";
-      source: "OPENAI_API_KEY" | "CODEX_API_KEY";
+      source: "OPENAI_API_KEY" | "CODEX_API_KEY" | "OPENROUTER_API_KEY";
       verified: false;
     }
   | {
@@ -164,8 +196,22 @@ type ScanObserverName =
   | "onReconnect"
   | "onWorkerStatus";
 
+export interface ScanPreflightModelCatalog {
+  source: typeof OPENROUTER_MODELS_URL;
+  canonicalSlug: string | null;
+  contextLength: number | null;
+  fetchedAt: string;
+  conservativePricing: true;
+  requestPricingNanodollars: number;
+  unsupportedPricingNanodollars: number;
+  providerEndpointsConsidered: number;
+  pricingOverridesConsidered: number;
+  tokenPricingNanodollars: Readonly<ModelPricingNanodollars>;
+}
+
 export interface ScanPreflight {
   repository: string;
+  provider?: ScanProvider;
   target: NormalizedTarget;
   mode: ScanMode;
   knowledgeBasePaths?: string[];
@@ -175,10 +221,23 @@ export interface ScanPreflight {
   model: string;
   reasoningEffort: string;
   maxCostUsd?: number;
+  openRouterMaxOutputTokens?: number;
+  modelCatalog?: ScanPreflightModelCatalog;
+}
+
+interface ResolvedScanModel {
+  provider: ScanProvider;
+  model: string;
+  reasoningEffort: string;
+  pricing?: Readonly<ModelPricingNanodollars>;
+  modelCatalog?: ScanPreflightModelCatalog;
 }
 
 interface LocalScanInputs
-  extends Omit<ScanPreflight, "model" | "reasoningEffort" | "authentication"> {
+  extends Omit<
+    ScanPreflight,
+    "provider" | "model" | "reasoningEffort" | "authentication"
+  > {
   protectedRoot: string;
 }
 
@@ -201,6 +260,9 @@ interface ClientDependencies {
   repositoryRevision?: typeof repositoryRevision;
   resolveCodexCommand?: () => CodexCommand;
   runWorkbench?: typeof runWorkbench;
+  fetchOpenRouterModel?: typeof fetchOpenRouterModel;
+  bootstrapPlugin?: typeof bootstrapPlugin;
+  createOpenRouterResponsesBridge?: typeof createOpenRouterResponsesBridge;
 }
 
 const DEFAULT_DEPENDENCIES: ClientDependencies = {
@@ -209,6 +271,18 @@ const DEFAULT_DEPENDENCIES: ClientDependencies = {
 };
 
 const SCAN_PERMISSION_PROFILE = "codex_security_scan";
+const CANONICAL_SCAN_DRAFTS = [
+  "scan-manifest.json",
+  "findings.json",
+  "coverage.json",
+] as const;
+const OPENROUTER_ARTIFACT_RECOVERY_PROMPT = [
+  "Continue this exact scan from the existing progress and evidence.",
+  "Do not restart preflight or discovery, discard completed work, or ask the user for input.",
+  'Finish every remaining required phase, then write complete unsealed scan-manifest.json, findings.json, and coverage.json under "$CODEX_SECURITY_SCAN_DIR".',
+  "Verify that all three are regular files before ending the turn.",
+  "Do not invoke finalization, complete-scan, or finalize_scan_contract.py; the SDK workbench owns validation, sealing, report generation, and completion.",
+].join("\n");
 
 export class CodexSecurity {
   public readonly config: Readonly<CodexSecurityConfig>;
@@ -242,7 +316,13 @@ export class CodexSecurity {
     repository: string,
     options: ScanOptions = {},
   ): Promise<ScanResult> {
-    return await this.#trackOperation(() => this.#run(repository, options));
+    const resolvedOptions = scanOptionsWithEnvironmentCostLimit(
+      options,
+      this.#dependencies.environment,
+    );
+    return await this.#trackOperation(() =>
+      this.#run(repository, resolvedOptions),
+    );
   }
 
   public async preflight(
@@ -250,6 +330,10 @@ export class CodexSecurity {
     options: ScanOptions = {},
   ): Promise<ScanPreflight> {
     this.#requireOpen();
+    options = scanOptionsWithEnvironmentCostLimit(
+      options,
+      this.#dependencies.environment,
+    );
     const inputs = await this.#validateLocalInputs(
       repository,
       options,
@@ -260,9 +344,19 @@ export class CodexSecurity {
       await realpath(tmpdir()),
       "temporary",
     );
-    const configuration = await mergedCodexConfig(this.config);
-    const model = scanModelConfiguration(configuration);
-    validateScanCostLimit(options.maxCostUsd, model.model);
+    const configuration = await mergedCodexConfig(
+      this.config,
+      this.#dependencies.environment,
+    );
+    const resolvedModel = await this.#resolveScanModel(
+      configuration,
+      options.signal,
+    );
+    validateScanCostLimit(
+      options.maxCostUsd,
+      resolvedModel.model,
+      resolvedModel.pricing,
+    );
     const archiveDir =
       options.archiveExisting === true
         ? await planOutputArchive(inputs.outputDir)
@@ -270,6 +364,7 @@ export class CodexSecurity {
     this.#requireOpen();
     return {
       repository: inputs.repository,
+      provider: resolvedModel.provider,
       target: inputs.target,
       mode: inputs.mode,
       ...(options.knowledgeBasePaths?.length
@@ -280,11 +375,23 @@ export class CodexSecurity {
       authentication: scanAuthentication(
         this.#dependencies.environment,
         options.auth,
+        resolvedModel.provider,
       ),
-      ...model,
+      model: resolvedModel.model,
+      reasoningEffort: resolvedModel.reasoningEffort,
+      ...(resolvedModel.modelCatalog === undefined
+        ? {}
+        : { modelCatalog: resolvedModel.modelCatalog }),
       ...(options.maxCostUsd === undefined
         ? {}
         : { maxCostUsd: options.maxCostUsd }),
+      ...(resolvedModel.provider === "openrouter"
+        ? {
+            openRouterMaxOutputTokens: resolveOpenRouterMaxOutputTokens(
+              this.#dependencies.environment,
+            ),
+          }
+        : {}),
     };
   }
 
@@ -348,13 +455,19 @@ export class CodexSecurity {
       }
       checkOpen();
 
+      const provider = resolveProviderSelection({
+        provider: this.config.provider,
+        environment: this.#dependencies.environment,
+      }).provider;
       const authentication = scanAuthentication(
         this.#dependencies.environment,
         options.auth,
+        provider,
       );
       const scanEnvironment = selectedScanEnvironment(
         this.#dependencies.environment,
         options.auth,
+        provider,
       );
       const runtime = await this.#ensureRuntime(
         signal,
@@ -363,6 +476,16 @@ export class CodexSecurity {
           requireOutputOutsideRepository(protectedRoot, path, "runtime"),
         options.auth,
       );
+      if (runtime.provider !== undefined && runtime.provider !== provider) {
+        throw new CodexSecurityError(
+          "The configured model provider changed after the isolated runtime was prepared; create a new CodexSecurity client.",
+        );
+      }
+      if (provider === "openrouter" && runtime.openRouterBridge === undefined) {
+        throw new CodexSecurityError(
+          "The isolated OpenRouter runtime is missing its credential bridge.",
+        );
+      }
       const runtimeHome = await realpath(runtime.codexHome);
       requireOutputOutsideRepository(protectedRoot, runtimeHome, "runtime");
       if (
@@ -375,6 +498,7 @@ export class CodexSecurity {
       }
       checkOpen();
       if (
+        provider === "openai" &&
         authentication.method === "stored_credentials" &&
         this.#runtimeCredentialSource === "api_key"
       ) {
@@ -391,9 +515,9 @@ export class CodexSecurity {
       }
       const apiKey =
         authentication.method === "api_key"
-          ? environmentApiKey(this.#dependencies.environment)
+          ? environmentApiKey(this.#dependencies.environment, provider)
           : null;
-      if (apiKey !== null) {
+      if (apiKey !== null && provider === "openai") {
         const codexCommand = this.#codexCommand();
         const login = await persistApiKey(
           codexCommand,
@@ -411,9 +535,11 @@ export class CodexSecurity {
       }
       if (!runtime.credentialsAvailable) {
         throw new AuthenticationRequiredError(
-          "No credentials were found. Run 'codex-security login', use " +
-            "'codex-security login --device-auth' on a remote or headless machine, or set " +
-            "OPENAI_API_KEY or CODEX_API_KEY for CI.",
+          provider === "openrouter"
+            ? "No OpenRouter credentials were found. Set OPENROUTER_API_KEY and retry."
+            : "No credentials were found. Run 'open-security login', use " +
+              "'open-security login --device-auth' on a remote or headless machine, or set " +
+              "OPENAI_API_KEY or CODEX_API_KEY for CI.",
         );
       }
       notifyObserver(
@@ -426,7 +552,7 @@ export class CodexSecurity {
         this.#dependencies.resolvePluginPython ?? resolvePluginPython
       )({
         configuredPath: this.config.pythonPath,
-        environment: scanEnvironment,
+        environment: helperProcessEnvironment(scanEnvironment),
         protectedRoot,
         signal,
       });
@@ -497,12 +623,18 @@ export class CodexSecurity {
         pluginVersion: runtime.plugin.version,
       };
       const effectiveConfig =
-        runtime.effectiveConfig ?? (await mergedCodexConfig(this.config));
-      const { model } = scanModelConfiguration(effectiveConfig);
-      validateScanCostLimit(options.maxCostUsd, model);
+        runtime.effectiveConfig ??
+        (await mergedCodexConfig(this.config, this.#dependencies.environment));
+      const resolvedModel = await this.#resolveScanModel(
+        effectiveConfig,
+        signal,
+      );
+      const { model } = resolvedModel;
+      validateScanCostLimit(options.maxCostUsd, model, resolvedModel.pricing);
       const tracker = new ScanCostTracker({
         codexHome: runtime.codexHome,
         model,
+        pricing: resolvedModel.pricing,
         maxCostUsd: options.maxCostUsd,
         onCost: (cost) => {
           notifyObserver(
@@ -511,14 +643,12 @@ export class CodexSecurity {
             options.onObserverError,
             cost,
           );
-          if (
-            options.maxCostUsd !== undefined &&
-            cost.estimatedUsd > options.maxCostUsd
-          ) {
-            costAbortController.abort(
-              new ScanCostLimitExceededError(options.maxCostUsd, cost, scanDir),
-            );
-          }
+        },
+        onCostLimitExceeded: (cost) => {
+          if (options.maxCostUsd === undefined) return;
+          costAbortController.abort(
+            new ScanCostLimitExceededError(options.maxCostUsd, cost, scanDir),
+          );
         },
         onError: (error) => costAbortController.abort(error),
       });
@@ -527,6 +657,7 @@ export class CodexSecurity {
         repo,
         normalized,
         mode,
+        provider,
         expectation.repositoryRevision,
         runtime.plugin.version,
         effectiveConfig,
@@ -538,7 +669,7 @@ export class CodexSecurity {
         python,
         pluginRoot: runtime.plugin.pluginRoot,
         environment: {
-          ...selectedScanEnvironment(runtime.environment, options.auth),
+          ...helperProcessEnvironment(scanEnvironment),
           CODEX_SECURITY_STATE_DIR: stateDirectory,
         },
         signal,
@@ -596,12 +727,21 @@ export class CodexSecurity {
           ? {}
           : { CODEX_SECURITY_TARGET_PATHS_FILE: targetPathsFile }),
       };
+      const modelEnvironment =
+        provider === "openrouter"
+          ? openRouterBridgeExecutionEnvironment(
+              scanEnvironment,
+              runtime.openRouterBridge!.credential,
+            )
+          : selectedScanEnvironment(
+              runtime.environment,
+              options.auth,
+              provider,
+            );
       const environment = {
         ...pluginExecutionEnvironment(
           python,
-          withoutCodexHome(
-            selectedScanEnvironment(runtime.environment, options.auth),
-          ),
+          withoutCodexHome(modelEnvironment),
         ),
         CODEX_HOME: runtime.codexHome,
         ...runtimePaths,
@@ -639,6 +779,7 @@ export class CodexSecurity {
         signal,
       });
       checkOpen();
+      let artifactRecoveryAttempted = false;
 
       const result = await runScanEvents({
         thread,
@@ -648,13 +789,49 @@ export class CodexSecurity {
         pluginRoot: runtime.plugin.installedRoot,
         expectation,
         model,
+        pricing: resolvedModel.pricing,
         onThreadStarted: (threadId) => tracker.start(threadId),
+        ...(provider === "openrouter" && mode === "standard"
+          ? {
+              onInitialTurnCompleted: async (turn) => {
+                throwIfAborted(signal, scanDir);
+                if (await canonicalScanDraftsReady(scanDir, signal)) {
+                  return null;
+                }
+                const checkpoint = await tracker.observeCompletedTurnUsage(
+                  turn.usage,
+                );
+                throwIfAborted(signal, scanDir);
+                if (
+                  options.maxCostUsd !== undefined &&
+                  checkpoint.cost === null
+                ) {
+                  throw new CodexSecurityError(
+                    "Cannot evaluate the cost limit before artifact recovery: model pricing or token usage is unavailable.",
+                  );
+                }
+                artifactRecoveryAttempted = true;
+                return await thread.runStreamed(
+                  OPENROUTER_ARTIFACT_RECOVERY_PROMPT,
+                  { signal },
+                );
+              },
+            }
+          : {}),
         onFinalize: async (usage) => {
           const snapshot = await tracker.stop(usage);
           throwIfAborted(signal, scanDir);
           if (options.maxCostUsd !== undefined && snapshot.cost === null) {
             throw new CodexSecurityError(
               "Cannot evaluate the cost limit: model pricing or token usage is unavailable.",
+            );
+          }
+          if (
+            artifactRecoveryAttempted &&
+            !(await canonicalScanDraftsReady(scanDir, signal))
+          ) {
+            throw new IncompleteScanError(
+              "OpenRouter artifact recovery ended without the required canonical scan files.",
             );
           }
           const cost = snapshot.cost;
@@ -711,6 +888,7 @@ export class CodexSecurity {
   }
 
   public async loginApiKey(apiKey: string): Promise<void> {
+    this.#requireOpenAiAccountOperation();
     const { result, runtime } = await this.#runOperation(
       async (preparedRuntime, signal) => ({
         runtime: preparedRuntime,
@@ -732,6 +910,7 @@ export class CodexSecurity {
   }
 
   public async loginChatGPT(): Promise<CodexLoginHandle> {
+    this.#requireOpenAiAccountOperation();
     const runtime = await this.#ensureRuntime();
     this.#requireOpen();
     const handle = this.#trackLoginHandle(
@@ -751,6 +930,7 @@ export class CodexSecurity {
   }
 
   public async loginChatGPTDeviceCode(): Promise<CodexLoginHandle> {
+    this.#requireOpenAiAccountOperation();
     const runtime = await this.#ensureRuntime();
     this.#requireOpen();
     const handle = this.#trackLoginHandle(
@@ -770,6 +950,7 @@ export class CodexSecurity {
   }
 
   public async account(): Promise<AccountStatus> {
+    this.#requireOpenAiAccountOperation();
     return await this.#runOperation(async (runtime, signal) => {
       const apiKey = environmentApiKey(this.#dependencies.environment);
       if (apiKey !== null) {
@@ -787,6 +968,7 @@ export class CodexSecurity {
   }
 
   public async logout(): Promise<void> {
+    this.#requireOpenAiAccountOperation();
     const runtime = await this.#runOperation(
       async (preparedRuntime, signal) => {
         await codexLogout(
@@ -819,6 +1001,14 @@ export class CodexSecurity {
       this.#abortController.abort();
     }
     for (const handle of loginHandles) handle.cancel();
+
+    const initiallyPreparedRuntime = this.#runtime;
+    const initialBridgeClose =
+      initiallyPreparedRuntime?.openRouterBridge === undefined
+        ? null
+        : Promise.resolve().then(() =>
+            initiallyPreparedRuntime.openRouterBridge!.close(),
+          );
     await Promise.allSettled(
       [activeOperation, ...loginHandles.map((handle) => handle.wait())].filter(
         (operation): operation is Promise<unknown> => operation !== null,
@@ -828,15 +1018,36 @@ export class CodexSecurity {
       this.#runtime ?? (await this.#runtimePromise?.catch(() => null));
     this.#runtime = null;
     this.#runtimePromise = null;
-    if (runtime !== null && runtime !== undefined) {
-      const cleanupResults = await Promise.allSettled(
-        [runtime.codexHome, runtime.bootstrapWorkspace]
-          .filter((path): path is string => path !== undefined)
-          .map((path) => cleanupSdkDirectory(path)),
+    if (runtime === null || runtime === undefined) {
+      await initialBridgeClose;
+      return;
+    }
+
+    const cleanupOperations: Promise<unknown>[] = [];
+    if (initialBridgeClose !== null) cleanupOperations.push(initialBridgeClose);
+    if (
+      runtime !== initiallyPreparedRuntime &&
+      runtime.openRouterBridge !== undefined
+    ) {
+      cleanupOperations.push(
+        Promise.resolve().then(() => runtime.openRouterBridge!.close()),
       );
-      for (const result of cleanupResults) {
-        if (result.status === "rejected") throw result.reason;
-      }
+    }
+    cleanupOperations.push(
+      ...[runtime.codexHome, runtime.bootstrapWorkspace]
+        .filter((path): path is string => path !== undefined)
+        .map((path) => cleanupSdkDirectory(path)),
+    );
+    const cleanupResults = await Promise.allSettled(cleanupOperations);
+    const cleanupFailures = cleanupResults.flatMap((result) =>
+      result.status === "rejected" ? [result.reason] : [],
+    );
+    if (cleanupFailures.length === 1) throw cleanupFailures[0];
+    if (cleanupFailures.length > 1) {
+      throw new AggregateError(
+        cleanupFailures,
+        "Codex Security could not fully close its isolated runtime.",
+      );
     }
   }
 
@@ -900,8 +1111,14 @@ export class CodexSecurity {
     const runtime = await this.#runtimePromise;
     this.#requireOpen();
     this.#runtime = runtime;
+    const provider = resolveProviderSelection({
+      provider: this.config.provider,
+      environment: this.#dependencies.environment,
+    }).provider;
     this.#runtimeCredentialSource = runtime.credentialsAvailable
-      ? "stored_credentials"
+      ? provider === "openrouter"
+        ? "api_key"
+        : "stored_credentials"
       : null;
     return this.#runtime;
   }
@@ -917,6 +1134,18 @@ export class CodexSecurity {
 
   #codexCommand(): CodexCommand {
     return (this.#dependencies.resolveCodexCommand ?? resolveCodexCommand)();
+  }
+
+  #requireOpenAiAccountOperation(): void {
+    const provider = resolveProviderSelection({
+      provider: this.config.provider,
+      environment: this.#dependencies.environment,
+    }).provider;
+    if (provider === "openrouter") {
+      throw new CodexSecurityError(
+        "OpenRouter authentication is environment-only. Set OPENROUTER_API_KEY; login, account, and logout manage only OpenAI credentials.",
+      );
+    }
   }
 
   async #validateLocalInputs(
@@ -941,6 +1170,23 @@ export class CodexSecurity {
     throwIfAborted(signal);
     const mode = options.mode ?? "standard";
     validateMode(normalized, mode);
+    const provider = resolveProviderSelection({
+      provider: this.config.provider,
+      environment: this.#dependencies.environment,
+    }).provider;
+    if (provider === "openrouter") {
+      resolveOpenRouterMaxOutputTokens(this.#dependencies.environment);
+    }
+    if (mode === "deep" && provider === "openrouter") {
+      throw new CodexSecurityError(
+        "Deep scans with OpenRouter are not yet supported because the credential bridge and aggregate cost accounting have not been validated across delegated workers; use standard mode.",
+      );
+    }
+    if (mode === "deep" && options.maxCostUsd !== undefined) {
+      throw new CodexSecurityError(
+        "Cost limits are not supported for deep scans because independent discovery workers cannot yet be accounted reliably; use standard mode or omit the cost limit.",
+      );
+    }
     const protectedRoot =
       (await enclosingGitWorktreeRoot(repo, signal)) ?? repo;
     const requestedOutput = await validateOutputDir(
@@ -970,6 +1216,7 @@ export class CodexSecurity {
     }
     const codexHome = await createIsolatedHome(temporaryRoot, validateLocation);
     let bootstrapWorkspace: string | undefined;
+    let openRouterBridge: OpenRouterResponsesBridge | undefined;
     try {
       throwIfAborted(signal);
       bootstrapWorkspace = await createIsolatedHome(
@@ -981,9 +1228,14 @@ export class CodexSecurity {
         bootstrapWorkspace,
         signal,
       );
+      const provider = resolveProviderSelection({
+        provider: this.config.provider,
+        environment: this.#dependencies.environment,
+      }).provider;
       const processEnvironment = selectedScanEnvironment(
         this.#dependencies.environment,
         auth,
+        provider,
       );
       const nodeAmbientHome = join(homedir(), ".codex");
       const configuredAmbientHome = environmentValue(
@@ -991,9 +1243,41 @@ export class CodexSecurity {
         "CODEX_HOME",
       );
       const ambientHome = configuredAmbientHome ?? nodeAmbientHome;
-      const mergedConfig = await mergedCodexConfig(this.config);
+      const mergedConfig = await mergedCodexConfig(
+        this.config,
+        this.#dependencies.environment,
+      );
+      let runtimeConfig = mergedConfig;
+      if (provider === "openrouter") {
+        const { model } = scanModelConfiguration(mergedConfig);
+        openRouterBridge = await (
+          this.#dependencies.createOpenRouterResponsesBridge ??
+          createOpenRouterResponsesBridge
+        )({
+          expectedModel: model,
+          getUpstreamApiKey: () => {
+            const credential = providerEnvironmentCredential(
+              "openrouter",
+              this.#dependencies.environment,
+            );
+            if (credential === null) {
+              throw new AuthenticationRequiredError(
+                "OpenRouter authentication requires OPENROUTER_API_KEY.",
+              );
+            }
+            return credential.value;
+          },
+          maxOutputTokens: resolveOpenRouterMaxOutputTokens(
+            this.#dependencies.environment,
+          ),
+        });
+        runtimeConfig = openRouterBridgeRuntimeConfig(
+          mergedConfig,
+          openRouterBridge.baseUrl,
+        );
+      }
       const codexConfig = scanRuntimeCodexConfig(
-        mergedConfig,
+        runtimeConfig,
         codexSecurityStateDirectory(processEnvironment),
       );
       await writeCodexConfig(join(codexHome, "config.toml"), codexConfig);
@@ -1003,14 +1287,20 @@ export class CodexSecurity {
         scanPreflightCodexConfig(mergedConfig),
       );
       throwIfAborted(signal);
-      const plugin = await bootstrapPlugin(codexHome, pluginRoot, {
-        environment: withoutCodexHome(processEnvironment),
+      const plugin = await (
+        this.#dependencies.bootstrapPlugin ?? bootstrapPlugin
+      )(codexHome, pluginRoot, {
+        environment: helperProcessEnvironment(
+          withoutCodexHome(processEnvironment),
+        ),
         signal,
       });
       const credentialsAvailable = await initialCredentialsAvailable(
         processEnvironment,
         ambientHome,
         codexHome,
+        importAmbientAuth,
+        provider,
       );
       return {
         codexHome,
@@ -1025,13 +1315,19 @@ export class CodexSecurity {
         },
         credentialsAvailable,
         effectiveConfig: mergedConfig,
+        provider,
+        ...(openRouterBridge === undefined ? {} : { openRouterBridge }),
       };
     } catch (error) {
-      const cleanupResults = await Promise.allSettled(
-        [bootstrapWorkspace, codexHome]
+      const cleanupOperations: Promise<unknown>[] = [
+        ...[bootstrapWorkspace, codexHome]
           .filter((path): path is string => path !== undefined)
           .map((path) => cleanupSdkDirectory(path)),
-      );
+      ];
+      if (openRouterBridge !== undefined) {
+        cleanupOperations.unshift(openRouterBridge.close());
+      }
+      const cleanupResults = await Promise.allSettled(cleanupOperations);
       const cleanupFailures = cleanupResults.flatMap((result) =>
         result.status === "rejected" ? [result.reason] : [],
       );
@@ -1046,9 +1342,68 @@ export class CodexSecurity {
     }
   }
 
+  async #resolveScanModel(
+    configuration: Readonly<JsonObject>,
+    signal?: AbortSignal,
+  ): Promise<ResolvedScanModel> {
+    const provider = resolveProviderSelection({
+      provider: this.config.provider,
+      environment: this.#dependencies.environment,
+    }).provider;
+    const { model, reasoningEffort } = scanModelConfiguration(configuration);
+    if (provider === "openai") {
+      return { provider, model, reasoningEffort };
+    }
+
+    const metadata: OpenRouterModelMetadata = await (
+      this.#dependencies.fetchOpenRouterModel ?? fetchOpenRouterModel
+    )(model, signal === undefined ? {} : { signal });
+    assertOpenRouterScanCapabilities(metadata, {
+      reasoning: reasoningEffort !== "none",
+    });
+    if (
+      metadata.requestPricingNanodollars !== 0 ||
+      metadata.unsupportedPricingNanodollars !== 0
+    ) {
+      throw new CodexSecurityError(
+        `OpenRouter model ${model} advertises non-token pricing that Open Security cannot yet track safely. Choose a model whose request and additional-unit prices are all zero.`,
+      );
+    }
+    const pricing: Readonly<ModelPricingNanodollars> = {
+      ...metadata.tokenPricingNanodollars,
+    };
+    return {
+      provider,
+      model,
+      reasoningEffort,
+      pricing,
+      modelCatalog: {
+        source: OPENROUTER_MODELS_URL,
+        canonicalSlug: metadata.canonicalSlug,
+        contextLength: metadata.contextLength,
+        fetchedAt: new Date(metadata.fetchedAt).toISOString(),
+        conservativePricing: true,
+        requestPricingNanodollars: metadata.requestPricingNanodollars,
+        unsupportedPricingNanodollars: metadata.unsupportedPricingNanodollars,
+        providerEndpointsConsidered: metadata.providerEndpointsConsidered,
+        pricingOverridesConsidered: metadata.pricingOverridesConsidered,
+        tokenPricingNanodollars: pricing,
+      },
+    };
+  }
+
   #requireOpen(): void {
     if (this.#closed) throw new CodexSecurityError("CodexSecurity is closed.");
   }
+}
+
+function scanOptionsWithEnvironmentCostLimit(
+  options: ScanOptions,
+  environment: ProcessEnvironment,
+): ScanOptions {
+  if (options.maxCostUsd !== undefined) return options;
+  const maxCostUsd = scanCostLimitFromEnvironment(environment);
+  return maxCostUsd === undefined ? options : { ...options, maxCostUsd };
 }
 
 export async function initialCredentialsAvailable(
@@ -1056,8 +1411,11 @@ export async function initialCredentialsAvailable(
   ambientHome: string,
   isolatedHome: string,
   importer: typeof importAmbientAuth = importAmbientAuth,
+  provider: ScanProvider = "openai",
 ): Promise<boolean> {
-  if (environmentApiKey(environment) !== null) return false;
+  const credential = providerEnvironmentCredential(provider, environment);
+  if (provider === "openrouter") return credential !== null;
+  if (credential !== null) return false;
   return await importer(ambientHome, isolatedHome);
 }
 
@@ -1072,6 +1430,21 @@ async function removeTargetPathsFile(path: string | null): Promise<void> {
   }
 }
 
+interface CompletedScanTurn {
+  threadId: string;
+  finalResponse: string;
+  usage: unknown;
+}
+
+interface ScanEventContinuation {
+  events: AsyncGenerator<ScanEvent>;
+}
+
+interface ScanEventState {
+  threadId: string | null;
+  scanStarted: boolean;
+}
+
 interface ScanEventRunOptions {
   thread: CodexThreadLike;
   events: AsyncGenerator<ScanEvent>;
@@ -1080,6 +1453,10 @@ interface ScanEventRunOptions {
   pluginRoot: string;
   expectation: ScanExpectation;
   model?: string;
+  pricing?: Readonly<ModelPricingNanodollars>;
+  onInitialTurnCompleted?: (
+    turn: Readonly<CompletedScanTurn>,
+  ) => Promise<ScanEventContinuation | null>;
   onFinalize?: (usage: unknown) => Promise<unknown>;
   onThreadStarted?: (threadId: string) => void;
   onScanStarted?: () => void;
@@ -1095,109 +1472,56 @@ interface ScanEventRunOptions {
 export async function runScanEvents(
   options: ScanEventRunOptions,
 ): Promise<ScanResult> {
-  let threadId = options.thread.id;
-  let scanStarted = false;
-  let status = "in_progress";
-  let finalResponse = "";
-  let usage: unknown = null;
-  let lastStreamError: string | null = null;
+  const state: ScanEventState = {
+    threadId: options.thread.id,
+    scanStarted: false,
+  };
   try {
-    for await (const event of options.events) {
-      const workerStatus = workerStatusFromEvent(event);
-      if (workerStatus !== null) {
-        notifyObserver(
-          "onWorkerStatus",
-          options.onWorkerStatus,
-          options.onObserverError,
-          workerStatus,
+    const initialTurn = await consumeScanTurnEvents(
+      options,
+      options.events,
+      state,
+    );
+    let completedTurn = initialTurn;
+    const continuation =
+      options.onInitialTurnCompleted === undefined
+        ? null
+        : await options.onInitialTurnCompleted(initialTurn);
+    if (continuation !== null) {
+      const recoveryTurn = await consumeScanTurnEvents(
+        options,
+        continuation.events,
+        state,
+      );
+      const aggregateUsage = aggregateScanTokenUsage([
+        initialTurn.usage,
+        recoveryTurn.usage,
+      ]);
+      if (aggregateUsage === null) {
+        throw new IncompleteScanError(
+          "Codex Security did not report complete token usage across artifact recovery turns.",
         );
       }
-      if (event.type === "thread.started") {
-        const startedThreadId = event["thread_id"];
-        if (typeof startedThreadId === "string") {
-          threadId = startedThreadId;
-          options.onThreadStarted?.(startedThreadId);
-        }
-        if (!scanStarted) {
-          scanStarted = true;
-          notifyObserver(
-            "onScanStarted",
-            options.onScanStarted,
-            options.onObserverError,
-          );
-        }
-      } else if (
-        event.type === "item.completed" &&
-        isRecord(event["item"]) &&
-        event["item"]["type"] === "agent_message" &&
-        typeof event["item"]["text"] === "string"
-      ) {
-        finalResponse = event["item"]["text"];
-      } else if (event.type === "turn.completed") {
-        status = "completed";
-        usage = event["usage"];
-      } else if (
-        event.type === "turn.failed" &&
-        isRecord(event["error"]) &&
-        typeof event["error"]["message"] === "string"
-      ) {
-        throw new CodexSecurityError(event["error"]["message"]);
-      } else if (
-        event.type === "error" &&
-        typeof event["message"] === "string"
-      ) {
-        const message = event["message"];
-        const classification = classifyConnectionFailure(message);
-        if (
-          classification === "unauthorized" ||
-          classification === "forbidden"
-        ) {
-          throw new CodexSecurityError(message);
-        }
-        const reconnect = reconnectAttempt(message);
-        if (reconnect === null) throw new CodexSecurityError(message);
-        lastStreamError = message;
-        notifyObserver(
-          "onReconnect",
-          options.onReconnect,
-          options.onObserverError,
-          ...reconnect,
-          reconnectDetails(message),
-        );
-      }
+      completedTurn = { ...recoveryTurn, usage: aggregateUsage };
     }
-    if (options.signal.aborted) {
-      throw new ScanInterruptedError(
-        `Codex Security scan was interrupted; partial output remains at ${options.scanDir}.`,
-        options.scanDir,
-      );
-    }
-    if (status !== "completed") {
-      throw new IncompleteScanError(
-        lastStreamError ??
-          "Codex Security event stream ended before the turn completed.",
-      );
-    }
-    if (threadId === null) {
-      throw new IncompleteScanError(
-        "Codex Security did not report a thread ID.",
-      );
-    }
+
+    let usage = completedTurn.usage;
     if (options.onFinalize !== undefined) {
       usage = (await options.onFinalize(usage)) ?? usage;
     }
     const result = await collectResult(
       {
-        status,
-        finalResponse,
+        status: "completed",
+        finalResponse: completedTurn.finalResponse,
         usage,
         ...(options.model === undefined ? {} : { model: options.model }),
       },
-      threadId,
+      completedTurn.threadId,
       options.scanDir,
       options.pluginRoot,
       options.expectation,
       options.signal,
+      options.pricing,
     );
     if (options.signal.aborted) {
       throw new ScanInterruptedError(
@@ -1219,6 +1543,129 @@ export async function runScanEvents(
     }
     throw error;
   }
+}
+
+async function consumeScanTurnEvents(
+  options: ScanEventRunOptions,
+  events: AsyncGenerator<ScanEvent>,
+  state: ScanEventState,
+): Promise<CompletedScanTurn> {
+  let status = "in_progress";
+  let finalResponse = "";
+  let usage: unknown = null;
+  let lastStreamError: string | null = null;
+  for await (const event of events) {
+    const workerStatus = workerStatusFromEvent(event);
+    if (workerStatus !== null) {
+      notifyObserver(
+        "onWorkerStatus",
+        options.onWorkerStatus,
+        options.onObserverError,
+        workerStatus,
+      );
+    }
+    if (event.type === "thread.started") {
+      const startedThreadId = event["thread_id"];
+      if (typeof startedThreadId === "string") {
+        if (state.threadId !== null && startedThreadId !== state.threadId) {
+          throw new IncompleteScanError(
+            "Codex Security artifact recovery changed the active thread ID.",
+          );
+        }
+        state.threadId = startedThreadId;
+        options.onThreadStarted?.(startedThreadId);
+      }
+      if (!state.scanStarted) {
+        state.scanStarted = true;
+        notifyObserver(
+          "onScanStarted",
+          options.onScanStarted,
+          options.onObserverError,
+        );
+      }
+    } else if (
+      event.type === "item.completed" &&
+      isRecord(event["item"]) &&
+      event["item"]["type"] === "agent_message" &&
+      typeof event["item"]["text"] === "string"
+    ) {
+      finalResponse = event["item"]["text"];
+    } else if (event.type === "turn.completed") {
+      status = "completed";
+      usage = event["usage"];
+    } else if (
+      event.type === "turn.failed" &&
+      isRecord(event["error"]) &&
+      typeof event["error"]["message"] === "string"
+    ) {
+      throw new CodexSecurityError(event["error"]["message"]);
+    } else if (event.type === "error" && typeof event["message"] === "string") {
+      const message = event["message"];
+      const classification = classifyConnectionFailure(message);
+      if (classification === "unauthorized" || classification === "forbidden") {
+        throw new CodexSecurityError(message);
+      }
+      const reconnect = reconnectAttempt(message);
+      if (reconnect === null) throw new CodexSecurityError(message);
+      lastStreamError = message;
+      notifyObserver(
+        "onReconnect",
+        options.onReconnect,
+        options.onObserverError,
+        ...reconnect,
+        reconnectDetails(message),
+      );
+    }
+  }
+  if (options.signal.aborted) {
+    throw new ScanInterruptedError(
+      `Codex Security scan was interrupted; partial output remains at ${options.scanDir}.`,
+      options.scanDir,
+    );
+  }
+  if (status !== "completed") {
+    throw new IncompleteScanError(
+      lastStreamError ??
+        "Codex Security event stream ended before the turn completed.",
+    );
+  }
+  if (state.threadId === null) {
+    throw new IncompleteScanError("Codex Security did not report a thread ID.");
+  }
+  return { threadId: state.threadId, finalResponse, usage };
+}
+
+async function canonicalScanDraftsReady(
+  scanDir: string,
+  signal: AbortSignal,
+): Promise<boolean> {
+  let ready = true;
+  for (const name of CANONICAL_SCAN_DRAFTS) {
+    throwIfAborted(signal, scanDir);
+    let metadata;
+    try {
+      metadata = await lstat(join(scanDir, name));
+    } catch (error) {
+      if (isRecord(error) && error["code"] === "ENOENT") {
+        ready = false;
+        continue;
+      }
+      throw error;
+    }
+    if (metadata.isSymbolicLink() || !metadata.isFile()) {
+      throw new IncompleteScanError(
+        `${name}: expected a regular non-symlink file.`,
+      );
+    }
+    try {
+      await requireScanJsonObject(scanDir, name, signal);
+    } catch (error) {
+      throwIfAborted(signal, scanDir);
+      if (!(error instanceof ContractValidationError)) throw error;
+      ready = false;
+    }
+  }
+  return ready;
 }
 
 async function scanPrompt(
@@ -1295,6 +1742,7 @@ function scanRecipe(
   repository: string,
   target: NormalizedTarget,
   mode: ScanMode,
+  provider: ScanProvider,
   repositoryRevision: string | null,
   pluginVersion: string,
   effectiveConfig: JsonObject,
@@ -1313,6 +1761,7 @@ function scanRecipe(
       ...(target.headRef === undefined ? {} : { headRef: target.headRef }),
     },
     mode,
+    provider,
     ...(repositoryRevision === null ? {} : { repositoryRevision }),
     pluginVersion,
     config: scanPreflightCodexConfig(effectiveConfig),
@@ -1325,9 +1774,13 @@ function scanRecipe(
 function validateScanCostLimit(
   maxCostUsd: number | undefined,
   model: string,
+  pricing?: Readonly<ModelPricingNanodollars>,
 ): void {
   if (maxCostUsd === undefined) return;
-  if (estimateScanCost(model, { input_tokens: 0, output_tokens: 0 }) === null) {
+  if (
+    estimateScanCost(model, { input_tokens: 0, output_tokens: 0 }, pricing) ===
+    null
+  ) {
     throw new CodexSecurityError(
       `A scan cost limit is not available for the configured model: ${model}.`,
     );
@@ -1341,6 +1794,7 @@ async function collectResult(
   pluginRoot: string,
   expectation: ScanExpectation,
   signal: AbortSignal,
+  pricing?: Readonly<ModelPricingNanodollars>,
 ): Promise<ScanResult> {
   const required = [
     "scan-manifest.json",
@@ -1386,35 +1840,46 @@ async function collectResult(
     threadId,
     turnResult,
     sarifPath,
+    pricing,
   });
 }
 
 export function scanAuthentication(
   environment: ProcessEnvironment,
   auth: ScanAuthMode = "auto",
+  provider: ScanProvider = "openai",
 ): ScanAuthentication {
-  if (auth === "chatgpt") {
-    return { method: "stored_credentials", verified: false };
+  const authentication = providerAuthentication({
+    provider,
+    authMode: auth,
+    environment,
+  });
+  if (authentication.mode === "api-key") {
+    if (!authentication.credentialsAvailable) {
+      throw new AuthenticationRequiredError(
+        provider === "openrouter"
+          ? "OpenRouter authentication requires OPENROUTER_API_KEY. Set a valid key and use auto or api-key authentication."
+          : "API-key authentication requires OPENAI_API_KEY or CODEX_API_KEY. Set a valid API key or use '--auth chatgpt'.",
+      );
+    }
+    return {
+      method: "api_key",
+      source: authentication.environmentVariable,
+      verified: false,
+    };
   }
-  const key = environmentApiKeyEntry(environment);
-  if (auth === "api-key" && key === null) {
-    throw new AuthenticationRequiredError(
-      "API-key authentication requires OPENAI_API_KEY or CODEX_API_KEY. " +
-        "Set a valid API key or use '--auth chatgpt'.",
-    );
-  }
-  return key === null
-    ? { method: "stored_credentials", verified: false }
-    : { method: "api_key", source: key.source, verified: false };
+  return { method: "stored_credentials", verified: false };
 }
 
 function selectedScanEnvironment(
   environment: ProcessEnvironment,
   auth: ScanAuthMode = "auto",
+  provider: ScanProvider = "openai",
 ): ProcessEnvironment {
-  if (auth !== "chatgpt") return environment;
+  const selected = modelProviderExecutionEnvironment(provider, environment);
+  if (auth !== "chatgpt") return selected;
   return Object.fromEntries(
-    Object.entries(environment).filter(
+    Object.entries(selected).filter(
       ([name]) =>
         name.toUpperCase() !== "OPENAI_API_KEY" &&
         name.toUpperCase() !== "CODEX_API_KEY",
@@ -1436,23 +1901,11 @@ function notifyObserver<Arguments extends unknown[]>(
     .catch(() => {});
 }
 
-function environmentApiKey(environment: ProcessEnvironment): string | null {
-  return environmentApiKeyEntry(environment)?.value ?? null;
-}
-
-function environmentApiKeyEntry(environment: ProcessEnvironment): {
-  source: "OPENAI_API_KEY" | "CODEX_API_KEY";
-  value: string;
-} | null {
-  for (const requested of ["OPENAI_API_KEY", "CODEX_API_KEY"] as const) {
-    const canonical = environment[requested]?.trim();
-    if (canonical) return { source: requested, value: canonical };
-    for (const [name, value] of Object.entries(environment)) {
-      if (name.toUpperCase() === requested && value?.trim())
-        return { source: requested, value: value.trim() };
-    }
-  }
-  return null;
+function environmentApiKey(
+  environment: ProcessEnvironment,
+  provider: ScanProvider = "openai",
+): string | null {
+  return providerEnvironmentCredential(provider, environment)?.value ?? null;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

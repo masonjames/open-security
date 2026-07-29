@@ -88,12 +88,37 @@ describe("CLI skill commands", () => {
           ),
         ).toBe(0);
         expect(help.text()).toContain(
-          `Usage: codex-security ${command} <${argument}>`,
+          `Usage: open-security ${command} <${argument}>`,
         );
         expect(help.text()).toContain("--codex <array>");
       }
     } finally {
       await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("fails closed before validation or patching when a cost limit is configured", async () => {
+    for (const command of ["validate", "patch"] as const) {
+      const stdout = capture();
+      const stderr = capture();
+      let started = false;
+      expect(
+        await main(
+          [command, "synthetic finding"],
+          stdout.stream,
+          stderr.stream,
+          dependencies({
+            environment: { OPEN_SECURITY_MAX_COST_USD: "1" },
+            onCodex: () => {
+              started = true;
+              return 0;
+            },
+          }),
+        ),
+      ).toBe(2);
+      expect(started).toBe(false);
+      expect(stdout.text()).toBe("");
+      expect(stderr.text()).toContain("cannot currently be enforced");
     }
   });
 
@@ -273,9 +298,44 @@ describe("CLI skill commands", () => {
           }),
         ),
       ).toBe(2);
-      expect(stderr.text()).toContain("codex-security:");
+      expect(stderr.text()).toContain("open-security:");
       expect(started).toBe(false);
     }
+  });
+
+  test("rejects OpenRouter validation before catalog or Codex access", async () => {
+    let codexStarted = false;
+    let catalogRequested = false;
+    const stderr = capture();
+    expect(
+      await main(
+        ["validate", "a candidate finding"],
+        capture().stream,
+        stderr.stream,
+        dependencies({
+          environment: {
+            OPEN_SECURITY_PROVIDER: "openrouter",
+            OPEN_SECURITY_MODEL: "qwen/qwen3.7-flash",
+            OPEN_SECURITY_REASONING_EFFORT: "high",
+            OPENROUTER_API_KEY: "synthetic-openrouter-key",
+            OPENAI_API_KEY: "must-not-be-forwarded",
+            CODEX_API_KEY: "must-not-be-forwarded-either",
+          },
+          fetchOpenRouterModel: async () => {
+            catalogRequested = true;
+            throw new Error("catalog must not be requested");
+          },
+          onCodex: () => {
+            codexStarted = true;
+            return 0;
+          },
+        }),
+      ),
+    ).toBe(2);
+    expect(catalogRequested).toBe(false);
+    expect(codexStarted).toBe(false);
+    expect(stderr.text()).toContain("standard scans only");
+    expect(stderr.text()).toContain("credential bridge");
   });
 
   test("rejects empty, non-file, and oversized skill inputs before launching Codex", async () => {
@@ -411,6 +471,55 @@ describe("CLI skill commands", () => {
     }
   });
 
+  test("gives provider-aware authentication guidance for skill failures", () => {
+    const openRouter = skillCommandFailure(
+      "validate",
+      7,
+      "401 sk-or-v1-SYNTHETIC_SECRET",
+      "openrouter",
+    );
+    expect(openRouter).toContain("OPENROUTER_API_KEY");
+    expect(openRouter).toContain("Set or replace");
+    expect(openRouter).not.toContain("open-security login");
+    expect(openRouter).not.toContain("SYNTHETIC_SECRET");
+
+    const openAi = skillCommandFailure(
+      "patch",
+      7,
+      "401 sk-proj-SYNTHETIC_SECRET",
+      "openai",
+    );
+    expect(openAi).toContain("open-security login");
+    expect(openAi).not.toContain("OPENROUTER_API_KEY");
+    expect(openAi).not.toContain("SYNTHETIC_SECRET");
+  });
+
+  test("strips every model credential from non-model Codex commands", async () => {
+    const stdout = capture();
+    const stderr = capture();
+    const script = [
+      'const modelKeys = new Set(["OPENAI_API_KEY", "CODEX_API_KEY", "OPENROUTER_API_KEY"]);',
+      "const leaked = Object.keys(process.env).filter((name) => modelKeys.has(name.toUpperCase()));",
+      'const text = leaked.length === 0 ? "none" : leaked.join(",");',
+      'process.stdout.write(JSON.stringify({type:"item.completed",item:{type:"agent_message",text}})+"\\n");',
+    ].join("");
+
+    expect(
+      await runCodexSkillCommand(
+        [],
+        { command: "validate", stdout: stdout.stream, stderr: stderr.stream },
+        { command: process.execPath, prefixArgs: ["-e", script] },
+        {
+          OPENAI_API_KEY: "synthetic-openai-key",
+          codex_api_key: "synthetic-codex-key",
+          OpenRouter_Api_Key: "synthetic-openrouter-key",
+        },
+      ),
+    ).toBe(0);
+    expect(stdout.text()).toBe("none\n");
+    expect(stderr.text()).toBe("");
+  });
+
   test("forwards only completed skill output and redacts subprocess diagnostics", async () => {
     const cases = [
       {
@@ -433,6 +542,15 @@ describe("CLI skill commands", () => {
       },
       {
         source:
+          'process.stdout.write(JSON.stringify({type:"turn.failed",error:{message:"401 sk-or-v1-SYNTHETIC_SECRET"}})+"\\n");' +
+          "process.exitCode=7",
+        status: 7,
+        stdout: "",
+        stderr: "OPENROUTER_API_KEY",
+        provider: "openrouter" as const,
+      },
+      {
+        source:
           'process.stdout.write(JSON.stringify({type:"turn.completed"})+"\\n")',
         status: 2,
         stdout: "",
@@ -446,7 +564,12 @@ describe("CLI skill commands", () => {
       expect(
         await runCodexSkillCommand(
           [],
-          { command: "validate", stdout: stdout.stream, stderr: stderr.stream },
+          {
+            command: "validate",
+            stdout: stdout.stream,
+            stderr: stderr.stream,
+            ...("provider" in scenario ? { provider: scenario.provider } : {}),
+          },
           { command: process.execPath, prefixArgs: ["-e", scenario.source] },
         ),
       ).toBe(scenario.status);
@@ -458,6 +581,9 @@ describe("CLI skill commands", () => {
       }
       expect(stderr.text()).not.toContain("SYNTHETIC_SECRET");
       expect(stderr.text()).not.toContain("/private");
+      if ("provider" in scenario && scenario.provider === "openrouter") {
+        expect(stderr.text()).not.toContain("open-security login");
+      }
     }
   });
 });

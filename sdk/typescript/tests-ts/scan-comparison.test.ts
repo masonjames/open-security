@@ -97,11 +97,66 @@ describe("semantic scan comparison", () => {
     expect(calls.prompt).toContain(JSON.stringify(input));
   });
 
+  test("rejects OpenRouter matching before catalog or model access", async () => {
+    const { codex, calls } = fakeCodex({ matches: [], uncertain: [] });
+    let catalogRequested = false;
+    await expect(
+      matchScanFindings(
+        { before: [finding("before")], after: [finding("after")] },
+        {
+          codex,
+          environment: {
+            OPEN_SECURITY_PROVIDER: "openrouter",
+            OPEN_SECURITY_MODEL: "qwen/qwen3.7-flash",
+            OPEN_SECURITY_REASONING_EFFORT: "high",
+            OPENROUTER_API_KEY: "synthetic-openrouter-key",
+          },
+          fetchOpenRouterModel: async () => {
+            catalogRequested = true;
+            throw new Error("catalog must not be requested");
+          },
+        },
+      ),
+    ).rejects.toThrow("standard scans only");
+    expect(catalogRequested).toBe(false);
+    expect(calls.threadOptions).toBeUndefined();
+  });
+
   test("rejects malformed model JSON", async () => {
     const { codex } = fakeCodex("not-json");
     await expect(
-      matchScanFindings({ before: [], after: [] }, { codex }),
+      matchScanFindings(
+        { before: [finding("before")], after: [finding("after")] },
+        { codex },
+      ),
     ).rejects.toThrow("invalid JSON");
+  });
+
+  test("returns model-free empty matches and fails closed for an unsupported cost limit", async () => {
+    const { codex, calls } = fakeCodex({ matches: [], uncertain: [] });
+    await expect(
+      matchScanFindings(
+        { before: [], after: [finding("after")] },
+        {
+          codex,
+          environment: { OPEN_SECURITY_MAX_COST_USD: "1" },
+        },
+      ),
+    ).resolves.toEqual({ matches: [], uncertain: [] });
+    expect(calls.threadOptions).toBeUndefined();
+
+    await expect(
+      matchScanFindings(
+        { before: [finding("before")], after: [finding("after")] },
+        {
+          codex,
+          environment: { OPEN_SECURITY_MAX_COST_USD: "1" },
+        },
+      ),
+    ).rejects.toThrow(
+      "cannot currently be enforced for semantic scan matching",
+    );
+    expect(calls.threadOptions).toBeUndefined();
   });
 
   test("allows cross-history uncertainty without relaxing two-scan matching", async () => {

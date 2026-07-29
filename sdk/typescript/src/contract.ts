@@ -24,6 +24,7 @@ const DOCUMENTS = {
   "findings.json": "findings.schema.json",
   "coverage.json": "coverage.schema.json",
 } as const;
+export type ContractDocumentName = keyof typeof DOCUMENTS;
 const PRODUCER_NAME = "codex-security-plugin";
 const MAX_CONTRACT_DOCUMENT_BYTES = {
   "scan-manifest.json": 16 * 1024 * 1024,
@@ -649,7 +650,7 @@ function safeScopePath(value: string): string {
 
 async function readScanJson(
   scanDir: string,
-  relativePath: keyof typeof DOCUMENTS,
+  relativePath: ContractDocumentName,
   documentDigests: Map<string, string>,
   signal?: AbortSignal,
   expectedRoot?: ScanRoot,
@@ -683,6 +684,28 @@ async function readScanJson(
   } finally {
     await file.close();
   }
+}
+
+/**
+ * Reads one canonical contract draft through the same bounded, symlink-safe
+ * JSON path used by final contract validation, without requiring the draft to
+ * be sealed yet.
+ *
+ * @internal
+ */
+export async function requireScanJsonObject(
+  scanDirectory: string,
+  relativePath: ContractDocumentName,
+  signal?: AbortSignal,
+): Promise<void> {
+  const scanRoot = await requireScanRoot(scanDirectory, signal);
+  await readScanJson(
+    scanRoot.path,
+    relativePath,
+    new Map<string, string>(),
+    signal,
+    scanRoot,
+  );
 }
 
 async function readJson(

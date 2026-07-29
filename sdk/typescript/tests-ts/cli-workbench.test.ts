@@ -213,6 +213,84 @@ describe("CLI workbench", () => {
     expect(JSON.parse(stdout.text())).toEqual({ summary: { persisting: 1 } });
   });
 
+  test("fails closed before uncached semantic matching when a cost limit is configured", async () => {
+    const before = [{ occurrenceId: "before" }];
+    const after = [{ occurrenceId: "after" }];
+    const calls: Array<readonly string[]> = [];
+    let matcherCalls = 0;
+    const stderr = capture();
+
+    expect(
+      await main(
+        ["scans", "match", "before", "after"],
+        capture().stream,
+        stderr.stream,
+        dependencies({
+          environment: { OPEN_SECURITY_MAX_COST_USD: "1" },
+          onWorkbench: (args): JsonObject => {
+            calls.push(args);
+            return {
+              matchingCached: false,
+              matchingInputs: { before, after },
+            };
+          },
+          onMatch: async () => {
+            matcherCalls += 1;
+            return { matches: [], uncertain: [] };
+          },
+        }),
+      ),
+    ).toBe(2);
+    expect(matcherCalls).toBe(0);
+    expect(calls.map((args) => args[0])).toEqual(["compare-scans"]);
+    expect(stderr.text()).toContain("cannot currently be enforced");
+  });
+
+  test("saves model-free empty matching under a configured scan cost limit", async () => {
+    const calls: Array<readonly string[]> = [];
+    let matcherCalls = 0;
+    const stdout = capture();
+
+    expect(
+      await main(
+        ["scans", "match", "before", "after", "--json"],
+        stdout.stream,
+        capture().stream,
+        dependencies({
+          environment: { OPEN_SECURITY_MAX_COST_USD: "1" },
+          onWorkbench: (args): JsonObject => {
+            calls.push(args);
+            return args[0] === "compare-scans"
+              ? {
+                  matchingCached: false,
+                  matchingInputs: {
+                    before: [],
+                    after: [{ occurrenceId: "after" }],
+                  },
+                }
+              : { summary: { persisting: 0 } };
+          },
+          onMatch: async () => {
+            matcherCalls += 1;
+            return { matches: [], uncertain: [] };
+          },
+        }),
+      ),
+    ).toBe(0);
+    expect(matcherCalls).toBe(0);
+    expect(calls.map((args) => args[0])).toEqual([
+      "compare-scans",
+      "save-scan-comparison",
+    ]);
+    expect(JSON.parse(calls[1]![6]!)).toEqual({
+      matches: [],
+      uncertain: [],
+    });
+    expect(JSON.parse(stdout.text())).toEqual({
+      summary: { persisting: 0 },
+    });
+  });
+
   test("matches all scans once per later scan", async () => {
     const finding = (occurrenceId: string) => ({ occurrenceId });
     const batches = [
@@ -338,9 +416,54 @@ describe("CLI workbench", () => {
     });
   });
 
+  test("rejects model-bearing match-all plans before any partial saves", async () => {
+    const calls: Array<readonly string[]> = [];
+    let matcherCalls = 0;
+    const stderr = capture();
+    expect(
+      await main(
+        ["scans", "match", "--all"],
+        capture().stream,
+        stderr.stream,
+        dependencies({
+          environment: { OPEN_SECURITY_MAX_COST_USD: "1" },
+          onWorkbench: (args): JsonObject => {
+            calls.push(args);
+            return {
+              repository: "/repo",
+              scanCount: 2,
+              unavailableScans: 0,
+              skippedPairs: 0,
+              batches: [
+                {
+                  afterScanId: "after",
+                  afterFindings: [{ occurrenceId: "after" }],
+                  beforeScans: [
+                    {
+                      scanId: "before",
+                      findings: [{ occurrenceId: "before" }],
+                    },
+                  ],
+                },
+              ],
+            };
+          },
+          onMatch: async () => {
+            matcherCalls += 1;
+            return { matches: [], uncertain: [] };
+          },
+        }),
+      ),
+    ).toBe(2);
+    expect(matcherCalls).toBe(0);
+    expect(calls.map((args) => args[0])).toEqual(["list-unmatched-scan-pairs"]);
+    expect(stderr.text()).toContain("cannot currently be enforced");
+  });
+
   test("saves empty comparisons without starting Codex", async () => {
     const calls: Array<readonly string[]> = [];
     const deps = dependencies({
+      environment: { OPEN_SECURITY_MAX_COST_USD: "1" },
       onWorkbench: (args): JsonObject => {
         calls.push(args);
         return args[0] === "list-unmatched-scan-pairs"

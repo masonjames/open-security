@@ -7,7 +7,7 @@ if [ "${1:-}" = bulk-scan ]; then
         --help|-h)
             ;;
         ""|-*)
-            printf '%s\n' 'codex-security: bulk-scan requires a repository CSV; interactive discovery is not supported in this image.' >&2
+            printf '%s\n' 'open-security: bulk-scan requires a repository CSV; interactive discovery is not supported in this image.' >&2
             exit 2
             ;;
     esac
@@ -18,7 +18,7 @@ if [ -n "${GH_TOKEN:-${GITHUB_TOKEN:-}}" ]; then
 
     case "$git_host" in
         ""|.*|*..*|*.|*[!A-Za-z0-9.-]*)
-            printf '%s\n' 'codex-security: CODEX_SECURITY_GIT_HOST must be a valid hostname.' >&2
+            printf '%s\n' 'open-security: CODEX_SECURITY_GIT_HOST must be a valid hostname.' >&2
             exit 2
             ;;
     esac
@@ -29,7 +29,7 @@ if [ -n "${GH_TOKEN:-${GITHUB_TOKEN:-}}" ]; then
         0|[1-9]|[1-9][0-9]|1[01][0-9]|12[0-8])
             ;;
         *)
-            printf '%s\n' 'codex-security: GIT_CONFIG_COUNT must be an integer from 0 to 128.' >&2
+            printf '%s\n' 'open-security: GIT_CONFIG_COUNT must be an integer from 0 to 128.' >&2
             exit 2
             ;;
     esac
@@ -42,4 +42,4 @@ if [ -n "${GH_TOKEN:-${GITHUB_TOKEN:-}}" ]; then
     export GIT_CONFIG_COUNT=$((git_config_count + 1))
 fi
 
-exec codex-security "$@"
+exec open-security "$@"

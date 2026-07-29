@@ -1,28 +1,32 @@
 # Security Policy
 
-## Report a vulnerability in Codex Security
+## Report a vulnerability in Open Security
 
-Report vulnerabilities in the Codex Security CLI, SDK, bundled plugin, or
-release artifacts privately through
-[OpenAI's Bugcrowd program](https://bugcrowd.com/engagements/openai).
+Report vulnerabilities in the Open Security CLI, SDK, bundled plugin, or
+release artifacts through
+[GitHub private vulnerability reporting](https://github.com/masonjames/open-security/security/advisories/new).
 
 Include the affected version, security impact, and the smallest safe
 reproduction. Remove API keys, access tokens, private source code, and customer
 data from the report unless a private submission requires that material and you
-have permission to share it. Use the latest published version when confirming a
-finding.
+have permission to share it. Use the latest tagged release or current source
+revision when confirming a finding.
 
 Public GitHub issues are for ordinary bugs, documentation problems, and feature
 requests. Keep unpatched vulnerabilities and sensitive scan artifacts out of
 public issues and pull requests.
 
+Open Security is an independent fork. A report to this repository is not
+automatically shared with OpenAI. If a vulnerability also affects the upstream
+project, coordinate disclosure using
+[the upstream security policy](https://github.com/openai/codex-security/security/policy).
+
 ## Report a finding in a scanned repository
 
 A vulnerability found in another repository belongs to that repository's
 owner. Follow its security policy or coordinated disclosure process, and share
-the finding only with people authorized to receive it. OpenAI's Bugcrowd program
-is for vulnerabilities in OpenAI products and services, not for findings in
-unrelated projects.
+the finding only with people authorized to receive it. Do not submit findings
+from unrelated repositories to Open Security's vulnerability-reporting channel.
 
 ## Run scans safely
 
@@ -32,6 +36,12 @@ unrelated projects.
   Codex sandbox.
 - Store credentials in an approved secret manager or environment variable.
   Keep your Codex home directory outside the repository being scanned.
+- Treat the selected model provider as a recipient of scan data. Repository
+  source, prompts, findings, and related context may be sent to that provider.
+  When using OpenRouter, review its data policy and the policies of any
+  downstream model providers selected by its routing configuration.
+- Use a provider key scoped for this purpose. Never commit it, include it in a
+  command line, or copy it into scan artifacts.
 - Store results outside the enclosing Git worktree. Findings, reports, logs,
   and SARIF can contain private source code, vulnerability details, and
   reproduction steps.

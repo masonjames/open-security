@@ -77,7 +77,7 @@ describe("scan history renderer", () => {
       ),
     );
 
-    expect(text).toContain("CODEX SECURITY");
+    expect(text).toContain("OPEN SECURITY");
     expect(text).toMatch(
       /SCAN COMPARISON[\s\S]*━━ ✓ Resolved \(2 findings\) ━+[\s\S]*━━ \+ New \(1 finding\) ━+[\s\S]*━━ ● Persisting \(2 findings\) ━+[\s\S]*━━ ○ Not rescanned \(1 finding\) ━+[\s\S]*━━ \? Unknown \(1 finding\) ━+/,
     );

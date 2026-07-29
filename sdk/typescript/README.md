@@ -1,18 +1,34 @@
-# `@openai/codex-security`
+# `@masonjames/open-security`
 
-Open-source TypeScript SDK and CLI for running Codex Security scans. The
-ESM-only package includes TypeScript declarations, the `codex-security`
-executable, and the matching Codex runtime.
+Open-source TypeScript SDK and CLI for running Open Security scans. The
+ESM-only package includes TypeScript declarations, the canonical `open-security`
+executable, the backward-compatible `codex-security` alias, and the matching
+Codex runtime.
+
+> [!IMPORTANT]
+> This is an independent community fork of
+> [OpenAI's Codex Security](https://github.com/openai/codex-security). It is not
+> affiliated with or endorsed by OpenAI. Internal plugin and artifact identifiers
+> retain their upstream names for compatibility.
 
 > [!NOTE]
 > This package follows semantic versioning. Its public API may change between
 > minor versions before `1.0.0`.
 
-## Install
+## Install from source
+
+The package is not published to npm yet. Build and install a verified local tarball:
 
 ```bash
-npm install @openai/codex-security
-npx codex-security --version
+git clone https://github.com/masonjames/open-security.git
+cd open-security/sdk/typescript
+corepack enable
+pnpm install --frozen-lockfile
+pnpm run types
+pnpm run build
+pnpm pack --pack-destination ./dist-package
+npm install ./dist-package/masonjames-open-security-*.tgz
+./node_modules/.bin/open-security --version
 ```
 
 The package supports macOS, Linux, and Windows and requires Node.js 22 or
@@ -22,12 +38,12 @@ with `--python`, `pythonPath`, or `PYTHON` when needed.
 
 ## Run a scan from TypeScript
 
-Sign in with `npx codex-security login` or set `OPENAI_API_KEY` or
+Sign in with `open-security login` or set `OPENAI_API_KEY` or
 `CODEX_API_KEY`. Then create a client and scan a repository you own or have
 permission to assess:
 
 ```ts
-import { CodexSecurity } from "@openai/codex-security";
+import { CodexSecurity } from "@masonjames/open-security";
 
 const security = new CodexSecurity();
 
@@ -38,6 +54,27 @@ try {
 
   console.log(result.reportPath);
   console.log(result.findings.findings.length);
+} finally {
+  await security.close();
+}
+```
+
+For OpenRouter, set `OPENROUTER_API_KEY` and select the provider and exact model:
+
+```ts
+const security = new CodexSecurity({
+  provider: "openrouter",
+  codexOverrides: {
+    model: "qwen/qwen3.7-flash",
+    model_reasoning_effort: "high",
+  },
+});
+
+try {
+  const result = await security.run("/path/to/repository", {
+    maxCostUsd: 1,
+  });
+  console.log(result.reportPath);
 } finally {
   await security.close();
 }
@@ -54,37 +91,80 @@ limit access to authorized reviewers.
 
 ## Authentication
 
+### OpenRouter
+
+OpenRouter uses an API key from the environment and requires an explicit model
+ID. The CLI owns a fixed OpenRouter Responses API upstream and routes standard
+scans through a temporary loopback bridge:
+
+```bash
+export OPENROUTER_API_KEY="<your-key>"
+export OPEN_SECURITY_PROVIDER="openrouter"
+export OPEN_SECURITY_MODEL="qwen/qwen3.7-flash"
+export OPEN_SECURITY_REASONING_EFFORT="high"
+export OPEN_SECURITY_OPENROUTER_MAX_OUTPUT_TOKENS="16384"
+export OPEN_SECURITY_MAX_COST_USD="1"
+
+open-security scan . --dry-run --json
+open-security scan .
+```
+
+The same configuration can be supplied with `--provider`, `--model`,
+`--reasoning-effort`, and `--max-cost`. OpenRouter supports `auto` and
+`api-key` authentication modes; `--auth chatgpt` is rejected. The key is not
+persisted by login, written to scan recipes, or forwarded to OpenAI scans.
+OpenAI keys are removed from OpenRouter model processes, and model-provider
+credentials are removed from Python and workbench helper processes.
+
+The standard-scan bridge binds an opaque route on `127.0.0.1`, removes ambient
+forward-proxy variables from the model process, forwards only validated streamed
+Responses requests to `https://openrouter.ai/api/v1`, and closes with the SDK
+client. Codex receives a random bridge-only credential; the real OpenRouter key
+stays in the host process and is substituted only on the fixed upstream request.
+Its URL exists only in the isolated runtime configuration; it is absent from
+scan recipes and the readable preflight snapshot. Validation, patching, and
+semantic scan matching are disabled for OpenRouter until those direct Codex
+paths use the same credential bridge. They remain available with OpenAI.
+
+Before starting Codex, the scanner queries OpenRouter's unauthenticated
+`GET https://openrouter.ai/api/v1/models` catalog and the exact model's
+`GET /api/v1/models/{author}/{slug}/endpoints` record. It requires an exact
+model ID, at least one advertised provider endpoint, and the tool,
+structured-response, and requested reasoning capabilities used by the command.
+
+### OpenAI
+
 For local use, sign in with ChatGPT:
 
 ```bash
-npx codex-security login
-npx codex-security scan .
+open-security login
+open-security scan .
 ```
 
 On a remote or headless machine, use device authentication:
 
 ```bash
-npx codex-security login --device-auth
+open-security login --device-auth
 ```
 
 For CI, set `OPENAI_API_KEY` or `CODEX_API_KEY`. To store an API key instead,
 pass it on stdin:
 
 ```bash
-printenv OPENAI_API_KEY | npx codex-security login --with-api-key
+printenv OPENAI_API_KEY | open-security login --with-api-key
 ```
 
 On Windows, set the API key in PowerShell:
 
 ```powershell
 $env:OPENAI_API_KEY = "<your-api-key>"
-npx codex-security scan C:\code\repository
+open-security scan C:\code\repository
 ```
 
-Check or remove the stored sign-in with `npx codex-security login status` and
-`npx codex-security logout`. Codex Security reuses an existing file-based Codex
+Check or remove the stored sign-in with `open-security login status` and
+`open-security logout`. Open Security reuses an existing file-based Codex
 sign-in. If Codex stores credentials in the system keyring, run
-`npx codex-security login` once before scanning.
+`open-security login` once before scanning.
 
 An environment API key takes precedence over a stored sign-in by default.
 When both a stored ChatGPT sign-in and an environment API key are available, an
@@ -93,8 +173,8 @@ other noninteractive scans never prompt and retain automatic API-key
 precedence. Select the credential source explicitly with `--auth`:
 
 ```bash
-npx codex-security scan . --auth chatgpt
-npx codex-security scan . --auth api-key
+open-security scan . --auth chatgpt
+open-security scan . --auth api-key
 ```
 
 `--auth chatgpt` uses the stored sign-in and ignores `OPENAI_API_KEY` and
@@ -114,44 +194,45 @@ unset OPENAI_API_KEY CODEX_API_KEY
 The interactive choice applies only to the current scan and is not persisted.
 
 When an environment key is configured, ChatGPT login and
-`codex-security login status` identify the effective scan credential source
+`open-security login status` identify the effective scan credential source
 without printing its value, including when no stored sign-in exists.
 
 ## CLI
 
 ```bash
-npx codex-security scan /path/to/repository
-npx codex-security scan /path/to/repository --model gpt-5.6-terra
-npx codex-security scan /path/to/repository --path src --path tests
-npx codex-security scan /path/to/repository --knowledge-base /path/to/threat-models --knowledge-base /path/to/architecture.pdf
-npx codex-security scan /path/to/repository --diff origin/main --json
-npx codex-security scan /path/to/repository --output-dir /path/outside/repository/results
-npx codex-security scan /path/to/repository --output-dir /path/outside/repository/results --archive-existing
-npx codex-security scan /path/to/repository --dry-run
-npx codex-security scan /path/to/repository --fail-on-severity high
-npx codex-security scan /path/to/repository --max-cost 5
-npx codex-security install-hook
-npx codex-security bulk-scan
-npx codex-security bulk-scan repositories.csv --output-dir /path/outside/repositories/security-scans --workers 4
-npx codex-security scans list /path/to/repository
-npx codex-security scans list --scan-root /path/outside/repository/results
-npx codex-security scans show SCAN_ID
-npx codex-security scans rerun SCAN_ID
-npx codex-security scans match PREVIOUS_SCAN_ID CURRENT_SCAN_ID
-npx codex-security scans match --all
-npx codex-security scans compare PREVIOUS_SCAN_ID CURRENT_SCAN_ID
-npx codex-security export /path/outside/repository/results --export-format sarif --output /path/outside/repository/results.sarif
-npx codex-security export /path/outside/repository/results --export-format csv --output /path/outside/repository/findings.csv
-npx codex-security export /path/outside/repository/results --export-format json --output /path/outside/repository/findings.json
-npx codex-security validate /path/outside/repository/findings.json "Possible SQL injection in src/query.ts:42"
-npx codex-security patch /path/outside/repository/findings.json "Missing authorization check in src/routes.ts:18"
+open-security scan /path/to/repository
+open-security scan /path/to/repository --model gpt-5.6-terra
+open-security scan /path/to/repository --path src --path tests
+open-security scan /path/to/repository --knowledge-base /path/to/threat-models --knowledge-base /path/to/architecture.pdf
+open-security scan /path/to/repository --diff origin/main --json
+open-security scan /path/to/repository --output-dir /path/outside/repository/results
+open-security scan /path/to/repository --output-dir /path/outside/repository/results --archive-existing
+open-security scan /path/to/repository --dry-run
+open-security scan /path/to/repository --fail-on-severity high
+open-security scan /path/to/repository --max-cost 5
+open-security install-hook
+open-security bulk-scan
+open-security bulk-scan repositories.csv --output-dir /path/outside/repositories/security-scans --workers 4
+open-security scans list /path/to/repository
+open-security scans list --scan-root /path/outside/repository/results
+open-security scans show SCAN_ID
+open-security scans rerun SCAN_ID
+open-security scans match PREVIOUS_SCAN_ID CURRENT_SCAN_ID
+open-security scans match --all
+open-security scans compare PREVIOUS_SCAN_ID CURRENT_SCAN_ID
+open-security export /path/outside/repository/results --export-format sarif --output /path/outside/repository/results.sarif
+open-security export /path/outside/repository/results --export-format csv --output /path/outside/repository/findings.csv
+open-security export /path/outside/repository/results --export-format json --output /path/outside/repository/findings.json
+open-security validate /path/outside/repository/findings.json "Possible SQL injection in src/query.ts:42"
+open-security patch /path/outside/repository/findings.json "Missing authorization check in src/routes.ts:18"
 ```
 
-Run `npx codex-security --version` for the installed CLI version or
-`npx codex-security info --json` for the package, bundled plugin, Codex runtime,
+Run `open-security --version` for the installed CLI version or
+`open-security info --json` for the package, bundled plugin, Codex runtime,
 default model, reasoning effort, and first-scan command. A scan with `--dry-run`
-also reports its effective model and reasoning effort, including `--codex`
-overrides, without starting Codex or contacting the network.
+also reports its effective provider, model, and reasoning effort, including
+`--codex` overrides, without starting Codex. OpenRouter dry runs query its public,
+unauthenticated model catalog to validate the exact model and pricing metadata.
 
 `install-hook` scans staged and unstaged changes before each commit. It respects
 `core.hooksPath`, does not replace an existing hook, and blocks high-severity
@@ -159,7 +240,11 @@ findings or failed scans. Set `--fail-on-severity` to change the threshold.
 
 `--path` scopes a scan to one or more paths, `--diff` scans committed changes,
 and `--working-tree` scans staged and unstaged changes. Deep scans support
-repository and path targets. The output directory must be outside the scanned
+repository and path targets with OpenAI. OpenRouter deep scans are rejected for
+now because the credential bridge and aggregate cost accounting have not yet
+been validated across independent delegated workers. Standard OpenRouter scans
+remain supported.
+The output directory must be outside the scanned
 directory and any enclosing Git worktree. When SARIF is produced, it is written
 to
 `<scan-dir>/exports/results.sarif`.
@@ -182,10 +267,17 @@ for a passing policy. Incomplete scans still write the available human or JSON
 result to stdout and a coverage warning to stderr, including in report-only
 mode.
 
-Scans use `gpt-5.6-sol` with extra-high reasoning effort by default. Use
-`--model gpt-5.6-terra` to switch models. Use repeatable `--codex KEY=VALUE`
-options for other Codex settings, such as
-`--codex 'model_reasoning_effort="high"'`.
+OpenAI scans use `gpt-5.6-sol` with extra-high reasoning effort by default. Use
+`--model gpt-5.6-terra` to switch OpenAI models. OpenRouter scans require an
+explicit model through `--model` or `OPEN_SECURITY_MODEL` and default to `high`
+reasoning unless explicitly configured. Use repeatable
+`--codex KEY=VALUE` options for other Codex settings, such as
+`--codex 'model_reasoning_effort="high"'`; OpenRouter's provider name, upstream
+endpoint, credential variable, and Responses wire API are owned by Open Security
+and cannot be overridden through raw Codex configuration. Set
+`OPEN_SECURITY_OPENROUTER_MAX_OUTPUT_TOKENS` to a decimal integer from `1` through
+`65536` to change the standard-scan per-request output reservation cap; the
+default is `16384`.
 
 Scan progress identifies the requested paths and reports actual ranking,
 file-review, validation, and attack-path phases as they become available.
@@ -194,19 +286,38 @@ token and worker counts, estimated cost, the results directory, and the next
 useful command.
 Progress and summaries use stderr; structured scan results remain on stdout.
 
-Each scan records its model, tokens, and estimated cost in its JSON result,
-scan history, and bulk-scan receipt. Estimates use
-[standard API token prices](https://developers.openai.com/api/docs/models/compare),
-including cached input and cache writes; fees and surcharges are not included.
+Each scan records its provider, model, tokens, and estimated cost in its JSON
+result, scan history, and bulk-scan receipt. OpenAI estimates use built-in
+published rates. OpenRouter estimates parse prices without floating point and
+use the maximum advertised prompt, completion, cache-read, and cache-write rate
+across the base catalog record, every current provider endpoint, and every
+conditional pricing override. Input, cached input, cache-write input, and output
+tokens are included. Models with no advertised endpoint, a nonzero per-request
+fee, or any other nonzero billing category are rejected for standard scans
+until they can be accounted reliably.
 
-Use `--max-cost USD` to stop a scan, including its delegated workers, when its
-running cost exceeds the limit. Partial results are preserved. Requests
-already in progress can finish above the limit.
+Use `--max-cost USD` or `OPEN_SECURITY_MAX_COST_USD` to stop an individual
+standard scan, including its parent-linked delegated workers, when its running
+estimate exceeds the limit. Partial results are preserved. Requests already in
+progress can finish above the limit; this is a local estimate guardrail, not a
+provider-side spending cap.
 
-Run `npx codex-security scan --help` or `npx codex-security bulk-scan --help`
+For OpenRouter standard scans, the output-token cap is enforced before each
+Responses request is forwarded. A missing or larger `max_output_tokens` value is
+clamped, while a valid lower value is preserved. This reduces provider credit
+reservations, latency, and rate-limit pressure; it complements rather than
+replaces the cumulative USD guardrail.
+
+`OPEN_SECURITY_MAX_COST_USD` fails closed for `bulk-scan`, `validate`, `patch`,
+and model-backed `scans match` operations because those paths do not yet have
+reliable campaign-wide or turn-level accounting. Cached and empty scan matching
+and deterministic `scans compare` remain model-free. Deep scans cannot use a
+cost limit; OpenRouter deep scans are entirely disabled as described above.
+
+Run `open-security scan --help` or `open-security bulk-scan --help`
 for the complete CLI references.
 
-Sign in with `gh auth login`, then run `npx codex-security bulk-scan` to discover
+Sign in with `gh auth login`, then run `open-security bulk-scan` to discover
 GitHub repositories pushed in the last 90 days. Archived
 repositories and forks are excluded. Search the repository list, select the
 repositories to scan, and confirm before scanning.
@@ -228,7 +339,7 @@ Results remain under `--output-dir`; rerun the same command to resume.
 
 ### Scan history and reruns
 
-`npx codex-security scans list` lists scans for the current repository. Pass a
+`open-security scans list` lists scans for the current repository. Pass a
 repository path to inspect another checkout, `--scan-root DIR` to list scans
 whose artifacts are under a particular root. `scans show SCAN_ID` includes the
 scan configuration, results, coverage, and artifact locations.
@@ -236,7 +347,7 @@ scan configuration, results, coverage, and artifact locations.
 Every scan history command accepts a full scan ID or a unique prefix of at
 least eight characters.
 
-Scan history uses the existing Codex Security workbench database at
+Scan history uses the existing Open Security workbench database at
 `$CODEX_HOME/state/plugins/codex-security/workbench.sqlite3`. Set
 `CODEX_SECURITY_STATE_DIR` to place the database elsewhere. Scan credentials
 are never stored in the scan configuration.
@@ -279,7 +390,7 @@ nonzero:
 
 ```bash
 SCAN_ROOT="$(mktemp -d)"
-npx codex-security scan . \
+open-security scan . \
   --diff origin/main \
   --output-dir "$SCAN_ROOT/results" \
   --json \
@@ -297,7 +408,7 @@ document. CSV uses the portable findings columns, marks findings as open, and
 does not include local workbench triage state. The exporter validates the seal
 before writing, accepts `--output -` for stdout, and can use
 `--source-root /path/to/repository` with SARIF to add source-line fingerprints.
-Run `npx codex-security export --help` for all export options.
+Run `open-security export --help` for all export options.
 
 Use `validate` to run the bundled validation skill on candidate findings and
 `patch` to run the bundled fix-finding skill on security issues. Each positional
@@ -332,9 +443,6 @@ authorization failures stop immediately.
 
 ## Documentation and security
 
-- [CLI quickstart](https://developers.openai.com/codex/security/cli)
-- [TypeScript SDK guide](https://developers.openai.com/codex/security/sdk)
-- [GitHub issues](https://github.com/openai/codex-security/issues) for bugs and
-  feature requests
-- [Security policy](https://github.com/openai/codex-security/blob/main/SECURITY.md)
-  for private vulnerability reporting and safe operation
+- [Open Security issues](https://github.com/masonjames/open-security/issues) for bugs and feature requests
+- [Open Security security policy](https://github.com/masonjames/open-security/security/policy) for private vulnerability reporting
+- [Upstream Codex Security](https://github.com/openai/codex-security) for project lineage and upstream documentation

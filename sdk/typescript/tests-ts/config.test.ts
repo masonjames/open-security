@@ -3,11 +3,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
 import { parse } from "smol-toml";
+import { openRouterBridgeRuntimeConfig } from "../src/config.js";
 import {
   ConfigurationError,
   DEFAULT_CODEX_CONFIG,
   mergedCodexConfig,
   writeCodexConfig,
+  type JsonObject,
 } from "../src/index.js";
 
 const temporaryDirectories: string[] = [];
@@ -153,6 +155,179 @@ describe("Codex configuration", () => {
         },
       }),
     ).resolves.toBeDefined();
+  });
+
+  test("builds a fixed OpenRouter Responses configuration with explicit precedence", async () => {
+    await expect(
+      mergedCodexConfig(
+        {
+          provider: "openrouter",
+          codexOverrides: { model: "qwen/qwen3.7-flash" },
+        },
+        {
+          OPEN_SECURITY_MODEL: "ignored/environment-model",
+          OPEN_SECURITY_REASONING_EFFORT: "high",
+        },
+      ),
+    ).resolves.toMatchObject({
+      model: "qwen/qwen3.7-flash",
+      model_reasoning_effort: "high",
+      model_provider: "openrouter",
+      model_providers: {
+        openrouter: {
+          name: "OpenRouter",
+          base_url: "https://openrouter.ai/api/v1",
+          env_key: "OPENROUTER_API_KEY",
+          wire_api: "responses",
+        },
+      },
+    });
+
+    await expect(
+      mergedCodexConfig({}, { OPEN_SECURITY_PROVIDER: "openrouter" }),
+    ).rejects.toThrow("require an explicit model");
+    await expect(
+      mergedCodexConfig(
+        {
+          provider: "openrouter",
+          codexOverrides: {
+            model: "qwen/qwen3.7-flash",
+            model_provider: "attacker-controlled",
+          },
+        },
+        {},
+      ),
+    ).rejects.toThrow("owns OpenRouter model_provider configuration");
+
+    for (const [key, value] of [
+      ["model", "more-expensive/model"],
+      ["model_reasoning_effort", "low"],
+      ["model_provider", "other"],
+      ["model_providers", { other: { base_url: "https://example.test" } }],
+    ] as const) {
+      await expect(
+        mergedCodexConfig(
+          {
+            provider: "openrouter",
+            codexOverrides: {
+              model: "qwen/qwen3.7-flash",
+              profile: "unsafe",
+              profiles: { unsafe: { [key]: value } },
+            },
+          },
+          {},
+        ),
+      ).rejects.toThrow(`cannot override ${key}`);
+    }
+  });
+
+  test("builds an isolated OpenRouter bridge runtime configuration", async () => {
+    const canonical = await mergedCodexConfig({
+      provider: "openrouter",
+      codexOverrides: {
+        model: "qwen/qwen3.7-flash",
+        features: {
+          custom_feature: true,
+          enable_request_compression: true,
+          responses_websockets: true,
+          responses_websockets_v2: true,
+          remote_compaction_v2: true,
+          multi_agent_v2: { max_concurrent_threads_per_session: 3 },
+        },
+      },
+    });
+    const before = structuredClone(canonical);
+    const baseUrl = "http://127.0.0.1:43123/opaque/api/v1";
+
+    const runtime = openRouterBridgeRuntimeConfig(canonical, baseUrl);
+
+    expect(runtime).toMatchObject({
+      model: "qwen/qwen3.7-flash",
+      model_provider: "openrouter",
+      model_providers: {
+        openrouter: {
+          name: "OpenRouter",
+          base_url: baseUrl,
+          env_key: "OPENROUTER_API_KEY",
+          wire_api: "responses",
+        },
+      },
+      features: {
+        plugins: true,
+        goals: true,
+        custom_feature: true,
+        enable_request_compression: false,
+        responses_websockets: false,
+        responses_websockets_v2: false,
+        remote_compaction_v2: false,
+        multi_agent_v2: {
+          enabled: true,
+          max_concurrent_threads_per_session: 3,
+        },
+      },
+    });
+    expect(canonical).toEqual(before);
+    expect(
+      (
+        (canonical["model_providers"] as JsonObject)["openrouter"] as JsonObject
+      )["base_url"],
+    ).toBe("https://openrouter.ai/api/v1");
+    expect(runtime).not.toBe(canonical);
+    expect(runtime["features"]).not.toBe(canonical["features"]);
+  });
+
+  test("rejects noncanonical OpenRouter bridge configurations", async () => {
+    const canonical = await mergedCodexConfig({
+      provider: "openrouter",
+      codexOverrides: { model: "qwen/qwen3.7-flash" },
+    });
+    const invalid: JsonObject[] = [];
+    for (const [key, value] of [
+      ["name", "Not OpenRouter"],
+      ["env_key", "OTHER_API_KEY"],
+      ["wire_api", "chat"],
+      ["base_url", "https://example.test/api/v1"],
+    ] as const) {
+      const candidate = structuredClone(canonical);
+      const modelProviders = candidate["model_providers"] as JsonObject;
+      (modelProviders["openrouter"] as JsonObject)[key] = value;
+      invalid.push(candidate);
+    }
+    invalid.push(
+      { ...structuredClone(canonical), model_provider: "openai" },
+      { ...structuredClone(canonical), model_providers: {} },
+    );
+
+    for (const candidate of invalid) {
+      expect(() =>
+        openRouterBridgeRuntimeConfig(
+          candidate,
+          "http://127.0.0.1:43123/opaque/api/v1",
+        ),
+      ).toThrow("canonical Open Security provider configuration");
+    }
+    expect(() => openRouterBridgeRuntimeConfig(canonical, "   ")).toThrow(
+      "base URL must be nonempty",
+    );
+  });
+
+  test("rejects provider-table overrides for OpenAI scans and profiles", async () => {
+    for (const [key, value] of [
+      ["model_provider", "attacker-controlled"],
+      ["model_providers", { attacker: { base_url: "https://example.test" } }],
+    ] as const) {
+      await expect(
+        mergedCodexConfig({ codexOverrides: { [key]: value } }),
+      ).rejects.toThrow("owns model_provider configuration");
+      await expect(
+        mergedCodexConfig({
+          codexOverrides: {
+            profile: "unsafe",
+            profiles: { unsafe: { [key]: value } },
+          },
+        }),
+      ).rejects.toThrow(`cannot override ${key}`);
+    }
   });
 
   test("writes deterministic TOML atomically with restrictive permissions", async () => {

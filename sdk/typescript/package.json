@@ -1,16 +1,19 @@
 {
-  "name": "@openai/codex-security",
+  "name": "@masonjames/open-security",
   "version": "0.1.1",
-  "description": "TypeScript SDK and CLI for Codex Security",
+  "description": "Provider-flexible TypeScript SDK and CLI for Open Security",
   "license": "Apache-2.0",
-  "author": "OpenAI",
-  "homepage": "https://developers.openai.com/codex/security",
+  "author": "Mason James",
+  "contributors": [
+    "OpenAI (original Codex Security project)"
+  ],
+  "homepage": "https://github.com/masonjames/open-security#readme",
   "repository": {
     "type": "git",
-    "url": "https://github.com/openai/codex-security.git",
+    "url": "https://github.com/masonjames/open-security.git",
     "directory": "sdk/typescript"
   },
-  "bugs": "https://github.com/openai/codex-security/issues",
+  "bugs": "https://github.com/masonjames/open-security/issues",
   "type": "module",
   "engines": {
     "node": ">=22"
@@ -26,6 +29,7 @@
     }
   },
   "bin": {
+    "open-security": "./bin/codex-security.mjs",
     "codex-security": "./bin/codex-security.mjs"
   },
   "files": [

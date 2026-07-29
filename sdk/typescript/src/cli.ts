@@ -51,13 +51,24 @@ import {
   type JsonObject,
   type JsonValue,
 } from "./config.js";
-import { formatUsd } from "./cost.js";
+import {
+  formatUsd,
+  rejectUnsupportedScanCostLimit,
+  scanCostLimitFromEnvironment,
+} from "./cost.js";
 import {
   CodexSecurityError,
   OutputInsideProtectedRootError,
   ScanInterruptedError,
 } from "./errors.js";
 import type { SeverityLevel } from "./models.js";
+import { fetchOpenRouterModel } from "./openrouter-models.js";
+import {
+  helperProcessEnvironment,
+  modelProviderExecutionEnvironment,
+  resolveProviderSelection,
+  type ScanProvider,
+} from "./provider.js";
 import { runMultiscan } from "./multiscan.js";
 import type { ScanResult } from "./result.js";
 import {
@@ -125,6 +136,8 @@ const EXPORT_DEFAULT_OUTPUTS = {
 } as const;
 const VALUE_OPTIONS = new Set([
   "--auth",
+  "--provider",
+  "--reasoning-effort",
   "--path",
   "--knowledge-base",
   "--diff",
@@ -156,6 +169,8 @@ function optionValue(flag: string) {
 
 interface ScanArguments {
   auth?: ScanAuthMode;
+  provider?: ScanProvider;
+  reasoningEffort?: string;
   repository?: string;
   paths: string[];
   knowledgeBasePaths: string[];
@@ -208,8 +223,10 @@ type MatchingPlan = JsonObject & {
 
 interface SkillCommandOutput {
   readonly command: "validate" | "patch";
+  readonly provider?: ScanProvider;
   readonly stdout: Writable;
   readonly stderr: Writable;
+  readonly environment?: NodeJS.ProcessEnv;
 }
 
 interface CliDependencies {
@@ -238,20 +255,17 @@ interface CliDependencies {
   bulkScan?: BulkScanDiscoveryDependencies;
   runWorkbench(args: readonly string[]): Promise<JsonObject>;
   matchFindings: typeof matchScanFindings;
+  fetchOpenRouterModel?: typeof fetchOpenRouterModel;
 }
 
 const DEFAULT_DEPENDENCIES: CliDependencies = {
   createSecurity: (config) => new CodexSecurity(config),
   environment: process.env,
   hasStoredChatGPTSignIn: async () => {
-    const environment = Object.fromEntries(
-      Object.entries(process.env).filter(
-        ([name]) =>
-          name.toUpperCase() !== "OPENAI_API_KEY" &&
-          name.toUpperCase() !== "CODEX_API_KEY",
-      ),
+    const status = await accountStatus(
+      resolveCodexCommand(),
+      helperProcessEnvironment(process.env),
     );
-    const status = await accountStatus(resolveCodexCommand(), environment);
     return status.authenticated && /\bchatgpt\b/iu.test(status.details);
   },
   currentDirectory: cwd,
@@ -327,7 +341,7 @@ const DEFAULT_DEPENDENCIES: CliDependencies = {
       const detail = stderr.trim().split("\n").at(-1);
       throw new CodexSecurityError(
         detail?.replace(/^finalize_scan_contract\.py: error: /, "") ||
-          `Could not export Codex Security findings as ${arguments_.format.toUpperCase()}.`,
+          `Could not export Open Security findings as ${arguments_.format.toUpperCase()}.`,
       );
     }
     return undefined;
@@ -343,7 +357,7 @@ const DEFAULT_DEPENDENCIES: CliDependencies = {
         python,
         pluginRoot: await bundledPluginRoot(),
         environment,
-        failureMessage: "Could not read Codex Security scan history",
+        failureMessage: "Could not read Open Security scan history",
       },
       args,
     );
@@ -355,9 +369,12 @@ export async function runCodexSkillCommand(
   args: readonly string[],
   output?: SkillCommandOutput,
   command: CodexCommand = resolveCodexCommand(),
+  baseEnvironment: NodeJS.ProcessEnv = process.env,
 ): Promise<number> {
-  const configuredHome = process.env["CODEX_HOME"];
-  const environment = { ...process.env };
+  const sourceEnvironment =
+    output?.environment ?? helperProcessEnvironment(baseEnvironment);
+  const configuredHome = sourceEnvironment["CODEX_HOME"];
+  const environment = { ...sourceEnvironment };
   for (const name of Object.keys(environment)) {
     if (name.toUpperCase() === "CODEX_HOME") delete environment[name];
   }
@@ -412,14 +429,19 @@ export async function runCodexSkillCommand(
     if (status !== 0) {
       await writeCliOutput(
         output.stderr,
-        `codex-security: ${skillCommandFailure(output.command, status, events?.error ?? diagnostic)}\n`,
+        `open-security: ${skillCommandFailure(
+          output.command,
+          status,
+          events?.error ?? diagnostic,
+          output.provider,
+        )}\n`,
       );
       return status;
     }
     if (events?.message === undefined || events.message.trim().length === 0) {
       await writeCliOutput(
         output.stderr,
-        `codex-security: Codex did not return a completed ${output.command} response.\n`,
+        `open-security: Codex did not return a completed ${output.command} response.\n`,
       );
       return 2;
     }
@@ -501,6 +523,17 @@ export function exportEnvironment(
   );
 }
 
+function rejectOpenRouterAccountOperation(
+  environment: NodeJS.ProcessEnv,
+): void {
+  const provider = resolveProviderSelection({ environment }).provider;
+  if (provider === "openrouter") {
+    throw new CodexSecurityError(
+      "OpenRouter authentication is environment-only. Set OPENROUTER_API_KEY; login, account, and logout manage only OpenAI credentials.",
+    );
+  }
+}
+
 export async function main(
   argv: readonly string[] = process.argv.slice(2),
   output: Writable = process.stdout,
@@ -511,7 +544,7 @@ export async function main(
   const positionals: string[] = [];
   const argumentError = validateCliArguments(argv, positionals);
   if (argumentError !== undefined) {
-    errorOutput.write(`codex-security: ${argumentError}\n`);
+    errorOutput.write(`open-security: ${argumentError}\n`);
     return 2;
   }
   let exitCode = 0;
@@ -525,7 +558,7 @@ export async function main(
     try {
       return select(await dependencies.runWorkbench(args));
     } catch (error) {
-      errorOutput.write(`codex-security: ${cliErrorMessage(error)}\n`);
+      errorOutput.write(`open-security: ${cliErrorMessage(error)}\n`);
       exitCode = 2;
       return undefined;
     }
@@ -562,7 +595,7 @@ export async function main(
   };
   const scanHistory = Cli.create("scans", {
     description:
-      "List, inspect, rerun, match, and compare saved Codex Security scans.",
+      "List, inspect, rerun, match, and compare saved Open Security scans.",
   })
     .command("list", {
       description: "List saved scans for a repository or scan root.",
@@ -657,7 +690,7 @@ export async function main(
           scanArguments = scanArgumentsFromRecipe(recipe, args.scanId);
         } catch (error) {
           const message = cliErrorMessage(error);
-          errorOutput.write(`codex-security: ${message}\n`);
+          errorOutput.write(`open-security: ${message}\n`);
           exitCode = 2;
           return incurError({
             code: "SCAN_REPLAY_UNAVAILABLE",
@@ -728,9 +761,27 @@ export async function main(
             return presentHistory(visibleComparison, "compare", format);
           }
 
-          const matching = await dependencies.matchFindings(
-            matchingInputs as JsonObject & ScanComparisonInput,
-          );
+          const comparisonInput = matchingInputs as JsonObject &
+            ScanComparisonInput;
+          const requiresModel =
+            comparisonInput.before.length > 0 &&
+            comparisonInput.after.length > 0;
+          if (requiresModel) {
+            rejectUnsupportedScanCostLimit(
+              dependencies.environment,
+              "semantic scan matching",
+            );
+          }
+          const matching = requiresModel
+            ? await dependencies.matchFindings(comparisonInput, {
+                environment: dependencies.environment,
+                ...(dependencies.fetchOpenRouterModel === undefined
+                  ? {}
+                  : {
+                      fetchOpenRouterModel: dependencies.fetchOpenRouterModel,
+                    }),
+              })
+            : { matches: [], uncertain: [] };
           return presentHistory(
             await history([
               "save-scan-comparison",
@@ -745,7 +796,7 @@ export async function main(
             format,
           );
         } catch (error) {
-          errorOutput.write(`codex-security: ${cliErrorMessage(error)}\n`);
+          errorOutput.write(`open-security: ${cliErrorMessage(error)}\n`);
           exitCode = 2;
           return undefined;
         }
@@ -774,17 +825,17 @@ export async function main(
         );
       },
     });
-  const cli = Cli.create("codex-security", {
-    description: "Run, validate, patch, and export Codex Security findings.",
+  const cli = Cli.create("open-security", {
+    description: "Run, validate, patch, and export Open Security findings.",
     version: VERSION,
     mcp: {
-      command: "npx --yes @openai/codex-security --mcp",
+      command: "open-security --mcp",
       instructions:
         "Use info for read-only SDK metadata. Scans and other state-changing commands are CLI-only because the MCP transport cannot cancel active commands.",
     },
   })
     .command("scan", {
-      description: "Run a Codex Security scan.",
+      description: "Run an Open Security scan.",
       destructive: true,
       mcp: false,
       args: z.object({
@@ -799,6 +850,17 @@ export async function main(
             .enum(["auto", "chatgpt", "api-key"])
             .default("auto")
             .describe("Select automatic, ChatGPT, or API-key authentication."),
+          provider: z
+            .enum(["openai", "openrouter"])
+            .optional()
+            .describe(
+              "Model provider (default: OPEN_SECURITY_PROVIDER or openai).",
+            ),
+          reasoningEffort: optionValue("--reasoning-effort")
+            .optional()
+            .describe(
+              "Model reasoning effort (default: OPEN_SECURITY_REASONING_EFFORT or provider default).",
+            ),
           path: z
             .array(optionValue("--path"))
             .default([])
@@ -836,7 +898,7 @@ export async function main(
             .describe("Archive existing results before scanning."),
           pluginPath: optionValue("--plugin-path")
             .optional()
-            .describe("Use a Codex Security plugin directory or ZIP."),
+            .describe("Use an Open Security plugin directory or ZIP."),
           python: optionValue("--python")
             .optional()
             .describe("Python interpreter for the bundled plugin runtime."),
@@ -896,7 +958,7 @@ export async function main(
       async run({ args, error: incurError, format, options }) {
         if (format === "md") {
           errorOutput.write(
-            "codex-security: Markdown output is not supported for scan results.\n",
+            "open-security: Markdown output is not supported for scan results.\n",
           );
           exitCode = 2;
           return;
@@ -904,6 +966,8 @@ export async function main(
         const outcome = await runScan(
           {
             auth: options.auth,
+            provider: options.provider,
+            reasoningEffort: options.reasoningEffort,
             repository: args.repository,
             paths: options.path,
             knowledgeBasePaths: options.knowledgeBase,
@@ -980,19 +1044,24 @@ export async function main(
             .map((path) => `'${path.replaceAll("'", `'"'"'`)}'`)
             .join(" ");
           const contents = `#!/bin/sh\nset -eu\nexec ${command} scan . --working-tree --fail-on-severity ${options.failOnSeverity}\n`;
-          const legacyContents = `#!/bin/sh\nset -eu\nexec npx --no-install codex-security scan . --working-tree --fail-on-severity ${options.failOnSeverity}\n`;
+          const legacyOpenSecurityContents = `#!/bin/sh\nset -eu\nexec npx --no-install open-security scan . --working-tree --fail-on-severity ${options.failOnSeverity}\n`;
+          const legacyCodexSecurityContents = `#!/bin/sh\nset -eu\nexec npx --no-install codex-security scan . --working-tree --fail-on-severity ${options.failOnSeverity}\n`;
           const existing = await readFile(hook, "utf8").catch(() => null);
           if (
             existing !== null &&
             existing !== contents &&
-            existing !== legacyContents
+            existing !== legacyOpenSecurityContents &&
+            existing !== legacyCodexSecurityContents
           ) {
             throw new Error(`A pre-commit hook already exists at ${hook}.`);
           }
           if (existing === null) {
             await mkdir(dirname(hook), { recursive: true });
             await writeFile(hook, contents, { flag: "wx", mode: 0o755 });
-          } else if (existing === legacyContents) {
+          } else if (
+            existing === legacyOpenSecurityContents ||
+            existing === legacyCodexSecurityContents
+          ) {
             await writeFile(hook, contents, { flag: "w" });
           }
           return {
@@ -1000,7 +1069,7 @@ export async function main(
             failOnSeverity: options.failOnSeverity,
           };
         } catch (error) {
-          errorOutput.write(`codex-security: ${cliErrorMessage(error)}\n`);
+          errorOutput.write(`open-security: ${cliErrorMessage(error)}\n`);
           exitCode = 2;
           return undefined;
         }
@@ -1027,9 +1096,20 @@ export async function main(
           .describe("Directory for scan artifacts and resumable results."),
         workers: z.number().int().positive().default(4),
         mode: z.enum(["standard", "deep"]).default("standard"),
+        provider: z
+          .enum(["openai", "openrouter"])
+          .optional()
+          .describe(
+            "Model provider for each repository (default: OPEN_SECURITY_PROVIDER or openai).",
+          ),
         model: optionValue("--model")
           .optional()
           .describe("Model to use for each repository."),
+        reasoningEffort: optionValue("--reasoning-effort")
+          .optional()
+          .describe(
+            "Reasoning effort for each repository (default: OPEN_SECURITY_REASONING_EFFORT or provider default).",
+          ),
         maxAttempts: z
           .number()
           .int()
@@ -1054,21 +1134,18 @@ export async function main(
         dependencies.addSignalListener("SIGINT", onInterrupt);
         dependencies.addSignalListener("SIGTERM", onTerminate);
         try {
+          rejectUnsupportedScanCostLimit(
+            dependencies.environment,
+            "bulk scans because workers and retries require a campaign-wide aggregate budget",
+          );
           const currentDirectory = dependencies.currentDirectory();
           let inputPath: string;
           let outputDir: string;
           let githubHost: string | undefined;
           if (args.input === undefined) {
-            if (
-              argv[0] !== "bulk-scan" ||
-              !(
-                argv.length === 1 ||
-                (argv.length === 3 && argv[1] === "--model") ||
-                (argv.length === 2 && argv[1] === `--model=${options.model}`)
-              )
-            ) {
+            if (!isBulkScanDiscoveryInvocation(argv)) {
               throw new Error(
-                "Run 'codex-security bulk-scan [--model MODEL]' to discover repositories, or provide a CSV and --output-dir.",
+                "Run 'open-security bulk-scan [--provider PROVIDER] [--model MODEL] [--reasoning-effort EFFORT]' to discover repositories, or provide a CSV and --output-dir.",
               );
             }
             const wizard = await runBulkScanWizard(
@@ -1101,15 +1178,20 @@ export async function main(
             mode: options.mode,
             maxAttempts: options.maxAttempts,
             config: {
+              provider: options.provider,
               pluginPath: options.pluginPath,
               pythonPath: options.python,
-              codexOverrides: parseCodexOverrides(options.codex, options.model),
+              codexOverrides: parseCodexOverrides(
+                options.codex,
+                options.model,
+                options.reasoningEffort,
+              ),
             },
             createSecurity: dependencies.createSecurity,
             signal: controller.signal,
             onProgress: ({ repository, status, attempt, error }) => {
               errorOutput.write(
-                `codex-security: ${repository} ${status} (attempt ${attempt})${error === undefined ? "" : `: ${cliErrorMessage(error)}`}\n`,
+                `open-security: ${repository} ${status} (attempt ${attempt})${error === undefined ? "" : `: ${cliErrorMessage(error)}`}\n`,
               );
             },
           });
@@ -1121,7 +1203,7 @@ export async function main(
             (error instanceof Error && error.name === "ExitPromptError"
               ? 130
               : 2);
-          errorOutput.write(`codex-security: ${cliErrorMessage(error)}\n`);
+          errorOutput.write(`open-security: ${cliErrorMessage(error)}\n`);
         } finally {
           dependencies.removeSignalListener("SIGINT", onInterrupt);
           dependencies.removeSignalListener("SIGTERM", onTerminate);
@@ -1134,9 +1216,7 @@ export async function main(
       destructive: true,
       mcp: false,
       args: z.object({
-        scanDir: z
-          .string()
-          .describe("Completed Codex Security scan directory."),
+        scanDir: z.string().describe("Completed Open Security scan directory."),
       }),
       options: z
         .object({
@@ -1219,7 +1299,7 @@ export async function main(
           );
         } catch (error) {
           exitCode = 2;
-          errorOutput.write(`codex-security: ${cliErrorMessage(error)}\n`);
+          errorOutput.write(`open-security: ${cliErrorMessage(error)}\n`);
         }
       },
     })
@@ -1251,7 +1331,7 @@ export async function main(
           );
         } catch (error) {
           exitCode = 2;
-          errorOutput.write(`codex-security: ${cliErrorMessage(error)}\n`);
+          errorOutput.write(`open-security: ${cliErrorMessage(error)}\n`);
         }
       },
     })
@@ -1277,6 +1357,7 @@ export async function main(
           .describe("Read an access token from stdin."),
       }),
       async run({ args, options }) {
+        rejectOpenRouterAccountOperation(dependencies.environment);
         exitCode = await dependencies.runCodex([
           "login",
           ...(args.action === undefined ? [] : [args.action]),
@@ -1332,6 +1413,7 @@ export async function main(
       destructive: true,
       mcp: false,
       async run() {
+        rejectOpenRouterAccountOperation(dependencies.environment);
         exitCode = await dependencies.runCodex([
           "logout",
           "-c",
@@ -1372,7 +1454,7 @@ export async function main(
           codexVersion: CODEX_EXECUTABLE_VERSION,
           codexSdkVersion: CODEX_SDK_VERSION,
           ...scanModelConfiguration(DEFAULT_CODEX_CONFIG),
-          nextStep: "codex-security scan . --dry-run",
+          nextStep: "open-security scan . --dry-run",
         };
       },
     });
@@ -1388,7 +1470,7 @@ export async function main(
   if (frameworkExit !== undefined) {
     if (exitCode !== 0) return exitCode;
     errorOutput.write(
-      `codex-security: ${cliErrorMessage(incurErrorMessage(frameworkOutput))}\n`,
+      `open-security: ${cliErrorMessage(incurErrorMessage(frameworkOutput))}\n`,
     );
     return 2;
   }
@@ -1397,7 +1479,7 @@ export async function main(
     await writeCliOutput(output, renderedHistory ?? frameworkOutput);
     return exitCode;
   } catch (error) {
-    errorOutput.write(`codex-security: ${cliErrorMessage(error)}\n`);
+    errorOutput.write(`open-security: ${cliErrorMessage(error)}\n`);
     return 2;
   }
 }
@@ -1482,6 +1564,16 @@ function scanArgumentsFromRecipe(
       "The saved scan recipe contains an invalid mode.",
     );
   }
+  const provider = recipe["provider"];
+  if (
+    provider !== undefined &&
+    provider !== "openai" &&
+    provider !== "openrouter"
+  ) {
+    throw new CodexSecurityError(
+      "The saved scan recipe contains an invalid model provider.",
+    );
+  }
   const config = recipe["config"];
   if (config === undefined || !isJsonObject(config)) {
     throw new CodexSecurityError(
@@ -1524,8 +1616,14 @@ function scanArgumentsFromRecipe(
       "The saved scan recipe contains an invalid cost limit.",
     );
   }
+  const codexOverrides = structuredClone(config);
+  if (provider === "openrouter") {
+    delete codexOverrides["model_provider"];
+    delete codexOverrides["model_providers"];
+  }
   return {
     repository,
+    provider: provider as ScanProvider | undefined,
     paths,
     knowledgeBasePaths,
     diff: kind === "refs" ? reference : undefined,
@@ -1535,7 +1633,7 @@ function scanArgumentsFromRecipe(
     mode,
     archiveExisting: false,
     codex: [],
-    codexOverrides: config,
+    codexOverrides,
     failOnSeverity: threshold as FailureSeverity | undefined,
     maxCostUsd,
     dryRun: false,
@@ -1709,6 +1807,17 @@ async function matchAllScans(
   ])) as MatchingPlan;
   const { repository, scanCount, unavailableScans, skippedPairs, batches } =
     result;
+  const requiresModel = batches.some(
+    ({ afterFindings, beforeScans }) =>
+      afterFindings.length > 0 &&
+      beforeScans.some(({ findings }) => findings.length > 0),
+  );
+  if (requiresModel) {
+    rejectUnsupportedScanCostLimit(
+      dependencies.environment,
+      "semantic scan matching",
+    );
+  }
 
   let matchedPairs = 0;
   let findingMatches = 0;
@@ -1719,7 +1828,15 @@ async function matchAllScans(
         ? { matches: [], uncertain: [] }
         : await dependencies.matchFindings(
             { before, after: afterFindings },
-            { allowHistoricalUncertainty: true },
+            {
+              allowHistoricalUncertainty: true,
+              environment: dependencies.environment,
+              ...(dependencies.fetchOpenRouterModel === undefined
+                ? {}
+                : {
+                    fetchOpenRouterModel: dependencies.fetchOpenRouterModel,
+                  }),
+            },
           );
     const comparisons = beforeScans.map(({ scanId, findings }) => {
       const beforeIds = new Set(
@@ -1800,6 +1917,10 @@ async function runSkill(
   stderr: Writable,
   dependencies: CliDependencies,
 ): Promise<number> {
+  rejectUnsupportedScanCostLimit(
+    dependencies.environment,
+    skill === "validation" ? "finding validation" : "finding patching",
+  );
   if (inputs.length > MAX_SKILL_INPUT_COUNT) {
     throw new CodexSecurityError("Skill inputs exceed the 64-item limit.");
   }
@@ -1813,8 +1934,20 @@ async function runSkill(
       "Validation and patching only support model and model_reasoning_effort overrides.",
     );
   }
+  const provider = resolveProviderSelection({
+    environment: dependencies.environment,
+  }).provider;
+  if (provider === "openrouter") {
+    throw new CodexSecurityError(
+      "OpenRouter currently supports standard scans only. Validation and patching are disabled until these direct Codex paths use the credential bridge; use OpenAI for this command.",
+    );
+  }
+  scanAuthentication(dependencies.environment, "auto", provider);
   const { model, reasoningEffort } = scanModelConfiguration(
-    await mergedCodexConfig({ codexOverrides: overrides }),
+    await mergedCodexConfig(
+      { provider, codexOverrides: overrides },
+      dependencies.environment,
+    ),
   );
   const directory = dependencies.currentDirectory();
   let totalBytes = 0;
@@ -1923,8 +2056,13 @@ async function runSkill(
     ],
     {
       command: skill === "validation" ? "validate" : "patch",
+      provider,
       stdout,
       stderr,
+      environment: modelProviderExecutionEnvironment(
+        provider,
+        dependencies.environment,
+      ),
     },
   );
 }
@@ -1990,13 +2128,16 @@ export function skillCommandFailure(
   command: "validate" | "patch",
   status: number,
   detail: string,
+  provider: ScanProvider = "openai",
 ): string {
   if (
     /401|invalid.api.key|token.expired|unauthori[sz]ed|authorizationrequired/iu.test(
       detail,
     )
   ) {
-    return "Authentication failed. Run codex-security login or check the configured API key.";
+    return provider === "openrouter"
+      ? "Authentication failed using OPENROUTER_API_KEY. Set or replace OPENROUTER_API_KEY and retry."
+      : "Authentication failed. Run open-security login or check the configured API key.";
   }
   if (
     /403|model.not.found|model.*access|access.*model|permission/iu.test(detail)
@@ -2033,6 +2174,33 @@ function incurErrorMessage(output: string): string {
 
 function isOutsidePath(path: string): boolean {
   return path === ".." || path.startsWith(`..${sep}`) || isAbsolute(path);
+}
+
+function isBulkScanDiscoveryInvocation(argv: readonly string[]): boolean {
+  if (argv[0] !== "bulk-scan") return false;
+  const supportedOptions = new Set([
+    "--provider",
+    "--model",
+    "--reasoning-effort",
+  ]);
+  for (let index = 1; index < argv.length; index += 1) {
+    const argument = argv[index]!;
+    const separator = argument.indexOf("=");
+    if (separator >= 0) {
+      if (
+        !supportedOptions.has(argument.slice(0, separator)) ||
+        argument.slice(separator + 1).length === 0
+      ) {
+        return false;
+      }
+      continue;
+    }
+    if (!supportedOptions.has(argument) || index + 1 >= argv.length) {
+      return false;
+    }
+    index += 1;
+  }
+  return true;
 }
 
 async function runExport(
@@ -2109,7 +2277,7 @@ async function runExport(
     }
     return 0;
   } catch (error) {
-    errorOutput.write(`codex-security: ${cliErrorMessage(error)}\n`);
+    errorOutput.write(`open-security: ${cliErrorMessage(error)}\n`);
     return 2;
   }
 }
@@ -2174,16 +2342,33 @@ async function runScan(
   try {
     const repository = arguments_.repository ?? dependencies.currentDirectory();
     const target = targetFromArguments(arguments_);
+    const provider = resolveProviderSelection({
+      provider: arguments_.provider,
+      environment: dependencies.environment,
+    }).provider;
+    const maxCostUsd =
+      arguments_.maxCostUsd ??
+      scanCostLimitFromEnvironment(dependencies.environment);
     const config: CodexSecurityConfig = {
+      provider,
       pluginPath: arguments_.pluginPath,
       pythonPath: arguments_.pythonPath,
       codexOverrides:
         arguments_.codexOverrides ??
-        parseCodexOverrides(arguments_.codex, arguments_.model),
+        parseCodexOverrides(
+          arguments_.codex,
+          arguments_.model,
+          arguments_.reasoningEffort,
+        ),
     };
     let auth = arguments_.auth;
-    selectedAuthentication = scanAuthentication(dependencies.environment, auth);
+    selectedAuthentication = scanAuthentication(
+      dependencies.environment,
+      auth,
+      provider,
+    );
     if (
+      provider === "openai" &&
       (auth === undefined || auth === "auto") &&
       !arguments_.dryRun &&
       interactive &&
@@ -2215,6 +2400,7 @@ async function runScan(
         selectedAuthentication = scanAuthentication(
           dependencies.environment,
           auth,
+          provider,
         );
       }
     }
@@ -2240,14 +2426,14 @@ async function runScan(
       parentScanId: arguments_.parentScanId,
       expectedPluginVersion: arguments_.expectedPluginVersion,
       failureSeverity: arguments_.failOnSeverity,
-      maxCostUsd: arguments_.maxCostUsd,
+      maxCostUsd,
       onCost: (cost) => {
-        if (arguments_.maxCostUsd === undefined) return;
+        if (maxCostUsd === undefined) return;
         progress?.stopTimer();
         progress?.stage(
-          `Estimated cost: ${formatUsd(cost.estimatedUsd)} of ${formatUsd(arguments_.maxCostUsd)} limit`,
+          `Estimated cost: ${formatUsd(cost.estimatedUsd)} of ${formatUsd(maxCostUsd)} limit`,
         );
-        if (cost.estimatedUsd <= arguments_.maxCostUsd) {
+        if (cost.estimatedUsd <= maxCostUsd) {
           progress?.startTimer(runningMessage());
         }
       },
@@ -2268,9 +2454,11 @@ async function runScan(
           progress?.stage(
             `Authentication: API key from ${authentication.source}.`,
           );
-          progress?.stage(
-            "To use your ChatGPT sign-in, retry with --auth chatgpt.",
-          );
+          if (authentication.source !== "OPENROUTER_API_KEY") {
+            progress?.stage(
+              "To use your ChatGPT sign-in, retry with --auth chatgpt.",
+            );
+          }
         } else {
           progress?.stage("Authentication: stored Codex credentials.");
         }
@@ -2318,7 +2506,7 @@ async function runScan(
       },
       onObserverError: (observer, error) => {
         errorOutput.write(
-          `codex-security: warning: ${observer} observer failed: ${cliErrorMessage(error)}\n`,
+          `open-security: warning: ${observer} observer failed: ${cliErrorMessage(error)}\n`,
         );
       },
     };
@@ -2360,14 +2548,14 @@ async function runScan(
     if (failure instanceof OutputInsideProtectedRootError) {
       errorOutput.write(`${message}\n`);
     } else {
-      errorOutput.write(`codex-security: ${message}\n`);
+      errorOutput.write(`open-security: ${message}\n`);
     }
     if (failure instanceof ScanInterruptedError) {
       return { exitCode: 2, error: message };
     }
     if (scanDir !== null) {
       errorOutput.write(
-        `codex-security: Partial output was kept at ${cliErrorMessage(scanDir)}.\n`,
+        `open-security: Partial output was kept at ${cliErrorMessage(scanDir)}.\n`,
       );
     }
     return { exitCode: 2, error: message };
@@ -2377,7 +2565,7 @@ async function runScan(
     return { exitCode: 0, data: { dryRun: true, ...preflight } };
   }
   if (result === null) {
-    errorOutput.write("codex-security: scan completed without a result\n");
+    errorOutput.write("open-security: scan completed without a result\n");
     return { exitCode: 2, error: "Scan completed without a result." };
   }
   const threshold = arguments_.failOnSeverity;
@@ -2398,8 +2586,8 @@ async function runScan(
   if (incomplete) {
     errorOutput.write(
       threshold === undefined
-        ? `codex-security: Scan coverage is ${result.coverage.completeness}; results may be incomplete.\n`
-        : `codex-security: Cannot evaluate the failure policy: coverage is ${result.coverage.completeness}.\n`,
+        ? `open-security: Scan coverage is ${result.coverage.completeness}; results may be incomplete.\n`
+        : `open-security: Cannot evaluate the failure policy: coverage is ${result.coverage.completeness}.\n`,
     );
     return { exitCode: 2, data: result.toJSON() };
   }
@@ -2410,19 +2598,26 @@ function scanFailureMessage(
   error: unknown,
   authentication: ScanAuthentication | null,
 ): string {
+  const openRouter =
+    authentication?.method === "api_key" &&
+    authentication.source === "OPENROUTER_API_KEY";
   switch (classifyConnectionFailure(error)) {
     case "unauthorized":
-      return authentication?.method === "api_key"
-        ? `Authentication failed using ${authentication.source}. ` +
+      return openRouter
+        ? "Authentication failed using OPENROUTER_API_KEY. Provide a valid OpenRouter API key."
+        : authentication?.method === "api_key"
+          ? `Authentication failed using ${authentication.source}. ` +
             "Your ChatGPT sign-in was not used. " +
             "Retry with '--auth chatgpt' or provide a valid API key."
-        : "Authentication failed using stored ChatGPT credentials. " +
-            "Sign in again with 'codex-security login' or provide a valid API key.";
+          : "Authentication failed using stored ChatGPT credentials. " +
+            "Sign in again with 'open-security login' or provide a valid API key.";
     case "forbidden":
-      return authentication?.method === "api_key"
-        ? `The API key from ${authentication.source} cannot access the configured model. ` +
+      return openRouter
+        ? "OPENROUTER_API_KEY cannot access the configured OpenRouter model. Choose an available model or use a key with model access."
+        : authentication?.method === "api_key"
+          ? `The API key from ${authentication.source} cannot access the configured model. ` +
             "Retry with '--auth chatgpt' or use an API key with model access."
-        : "The stored ChatGPT credentials cannot access the configured model. " +
+          : "The stored ChatGPT credentials cannot access the configured model. " +
             "Use an account or API key with model access.";
     case "rate_limited":
       return "The configured account reached its rate limit. Wait and retry.";
@@ -2483,7 +2678,7 @@ function printScanSummary(
     .filter((value): value is string => value !== null)
     .join(", ");
   errorOutput.write(
-    `codex-security: Findings: ${result.findings.findings.length}${severitySummary === "" ? "" : ` (${severitySummary})`}. Coverage: ${result.coverage.completeness}.\n`,
+    `open-security: Findings: ${result.findings.findings.length}${severitySummary === "" ? "" : ` (${severitySummary})`}. Coverage: ${result.coverage.completeness}.\n`,
   );
 
   const started = Date.parse(result.manifest.scan.startedAt);
@@ -2495,24 +2690,24 @@ function printScanSummary(
       ? Math.floor((completed - started) / 1_000)
       : progress?.elapsedSeconds ?? 0;
   errorOutput.write(
-    `codex-security: Elapsed: ${elapsed}s.${workers === null ? "" : ` Workers: ${workers.started}/${workers.planned}.`}\n`,
+    `open-security: Elapsed: ${elapsed}s.${workers === null ? "" : ` Workers: ${workers.started}/${workers.planned}.`}\n`,
   );
 
   const tokenSummary = formatTokenUsage(result.turnResult.usage);
   if (tokenSummary !== null) {
-    errorOutput.write(`codex-security: Tokens: ${tokenSummary}.\n`);
+    errorOutput.write(`open-security: Tokens: ${tokenSummary}.\n`);
   }
   if (result.cost !== null) {
     errorOutput.write(
-      `codex-security: Estimated cost: ${formatUsd(result.cost.estimatedUsd)} USD.\n`,
+      `open-security: Estimated cost: ${formatUsd(result.cost.estimatedUsd)} USD.\n`,
     );
   }
   const scanDir = cliErrorMessage(result.scanDir);
-  errorOutput.write(`codex-security: Results: ${scanDir}\n`);
+  errorOutput.write(`open-security: Results: ${scanDir}\n`);
   errorOutput.write(
     result.sarifPath === null
-      ? `codex-security: Next: codex-security export ${quoteCliPath(scanDir)} --export-format sarif\n`
-      : `codex-security: Next: review ${cliErrorMessage(result.reportPath)}\n`,
+      ? `open-security: Next: open-security export ${quoteCliPath(scanDir)} --export-format sarif\n`
+      : `open-security: Next: review ${cliErrorMessage(result.reportPath)}\n`,
   );
 }
 
@@ -2563,7 +2758,7 @@ function protectedRootErrorMessage(
         ? "Set TMPDIR (or TEMP on Windows) to a writable directory outside the protected root."
         : `Set TMPDIR (or TEMP on Windows) to ${quoteCliPath(suggestion)} after creating that directory.`;
   return [
-    `codex-security: ${description} must be outside the scanned directory and any enclosing Git worktree.`,
+    `open-security: ${description} must be outside the scanned directory and any enclosing Git worktree.`,
     `  Resolved path:  ${error.outputDirectory}`,
     `  Protected root: ${error.protectedRoot}`,
     `  Reason:         ${reason}`,
@@ -2626,9 +2821,13 @@ function targetFromArguments(arguments_: ScanArguments): ScanTarget {
 export function parseCodexOverrides(
   values: readonly string[],
   model?: string,
+  reasoningEffort?: string,
 ): JsonObject {
   const result = Object.create(null) as JsonObject;
   if (model !== undefined) result["model"] = model;
+  if (reasoningEffort !== undefined) {
+    result["model_reasoning_effort"] = reasoningEffort;
+  }
   for (const value of values) {
     const separator = value.indexOf("=");
     const key = separator < 0 ? "" : value.slice(0, separator);
@@ -2679,7 +2878,9 @@ export function parseCodexOverrides(
       throw new CodexSecurityError(
         model !== undefined && key === "model"
           ? "--model conflicts with --codex model"
-          : "Duplicate --codex key",
+          : reasoningEffort !== undefined && key === "model_reasoning_effort"
+            ? "--reasoning-effort conflicts with --codex model_reasoning_effort"
+            : "Duplicate --codex key",
       );
     }
     cursor[final] = parsed;
@@ -2801,12 +3002,12 @@ function interruptedExit(
 ): number {
   const ctrlC = signal === "SIGINT";
   errorOutput.write(
-    `codex-security: Scan ${ctrlC ? "canceled by Ctrl-C" : "terminated by SIGTERM"}.\n`,
+    `open-security: Scan ${ctrlC ? "canceled by Ctrl-C" : "terminated by SIGTERM"}.\n`,
   );
   errorOutput.write(
     scanDir === null
-      ? "codex-security: No partial output was kept.\n"
-      : `codex-security: Partial output was kept at ${cliErrorMessage(scanDir)}.\n`,
+      ? "open-security: No partial output was kept.\n"
+      : `open-security: Partial output was kept at ${cliErrorMessage(scanDir)}.\n`,
   );
   return ctrlC ? 130 : 143;
 }
@@ -2853,7 +3054,7 @@ if (invokedAsMain()) {
       process.exitCode = exitCode;
     },
     (error: unknown) => {
-      process.stderr.write(`codex-security: ${cliErrorMessage(error)}\n`);
+      process.stderr.write(`open-security: ${cliErrorMessage(error)}\n`);
       process.exitCode = 2;
     },
   );

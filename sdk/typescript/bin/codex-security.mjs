@@ -20,7 +20,7 @@ void launch().then(
     process.exitCode = exitCode;
   },
   () => {
-    process.stderr.write("codex-security: Failed to start Codex Security.\n");
+    process.stderr.write("open-security: Failed to start Open Security.\n");
     process.exitCode = 2;
   },
 );

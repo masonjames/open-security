@@ -228,39 +228,50 @@ try {
     ],
     { cwd: consumer },
   );
-
-  assert.equal(
-    typeof installedManifest.bin?.["codex-security"],
-    "string",
-    "Installed package must declare the codex-security launcher.",
-  );
-  const launcher = resolve(
-    installedRoot,
-    installedManifest.bin["codex-security"],
-  );
-  assert.ok(
-    launcher.startsWith(`${installedRoot}${sep}`),
-    "Installed CLI launcher must remain inside its package.",
-  );
-  assert.equal(
-    (await stat(launcher)).isFile(),
-    true,
-    "Installed package must contain its declared CLI launcher.",
+  run(
+    process.execPath,
+    [
+      fileURLToPath(new URL("./smoke-openrouter-bridge.mjs", import.meta.url)),
+      join(installedRoot, "dist", "openrouter-responses-bridge.js"),
+    ],
+    { cwd: consumer },
   );
 
-  const shim = join(
-    consumer,
-    "node_modules",
-    ".bin",
-    process.platform === "win32" ? "codex-security.cmd" : "codex-security",
-  );
-  assert.equal(
-    (await stat(shim)).isFile(),
-    true,
-    "npm must create the published codex-security executable shim.",
-  );
+  const shims = new Map();
+  for (const cliName of ["open-security", "codex-security"]) {
+    assert.equal(
+      typeof installedManifest.bin?.[cliName],
+      "string",
+      `Installed package must declare the ${cliName} launcher.`,
+    );
+    const launcher = resolve(installedRoot, installedManifest.bin[cliName]);
+    assert.ok(
+      launcher.startsWith(`${installedRoot}${sep}`),
+      "Installed CLI launcher must remain inside its package.",
+    );
+    assert.equal(
+      (await stat(launcher)).isFile(),
+      true,
+      "Installed package must contain its declared CLI launcher.",
+    );
 
-  function runInstalledCli(argument) {
+    const shim = join(
+      consumer,
+      "node_modules",
+      ".bin",
+      process.platform === "win32" ? `${cliName}.cmd` : cliName,
+    );
+    assert.equal(
+      (await stat(shim)).isFile(),
+      true,
+      `npm must create the published ${cliName} executable shim.`,
+    );
+    shims.set(cliName, shim);
+  }
+
+  function runInstalledCli(cliName, argument) {
+    const shim = shims.get(cliName);
+    assert.equal(typeof shim, "string");
     const options = { cwd: consumer, capture: true };
     if (process.platform === "win32") {
       return run(
@@ -273,11 +284,13 @@ try {
     return run(shim, [argument], options);
   }
 
-  const version = runInstalledCli("--version");
-  assert.equal(version.trim(), packageManifest.version);
+  for (const cliName of shims.keys()) {
+    const version = runInstalledCli(cliName, "--version");
+    assert.equal(version.trim(), packageManifest.version);
+  }
 
-  const help = runInstalledCli("--help");
-  assert.match(help, /Usage: codex-security\b/u);
+  const help = runInstalledCli("open-security", "--help");
+  assert.match(help, /Usage: open-security\b/u);
 
   console.log(
     `Validated installed ${packageManifest.name}@${packageManifest.version}: public import, CLI, and ${expectedPluginFiles.length} bundled plugin files.`,

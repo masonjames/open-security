@@ -127,6 +127,14 @@ for (const file of pluginFiles) {
   }
 }
 
+const mcpManifestPath = "package/_bundled_plugin/.mcp.json";
+const mcpManifest = tar(["-xOf", archive, mcpManifestPath]).toString("utf8");
+if (/OPENROUTER_API_KEY/iu.test(mcpManifest)) {
+  throw new Error(
+    "npm package must not forward OPENROUTER_API_KEY through the bundled MCP process.",
+  );
+}
+
 const allowedRoot = new Set([
   "package/package.json",
   "package/README.md",
@@ -147,6 +155,9 @@ const distFiles = new Set(
     "knowledge-base",
     "models",
     "multiscan",
+    "openrouter-models",
+    "openrouter-responses-bridge",
+    "provider",
     "result",
     "runtime",
     "scan-comparison",
@@ -207,7 +218,7 @@ const packageJson = JSON.parse(
   tar(["-xOf", archive, "package/package.json"]).toString("utf8"),
 );
 if (
-  packageJson.name !== "@openai/codex-security" ||
+  packageJson.name !== "@masonjames/open-security" ||
   packageJson.license !== "Apache-2.0"
 ) {
   throw new Error("npm package does not contain the expected public metadata.");

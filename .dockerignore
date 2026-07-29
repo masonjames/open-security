@@ -7,6 +7,7 @@
 **/coverage
 **/dist
 **/node_modules
+**/prompt-exports
 **/*.csv
 **/repositories.csv
 **/results

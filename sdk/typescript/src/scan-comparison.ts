@@ -8,7 +8,14 @@ import {
   type TurnOptions,
 } from "@openai/codex-sdk";
 import { z } from "incur";
+import { rejectUnsupportedScanCostLimit } from "./cost.js";
 import { CodexSecurityError } from "./errors.js";
+import { fetchOpenRouterModel } from "./openrouter-models.js";
+import {
+  modelProviderExecutionEnvironment,
+  resolveProviderSelection,
+  type ScanProvider,
+} from "./provider.js";
 
 type Finding = { occurrenceId: string } & Record<string, unknown>;
 
@@ -30,6 +37,8 @@ export interface ScanComparisonOptions {
   allowHistoricalUncertainty?: boolean;
   codex?: ComparisonCodex;
   environment?: NodeJS.ProcessEnv;
+  fetchOpenRouterModel?: typeof fetchOpenRouterModel;
+  provider?: ScanProvider;
   model?: string;
   reasoningEffort?: ModelReasoningEffort;
   signal?: AbortSignal;
@@ -70,10 +79,26 @@ export async function matchScanFindings(
   input: ScanComparisonInput,
   options: ScanComparisonOptions = {},
 ): Promise<ScanComparisonResult> {
+  if (input.before.length === 0 || input.after.length === 0) {
+    return { matches: [], uncertain: [] };
+  }
+  const environment = options.environment ?? process.env;
+  rejectUnsupportedScanCostLimit(environment, "semantic scan matching");
+  const selection = resolveProviderSelection({
+    provider: options.provider,
+    model: options.model,
+    reasoningEffort: options.reasoningEffort,
+    environment,
+  });
+  if (selection.provider === "openrouter") {
+    throw new CodexSecurityError(
+      "OpenRouter currently supports standard scans only. Semantic scan matching is disabled until this direct Codex path uses the credential bridge; use OpenAI for matching.",
+    );
+  }
   const codex =
     options.codex ??
     new Codex({
-      env: comparisonEnvironment(options.environment),
+      env: comparisonEnvironment(selection.provider, environment),
       config: {
         allow_login_shell: false,
         "features.apps": false,
@@ -93,8 +118,10 @@ export async function matchScanFindings(
       },
     });
   const thread = codex.startThread({
-    ...(options.model === undefined ? {} : { model: options.model }),
-    modelReasoningEffort: options.reasoningEffort ?? "medium",
+    ...(selection.model === undefined ? {} : { model: selection.model }),
+    modelReasoningEffort:
+      (selection.reasoningEffort as ModelReasoningEffort | undefined) ??
+      "medium",
     sandboxMode: "read-only",
     approvalPolicy: "never",
     networkAccessEnabled: false,
@@ -135,6 +162,7 @@ function comparisonPrompt(input: ScanComparisonInput): string {
 }
 
 function comparisonEnvironment(
+  provider: ScanProvider,
   source: NodeJS.ProcessEnv = process.env,
 ): Record<string, string> {
   const environment = Object.fromEntries(
@@ -157,7 +185,11 @@ function comparisonEnvironment(
       }
     }
   }
-  return environment;
+  return Object.fromEntries(
+    Object.entries(
+      modelProviderExecutionEnvironment(provider, environment),
+    ).filter((entry): entry is [string, string] => entry[1] !== undefined),
+  );
 }
 
 function validateComparison(

@@ -1,12 +1,12 @@
 {
   "name": "codex-security",
   "version": "0.1.14",
-  "description": "Codex Security workflows for security scans, analysis, and investigation.",
+  "description": "Open Security workflows for provider-flexible security scans, analysis, and investigation.",
   "author": {
-    "name": "OpenAI"
+    "name": "Mason James"
   },
-  "homepage": "https://developers.openai.com/codex/security",
-  "repository": "https://github.com/openai/codex-security",
+  "homepage": "https://github.com/masonjames/open-security#readme",
+  "repository": "https://github.com/masonjames/open-security",
   "license": "Apache-2.0",
   "keywords": [
     "security",
@@ -19,23 +19,19 @@
   "apps": "./.app.json",
   "mcpServers": "./.mcp.json",
   "interface": {
-    "displayName": "Codex Security",
+    "displayName": "Open Security",
     "shortDescription": "Security scanning for your codebase",
-    "longDescription": "Codex Security packages reusable workflows for security scans, analysis, validation, and investigation across code, diffs, and related artifacts.",
-    "developerName": "OpenAI",
+    "longDescription": "Open Security packages reusable, provider-flexible workflows for security scans, analysis, validation, and investigation across code, diffs, and related artifacts.",
+    "developerName": "Mason James",
     "category": "Security",
     "capabilities": ["Interactive", "Read", "Write"],
-    "websiteURL": "https://openai.com/",
-    "privacyPolicyURL": "https://openai.com/policies/row-privacy-policy/",
-    "termsOfServiceURL": "https://openai.com/policies/row-terms-of-use/",
+    "websiteURL": "https://github.com/masonjames/open-security",
     "defaultPrompt": [
-      "Run a Codex Security scan on this repository.",
-      "Run a Codex Security diff scan on this PR, commit, branch diff, or working-tree patch.",
+      "Run an Open Security scan on this repository.",
+      "Run an Open Security diff scan on this PR, commit, branch diff, or working-tree patch.",
       "Triage existing security findings against this repository."
     ],
     "brandColor": "#111111",
-    "composerIcon": "./assets/logo.png",
-    "logo": "./assets/logo.png",
     "screenshots": []
   }
 }

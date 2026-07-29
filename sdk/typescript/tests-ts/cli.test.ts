@@ -76,7 +76,7 @@ describe("CLI", () => {
     const root = capture();
     const stderr = capture();
     expect(await main([], root.stream, stderr.stream, dependencies())).toBe(0);
-    expect(root.text()).toContain("Usage: codex-security <command>");
+    expect(root.text()).toContain("Usage: open-security <command>");
     expect(root.text()).toContain("bulk-scan");
     expect(root.text()).toContain("install-hook");
     expect(root.text()).not.toContain("multiscan");
@@ -124,24 +124,24 @@ describe("CLI", () => {
     expect(
       await main(["--llms"], manifest.stream, capture().stream, dependencies()),
     ).toBe(0);
-    expect(manifest.text()).toContain("codex-security scan [repository]");
+    expect(manifest.text()).toContain("open-security scan [repository]");
     expect(manifest.text()).toContain(
-      "codex-security install-hook [repository]",
+      "open-security install-hook [repository]",
     );
-    expect(manifest.text()).toContain("codex-security bulk-scan [input]");
-    expect(manifest.text()).toContain("codex-security export <scanDir>");
-    expect(manifest.text()).toContain("codex-security validate <findings...>");
-    expect(manifest.text()).toContain("codex-security patch <issues...>");
-    expect(manifest.text()).toContain("codex-security scans list [repository]");
-    expect(manifest.text()).toContain("codex-security scans show <scanId>");
-    expect(manifest.text()).toContain("codex-security scans rerun <scanId>");
+    expect(manifest.text()).toContain("open-security bulk-scan [input]");
+    expect(manifest.text()).toContain("open-security export <scanDir>");
+    expect(manifest.text()).toContain("open-security validate <findings...>");
+    expect(manifest.text()).toContain("open-security patch <issues...>");
+    expect(manifest.text()).toContain("open-security scans list [repository]");
+    expect(manifest.text()).toContain("open-security scans show <scanId>");
+    expect(manifest.text()).toContain("open-security scans rerun <scanId>");
     expect(manifest.text()).toContain(
-      "codex-security scans match [beforeId] [afterId]",
+      "open-security scans match [beforeId] [afterId]",
     );
     expect(manifest.text()).toContain(
-      "codex-security scans compare <beforeId> <afterId>",
+      "open-security scans compare <beforeId> <afterId>",
     );
-    expect(manifest.text()).toContain("codex-security info");
+    expect(manifest.text()).toContain("open-security info");
 
     const completions = capture();
     expect(
@@ -335,8 +335,12 @@ describe("CLI", () => {
             "results",
             "--mode",
             "deep",
+            "--provider",
+            "openrouter",
             "--model",
-            "gpt-5.6-terra",
+            "qwen/qwen3.7-flash",
+            "--reasoning-effort",
+            "high",
             "--codex",
             "features.goals=true",
             "--json",
@@ -358,9 +362,11 @@ describe("CLI", () => {
         resultsPath: join(root, "results", "results.jsonl"),
       });
       expect(config).toMatchObject({
+        provider: "openrouter",
         codexOverrides: {
           features: { goals: true },
-          model: "gpt-5.6-terra",
+          model: "qwen/qwen3.7-flash",
+          model_reasoning_effort: "high",
         },
       });
       expect(scanOptions).toMatchObject({ mode: "deep" });
@@ -417,6 +423,18 @@ describe("CLI", () => {
       ["bulk-scan"],
       ["bulk-scan", "--model", "gpt-5.6-terra"],
       ["bulk-scan", "--model=gpt-5.6-terra"],
+      ["bulk-scan", "--provider", "openrouter"],
+      ["bulk-scan", "--provider=openrouter"],
+      ["bulk-scan", "--reasoning-effort", "high"],
+      ["bulk-scan", "--reasoning-effort=high"],
+      [
+        "bulk-scan",
+        "--reasoning-effort",
+        "high",
+        "--model=qwen/qwen3.7-flash",
+        "--provider",
+        "openrouter",
+      ],
     ] as const) {
       const stdout = capture();
       const stderr = capture();
@@ -434,6 +452,27 @@ describe("CLI", () => {
       expect(stdout.text()).toBe("");
       expect(stderr.text()).toContain("requires a terminal");
     }
+  });
+
+  test("fails closed when a bulk campaign cannot enforce the configured cost limit", async () => {
+    const stdout = capture();
+    const stderr = capture();
+    let started = false;
+
+    expect(
+      await main(
+        ["bulk-scan", "repositories.csv", "--output-dir", "results"],
+        stdout.stream,
+        stderr.stream,
+        dependencies({
+          environment: { OPEN_SECURITY_MAX_COST_USD: "1" },
+          onRun: () => (started = true),
+        }),
+      ),
+    ).toBe(2);
+    expect(started).toBe(false);
+    expect(stdout.text()).toBe("");
+    expect(stderr.text()).toContain("campaign-wide aggregate budget");
   });
 
   test("requires an output directory for a supplied bulk scan CSV", async () => {
@@ -502,7 +541,7 @@ describe("CLI", () => {
       codexSdkVersion: "0.144.6",
       model: "gpt-5.6-sol",
       reasoningEffort: "xhigh",
-      nextStep: "codex-security scan . --dry-run",
+      nextStep: "open-security scan . --dry-run",
     });
   }, 30_000);
 
@@ -565,7 +604,7 @@ describe("CLI", () => {
       ),
     ).toBe(0);
     const text = stdout.text();
-    expect(text).toContain("CODEX SECURITY");
+    expect(text).toContain("OPEN SECURITY");
     expect(text).toContain("SCAN HISTORY");
     expect(text).toContain("juice-shop");
     for (const heading of ["DATE", "STATUS", "FINDINGS", "MODE", "SCAN"]) {
@@ -645,7 +684,7 @@ describe("CLI", () => {
         ),
       ).toBe(0);
       const text = stripVTControlCharacters(stdout.text());
-      expect(text).toContain("CODEX SECURITY");
+      expect(text).toContain("OPEN SECURITY");
       expect(text).toContain("SCAN DETAILS");
       expect(text).toContain("juice-shop");
       expect(text).toContain("scan-1");
@@ -763,7 +802,7 @@ describe("CLI", () => {
     ).toBe(0);
     expect(redirected.text()).toContain("internal-finding-id");
     expect(redirected.text()).toContain("status: unknown");
-    expect(redirected.text()).not.toContain("CODEX SECURITY");
+    expect(redirected.text()).not.toContain("OPEN SECURITY");
 
     const filtered = capture(true);
     expect(
@@ -776,7 +815,7 @@ describe("CLI", () => {
     ).toBe(0);
     expect(filtered.text()).toContain("persisting: 1");
     expect(filtered.text()).not.toContain("internal-finding-id");
-    expect(filtered.text()).not.toContain("CODEX SECURITY");
+    expect(filtered.text()).not.toContain("OPEN SECURITY");
   });
 
   test("prints SDK metadata without starting a scan", async () => {
@@ -820,7 +859,7 @@ describe("CLI", () => {
     expect(JSON.parse(stdout.text())).toEqual({
       model: "gpt-5.6-sol",
       reasoningEffort: "xhigh",
-      nextStep: "codex-security scan . --dry-run",
+      nextStep: "open-security scan . --dry-run",
     });
     expect(stderr.text()).toBe("");
   });
@@ -841,7 +880,7 @@ describe("CLI", () => {
     expect(stderr.text()).toContain("info metadata field");
   });
 
-  test("registers the scoped package as the MCP command", async () => {
+  test("registers the installed Open Security executable as the MCP command", async () => {
     const home = await mkdtemp(join(tmpdir(), "codex-security-mcp-home-"));
     try {
       const child = spawnSync(
@@ -861,15 +900,13 @@ describe("CLI", () => {
         },
       );
       expect(child.status).toBe(0);
-      expect(child.stdout).toContain(
-        "command: npx --yes @openai/codex-security --mcp",
-      );
+      expect(child.stdout).toContain("command: open-security --mcp");
       const config = JSON.parse(
         await readFile(join(home, ".config", "amp", "settings.json"), "utf8"),
       );
-      expect(config["amp.mcpServers"]["codex-security"]).toEqual({
-        command: "npx",
-        args: ["--yes", "@openai/codex-security", "--mcp"],
+      expect(config["amp.mcpServers"]["open-security"]).toEqual({
+        command: "open-security",
+        args: ["--mcp"],
       });
     } finally {
       await rm(home, { recursive: true, force: true });
@@ -995,7 +1032,7 @@ describe("CLI", () => {
     expect(
       await main(["export", "--help"], stdout.stream, stderr.stream, deps),
     ).toBe(0);
-    expect(stdout.text()).toContain("Usage: codex-security export <scanDir>");
+    expect(stdout.text()).toContain("Usage: open-security export <scanDir>");
     expect(stdout.text()).toContain("--export-format <csv|json|sarif>");
     expect(stdout.text()).toContain("--source-root <string>");
     expect(stdout.text()).not.toContain("--format {sarif}");
@@ -1087,7 +1124,7 @@ describe("CLI", () => {
       expect([failed.status, failed.stdout, failed.stderr]).toEqual([
         2,
         "",
-        "codex-security: working directory is unavailable\n",
+        "open-security: working directory is unavailable\n",
       ]);
     } finally {
       await rm(root, { recursive: true, force: true });
@@ -1112,13 +1149,11 @@ describe("CLI", () => {
         dependencies(),
       ),
     ).toBe(0);
-    expect(help.text()).toContain("Usage: codex-security scan [repository]");
+    expect(help.text()).toContain("Usage: open-security scan [repository]");
     expect(help.text()).toContain("--path <array>");
     expect(help.text()).toContain("--max-cost <number>");
     expect(help.text()).toContain("--model <string>");
-    expect(help.text()).toContain(
-      "codex-security scan . --model gpt-5.6-terra",
-    );
+    expect(help.text()).toContain("open-security scan . --model gpt-5.6-terra");
     expect(help.text()).toContain("--format <toon|json|yaml|md|jsonl>");
   });
 
@@ -1142,6 +1177,97 @@ describe("CLI", () => {
         ),
       ).toBe(0);
       expect(config?.codexOverrides).toEqual(expected);
+    }
+  });
+
+  test("selects OpenRouter with explicit model and reasoning settings", async () => {
+    let config: CodexSecurityConfig | undefined;
+    let scanOptions: unknown;
+    expect(
+      await main(
+        [
+          "scan",
+          ".",
+          "--provider",
+          "openrouter",
+          "--model",
+          "qwen/qwen3.7-flash",
+          "--reasoning-effort",
+          "high",
+          "--auth",
+          "api-key",
+        ],
+        capture().stream,
+        capture().stream,
+        dependencies({
+          environment: {
+            OPENROUTER_API_KEY: "synthetic-openrouter-key",
+            OPEN_SECURITY_MAX_COST_USD: "0.5",
+          },
+          onConfig: (value) => (config = value),
+          onTurn: (_repository, options) => (scanOptions = options),
+        }),
+      ),
+    ).toBe(0);
+    expect(config).toEqual({
+      provider: "openrouter",
+      codexOverrides: {
+        model: "qwen/qwen3.7-flash",
+        model_reasoning_effort: "high",
+      },
+    });
+    expect(scanOptions).toMatchObject({ maxCostUsd: 0.5 });
+
+    const stderr = capture();
+    expect(
+      await main(
+        [
+          "scan",
+          ".",
+          "--provider",
+          "openrouter",
+          "--model",
+          "qwen/qwen3.7-flash",
+          "--auth",
+          "chatgpt",
+        ],
+        capture().stream,
+        stderr.stream,
+        dependencies({
+          environment: { OPENROUTER_API_KEY: "synthetic-openrouter-key" },
+        }),
+      ),
+    ).toBe(2);
+    expect(stderr.text()).toContain("does not support ChatGPT authentication");
+  });
+
+  test("rejects OpenRouter account commands before invoking Codex", async () => {
+    for (const args of [["login"], ["login", "status"], ["logout"]]) {
+      let invoked = false;
+      const stdout = capture();
+      const stderr = capture();
+      expect(
+        await main(
+          args,
+          stdout.stream,
+          stderr.stream,
+          dependencies({
+            environment: {
+              OPEN_SECURITY_PROVIDER: "openrouter",
+              OPENROUTER_API_KEY: "synthetic-openrouter-key",
+            },
+            onCodex: () => {
+              invoked = true;
+              return 0;
+            },
+          }),
+        ),
+      ).toBe(2);
+      expect(invoked).toBe(false);
+      expect(stdout.text()).toBe("");
+      expect(stderr.text()).toContain(
+        "OpenRouter authentication is environment-only",
+      );
     }
   });
 
@@ -1382,7 +1508,7 @@ describe("CLI", () => {
         dependencies(),
       ),
     ).toBe(0);
-    expect(stdout.text()).toContain("Usage: codex-security scan [repository]");
+    expect(stdout.text()).toContain("Usage: open-security scan [repository]");
     expect(stderr.text()).toBe("");
   });
 
@@ -1420,6 +1546,7 @@ describe("CLI", () => {
     expect(stderr.text()).toContain("Running scan");
     expect(stderr.text()).toContain("Scan complete");
     expect(captured.config).toEqual({
+      provider: "openai",
       pluginPath: "plugin.zip",
       pythonPath: "/managed/python",
       codexOverrides: { features: { goals: true } },
@@ -1590,7 +1717,7 @@ describe("CLI", () => {
     ).toBe(0);
     expect(JSON.parse(stdout.text())).toEqual(fakeResult().toJSON());
     expect(stderr.text()).toContain(
-      `codex-security: warning: onWorkerStatus observer failed: status observer failed ${REDACTED_CREDENTIALS}`,
+      `open-security: warning: onWorkerStatus observer failed: status observer failed ${REDACTED_CREDENTIALS}`,
     );
     expect(stderr.text()).not.toContain("SYNTHETIC_OPENAI_VALUE_123");
   });
@@ -1722,7 +1849,7 @@ describe("CLI", () => {
     expect(stderr.text()).toContain("Estimated cost: $0.00625 USD.");
     expect(stderr.text()).toContain("Results: /tmp/scan");
     expect(stderr.text()).toContain(
-      "Next: codex-security export /tmp/scan --export-format sarif",
+      "Next: open-security export /tmp/scan --export-format sarif",
     );
   });
 
@@ -2108,7 +2235,7 @@ describe("CLI", () => {
       await main(["scan", "."], stdout.stream, stderr.stream, failing),
     ).toBe(2);
     expect(stdout.text()).toBe("");
-    expect(stderr.text()).toContain("codex-security: invalid scan request\n");
+    expect(stderr.text()).toContain("open-security: invalid scan request\n");
     expect(stderr.text()).not.toContain("Running scan");
     expect(stderr.text()).not.toContain("CodexSecurityError");
   });
@@ -2133,7 +2260,7 @@ describe("CLI", () => {
       ),
     ).toBe(2);
     expect(stdout.text()).toBe("");
-    expect(stderr.text()).toContain("codex-security: invalid scan request\n");
+    expect(stderr.text()).toContain("open-security: invalid scan request\n");
 
     const unavailableCwd = dependencies();
     unavailableCwd.currentDirectory = () => {
@@ -2322,7 +2449,7 @@ describe("CLI", () => {
       expect(stdout.text()).toBe("");
       expect(stderr.text()).toBe(
         "[00:00] Preparing scan\n" +
-          `codex-security: scan failed ${REDACTED_CREDENTIALS}\n`,
+          `open-security: scan failed ${REDACTED_CREDENTIALS}\n`,
       );
     }
   });
