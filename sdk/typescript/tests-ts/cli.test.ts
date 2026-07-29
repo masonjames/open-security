@@ -101,6 +101,7 @@ describe("CLI", () => {
           path: { type: "array" },
           mode: { enum: ["standard", "deep"] },
           model: { type: "string" },
+          effort: { enum: ["minimal", "low", "medium", "high", "xhigh"] },
           failOnSeverity: { enum: ["critical", "high", "medium", "low"] },
         },
       },
@@ -486,7 +487,7 @@ describe("CLI", () => {
             "--model",
             "qwen/qwen3.7-flash",
             "--reasoning-effort",
-            "high",
+            "future-preview",
             "--codex",
             "features.goals=true",
             "--json",
@@ -512,12 +513,44 @@ describe("CLI", () => {
         codexOverrides: {
           features: { goals: true },
           model: "qwen/qwen3.7-flash",
-          model_reasoning_effort: "high",
+          model_reasoning_effort: "future-preview",
         },
       });
       expect(scanOptions).toMatchObject({ mode: "deep" });
       expect(stderr.text()).toContain("sample started (attempt 1)");
       expect(stderr.text()).toContain("sample completed (attempt 1)");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("selects typed reasoning effort for a CSV-backed bulk scan", async () => {
+    const root = await mkdtemp(join(tmpdir(), "codex-security-cli-multiscan-"));
+    try {
+      await multiscanInventory(root);
+      let config: CodexSecurityConfig | undefined;
+      expect(
+        await main(
+          [
+            "bulk-scan",
+            "repositories.csv",
+            "--output-dir",
+            "typed-results",
+            "--effort",
+            "high",
+            "--json",
+          ],
+          capture().stream,
+          capture().stream,
+          dependencies({
+            currentDirectory: root,
+            onConfig: (value) => (config = value),
+          }),
+        ),
+      ).toBe(0);
+      expect(config?.codexOverrides).toEqual({
+        model_reasoning_effort: "high",
+      });
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -573,6 +606,9 @@ describe("CLI", () => {
       ["bulk-scan", "--provider=openrouter"],
       ["bulk-scan", "--reasoning-effort", "high"],
       ["bulk-scan", "--reasoning-effort=high"],
+      ["bulk-scan", "--effort", "high"],
+      ["bulk-scan", "--effort=high"],
+      ["bulk-scan", "--model", "gpt-5.6-terra", "--effort", "high"],
       [
         "bulk-scan",
         "--reasoning-effort",
@@ -1300,14 +1336,74 @@ describe("CLI", () => {
     expect(help.text()).toContain("--max-cost <number>");
     expect(help.text()).toContain("--model <string>");
     expect(help.text()).toContain("open-security scan . --model gpt-5.6-terra");
+    expect(help.text()).toContain("--provider <openai|openrouter>");
+    expect(help.text()).toContain("--reasoning-effort <string>");
+    expect(help.text()).toContain("--effort <minimal|low|medium|high|xhigh>");
+    expect(help.text()).toContain(
+      "Model reasoning effort (default: OPEN_SECURITY_REASONING_EFFORT or provider default).",
+    );
+    expect(help.text()).toContain('model_reasoning_effort="high"');
+    expect(help.text()).toContain(
+      "open-security scan . --model gpt-5.6-terra --effort high",
+    );
+    expect(help.text()).not.toContain("openai:gpt");
     expect(help.text()).toContain("--format <toon|json|yaml|md|jsonl>");
   });
 
-  test("selects scan models without TOML quoting", async () => {
+  test("documents existing model and reasoning options in bulk-scan help", async () => {
+    const help = capture();
+    const stderr = capture();
+
+    expect(
+      await main(
+        ["bulk-scan", "--help"],
+        help.stream,
+        stderr.stream,
+        dependencies(),
+      ),
+    ).toBe(0);
+    expect(help.text()).toContain("--model <string>");
+    expect(help.text()).toContain("Model to use for each repository.");
+    expect(help.text()).toContain("--provider <openai|openrouter>");
+    expect(help.text()).toContain("--reasoning-effort <string>");
+    expect(help.text()).toContain("--effort <minimal|low|medium|high|xhigh>");
+    expect(help.text()).toContain(
+      "Model reasoning effort (default: OPEN_SECURITY_REASONING_EFFORT or provider default).",
+    );
+    expect(help.text()).toContain("--codex <array>");
+    expect(help.text()).toContain('model_reasoning_effort="high"');
+    expect(help.text()).not.toContain("@openai/codex-security");
+    expect(stderr.text()).toBe("");
+  });
+
+  test("selects scan models and reasoning without TOML quoting", async () => {
     for (const [options, expected] of [
       [["--model", "gpt-5.6-terra"], { model: "gpt-5.6-terra" }],
       [["--model=gpt-5.6-sol"], { model: "gpt-5.6-sol" }],
+      [["--effort", "minimal"], { model_reasoning_effort: "minimal" }],
+      [["--effort=xhigh"], { model_reasoning_effort: "xhigh" }],
+      [
+        ["--reasoning-effort", "future-preview"],
+        { model_reasoning_effort: "future-preview" },
+      ],
+      [
+        ["--model", "gpt-5.6-terra", "--effort", "high"],
+        { model: "gpt-5.6-terra", model_reasoning_effort: "high" },
+      ],
       [["--codex", 'model="gpt-5.6-terra"'], { model: "gpt-5.6-terra" }],
+      [
+        ["--codex", 'model_reasoning_effort="high"'],
+        { model_reasoning_effort: "high" },
+      ],
+      [
+        [
+          "--model",
+          "gpt-5.6-terra",
+          "--codex",
+          'model_reasoning_effort="high"',
+        ],
+        { model: "gpt-5.6-terra", model_reasoning_effort: "high" },
+      ],
       [
         ["--model", "gpt-5.6-terra", "--codex", "features.goals=true"],
         { model: "gpt-5.6-terra", features: { goals: true } },
@@ -1509,6 +1605,30 @@ describe("CLI", () => {
     expect(() =>
       parseCodexOverrides(['model="gpt-5.6-sol"'], "gpt-5.6-terra"),
     ).toThrow("--model conflicts with --codex model");
+    expect(parseCodexOverrides([], "gpt-5.6-terra", "high")).toEqual({
+      model: "gpt-5.6-terra",
+      model_reasoning_effort: "high",
+    });
+    expect(() =>
+      parseCodexOverrides(
+        ['model_reasoning_effort="medium"'],
+        undefined,
+        undefined,
+        "high",
+      ),
+    ).toThrow("--effort conflicts with --codex model_reasoning_effort");
+    expect(() =>
+      parseCodexOverrides(
+        ['model_reasoning_effort="medium"'],
+        undefined,
+        "high",
+      ),
+    ).toThrow(
+      "--reasoning-effort conflicts with --codex model_reasoning_effort",
+    );
+    expect(() => parseCodexOverrides([], undefined, "high", "medium")).toThrow(
+      "--reasoning-effort and --effort cannot be used together",
+    );
   });
 
   test("redacts malformed and bounded --codex overrides", () => {
@@ -1555,13 +1675,35 @@ describe("CLI", () => {
       [["scan", ".", "--head", "HEAD"], "--head requires --diff"],
       [["scan", ".", "--base", "HEAD"], "--base requires --working-tree"],
       [["scan", ".", "--archive-existing"], "requires --output-dir"],
+      [
+        ["scan", ".", "--reasoning-effort", "high", "--effort", "medium"],
+        "--reasoning-effort and --effort cannot be used together",
+      ],
+      [
+        [
+          "bulk-scan",
+          "repositories.csv",
+          "--output-dir",
+          "results",
+          "--reasoning-effort",
+          "high",
+          "--effort",
+          "medium",
+        ],
+        "--reasoning-effort and --effort cannot be used together",
+      ],
       [["scan", ".", "--max-cost=0"], "expected number to be >0"],
       [["scan", ".", "--path="], "--path must not be empty"],
       [["scan", ".", "--model="], "--model must not be empty"],
+      [
+        ["scan", ".", "--effort", "ultra"],
+        "--effort must be minimal, low, medium, high, or xhigh",
+      ],
       [["scan", ".", "--mode", "bogus"], "Invalid option"],
       [["scan", ".", "--unknown"], "Unknown flag: --unknown"],
       [["scan", ".", "--path", "--dry-run"], "Missing value for flag"],
       [["scan", ".", "--model", "--dry-run"], "Missing value for flag"],
+      [["scan", ".", "--effort", "--dry-run"], "Missing value for flag"],
       [["scan", ".", "--output-dir", "--dry-run"], "Missing value for flag"],
       [["scan", ".", "--max-cost", "--dry-run"], "Missing value for flag"],
       [["scan", "repo-a", "repo-b", "--dry-run"], "Unexpected positional"],
@@ -1614,6 +1756,17 @@ describe("CLI", () => {
           'model="gpt-5.6-sol"',
         ],
         "--model conflicts with --codex model",
+      ],
+      [
+        [
+          "scan",
+          ".",
+          "--effort",
+          "high",
+          "--codex",
+          'model_reasoning_effort="medium"',
+        ],
+        "--effort conflicts with --codex model_reasoning_effort",
       ],
       [["export"], "scanDir"],
       [["export", "scan", "--unknown"], "Unknown flag: --unknown"],
@@ -1804,13 +1957,11 @@ describe("CLI", () => {
     expect(JSON.parse(stdout.text())).toEqual(fakeResult().toJSON());
   });
 
-  test("turns provider-specific scan failures into actionable safe messages", async () => {
+  test("turns authentication and rate-limit failures into actionable safe messages", async () => {
     for (const [message, expected] of [
       ["401 invalid API key for org-private", "provide a valid API key"],
       ["403 model access denied for org-private", "model access"],
       ["429 rate limit reached for org-private", "rate limit"],
-      ["network failure ECONNRESET for org-private", "network connection"],
-      ["request timed out for org-private", "connection timed out"],
     ] as const) {
       const stdout = capture();
       const stderr = capture();
@@ -1827,6 +1978,58 @@ describe("CLI", () => {
       expect(stderr.text()).toContain(expected);
       expect(stderr.text()).not.toContain("org-private");
     }
+  });
+
+  test("surfaces underlying scanner errors instead of inventing a model outage", async () => {
+    for (const message of [
+      "Could not save the Codex Security scan: UNIQUE constraint failed: scans.scan_dir",
+      "sandbox-exec: sandbox_apply: Operation not permitted during network setup.",
+      "network failure ECONNRESET while connecting to the model.",
+      "request timed out while reading the scanner response.",
+    ]) {
+      const stdout = capture();
+      const stderr = capture();
+      const deps = dependencies();
+      deps.createSecurity = () => ({
+        run: async () => {
+          throw new CodexSecurityError(message);
+        },
+        preflight: async () => fakePreflight(),
+        close: async () => {},
+      });
+
+      expect(
+        await main(["scan", ".", "--json"], stdout.stream, stderr.stream, deps),
+      ).toBe(2);
+      expect(stdout.text()).toBe("");
+      expect(stderr.text()).toContain(`open-security: ${message}\n`);
+      expect(stderr.text()).not.toContain("model service could not be reached");
+    }
+  });
+
+  test("redacts credentials in underlying network errors", async () => {
+    const stdout = capture();
+    const stderr = capture();
+    const deps = dependencies();
+    deps.createSecurity = () => ({
+      run: async () => {
+        throw new CodexSecurityError(
+          `network failure ECONNRESET ${SYNTHETIC_CREDENTIALS}`,
+        );
+      },
+      preflight: async () => fakePreflight(),
+      close: async () => {},
+    });
+
+    expect(
+      await main(["scan", ".", "--json"], stdout.stream, stderr.stream, deps),
+    ).toBe(2);
+    expect(stdout.text()).toBe("");
+    expect(stderr.text()).toContain(
+      `network failure ECONNRESET ${REDACTED_CREDENTIALS}`,
+    );
+    expect(stderr.text()).not.toContain("SYNTHETIC_KEY_123");
+    expect(stderr.text()).not.toContain("model service could not be reached");
   });
 
   test("reports database connection failures without claiming the model network failed", async () => {
@@ -1864,6 +2067,30 @@ describe("CLI", () => {
     ).toBe(0);
     expect(stdout.text()).toContain("scanDir: /tmp/scan");
     expect(stdout.text()).toContain("completeness: complete");
+  });
+
+  test("prints scan completion warnings without failing the scan", async () => {
+    const stdout = capture();
+    const stderr = capture();
+    const deps = dependencies();
+    deps.createSecurity = () => ({
+      run: async (_repository, options) => {
+        options?.onWarning?.(
+          "Repository HEAD changed while the scan was running; results were saved for the original revision.",
+        );
+        return fakeResult();
+      },
+      close: async () => {},
+      preflight: async () => fakePreflight(),
+    });
+
+    expect(
+      await main(["scan", ".", "--json"], stdout.stream, stderr.stream, deps),
+    ).toBe(0);
+    expect(JSON.parse(stdout.text())).toEqual(fakeResult().toJSON());
+    expect(stderr.text()).toContain(
+      "open-security: warning: Repository HEAD changed while the scan was running; results were saved for the original revision.",
+    );
   });
 
   test("reports isolated observer failures without failing the scan", async () => {

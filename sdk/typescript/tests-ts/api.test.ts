@@ -1552,8 +1552,11 @@ describe("CodexSecurity orchestration", () => {
     let threadOptions: Record<string, unknown> | null = null;
     let prompt = "";
     let scanStarted = false;
+    const warnings: string[] = [];
     const reconnects: Array<[number, number]> = [];
     const commands: Array<readonly string[]> = [];
+    const completionWarning =
+      "Repository HEAD changed while the scan was running; results were saved for the original revision.";
 
     const client = new TestClient(
       { codexOverrides: { model: "replay-model" } },
@@ -1597,6 +1600,9 @@ describe("CodexSecurity orchestration", () => {
               falsePositives: [],
             };
           }
+          if (args[0] === "complete-scan") {
+            return { scan: { warnings: [completionWarning] } };
+          }
           return {};
         },
         createCodex: (options: CodexOptions) => {
@@ -1628,12 +1634,16 @@ describe("CodexSecurity orchestration", () => {
       onScanStarted: () => {
         scanStarted = true;
       },
+      onWarning: (warning) => {
+        warnings.push(warning);
+      },
       onReconnect: (attempt, maxAttempts) => {
         reconnects.push([attempt, maxAttempts]);
       },
     });
     expect(result.threadId).toBe("thread-1");
     expect(scanStarted).toBe(true);
+    expect(warnings).toEqual([completionWarning]);
     expect(reconnects).toEqual([[2, 5]]);
     const startedAt = (codexOptions as CodexOptions | null)?.env?.[
       "CODEX_SECURITY_STARTED_AT"

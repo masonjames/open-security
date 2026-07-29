@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { brotliDecompressSync, gunzipSync } from "node:zlib";
+import { assertExpectedGitHead } from "./package-provenance.mjs";
 
 const args = process.argv.slice(2);
 if (args[0] === "--") args.shift();
@@ -223,6 +224,10 @@ if (
 ) {
   throw new Error("npm package does not contain the expected public metadata.");
 }
+assertExpectedGitHead(
+  packageJson,
+  process.env.CODEX_SECURITY_EXPECTED_GIT_HEAD,
+);
 const versionModule = tar([
   "-xOf",
   archive,

@@ -76,11 +76,17 @@ jobs:
 
       - name: Pack
         working-directory: sdk/typescript
-        run: pnpm pack --pack-destination ../../dist
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm pkg set "gitHead=$GITHUB_SHA"
+          pnpm pack --pack-destination ../../dist
 
       - name: Inspect and smoke test package
         working-directory: sdk/typescript
         shell: bash
+        env:
+          CODEX_SECURITY_EXPECTED_GIT_HEAD: ${{ github.sha }}
         run: pnpm run check:package ../../dist/*.tgz
 
       - name: Upload verified package

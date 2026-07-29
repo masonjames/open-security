@@ -121,8 +121,10 @@ open-security scan .
 ```
 
 The same configuration can be supplied with `--provider`, `--model`,
-`--reasoning-effort`, and `--max-cost`. OpenRouter supports `auto` and
-`api-key` authentication modes; `--auth chatgpt` is rejected. The key is not
+`--reasoning-effort`, and `--max-cost`. The typed concise alias
+`--effort minimal|low|medium|high|xhigh` selects the same reasoning setting;
+`--reasoning-effort` and `--effort` cannot be used together. OpenRouter supports
+`auto` and `api-key` authentication modes; `--auth chatgpt` is rejected. The key is not
 persisted by login, written to scan recipes, or forwarded to OpenAI scans.
 OpenAI keys are removed from OpenRouter model processes, and model-provider
 credentials are removed from Python and workbench helper processes.

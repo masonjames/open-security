@@ -67,7 +67,7 @@ open-security scan . \
   --max-cost 1
 ```
 
-Use an exact ID returned by OpenRouter's unauthenticated model catalog. Open Security also checks the exact model's advertised provider endpoints, refuses a model with no routable endpoint, and verifies tool use, structured-response, and requested reasoning support before starting the model runtime. OpenRouter defaults to `high` reasoning unless you configure another effort.
+Use an exact ID returned by OpenRouter's unauthenticated model catalog. Open Security also checks the exact model's advertised provider endpoints, refuses a model with no routable endpoint, and verifies tool use, structured-response, and requested reasoning support before starting the model runtime. OpenRouter defaults to `high` reasoning unless you configure another effort. `--effort minimal|low|medium|high|xhigh` is the typed concise alias for the compatible `--reasoning-effort VALUE` option; do not pass both in one command.
 
 ## OpenAI quick start
 

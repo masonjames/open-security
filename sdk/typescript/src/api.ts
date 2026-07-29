@@ -167,6 +167,7 @@ export interface ScanOptions {
     details?: ScanReconnectDetails,
   ) => void;
   onWorkerStatus?: (status: ScanWorkerStatus) => void;
+  onWarning?: (warning: string) => void;
   onObserverError?: (observer: ScanObserverName, error: unknown) => void;
   signal?: AbortSignal;
 }
@@ -196,7 +197,8 @@ type ScanObserverName =
   | "onOutputDirReady"
   | "onScanStarted"
   | "onReconnect"
-  | "onWorkerStatus";
+  | "onWorkerStatus"
+  | "onWarning";
 
 export interface ScanPreflightModelCatalog {
   source: typeof OPENROUTER_MODELS_URL;
@@ -887,7 +889,7 @@ export class CodexSecurity {
           throwIfAborted(signal, scanDir);
           if (options.maxCostUsd !== undefined && snapshot.cost === null) {
             throw new CodexSecurityError(
-              "Cannot evaluate the cost limit: model pricing or token usage is unavailable.",
+              "Cannot evaluate the cost limit because model pricing or token usage is unavailable.",
             );
           }
           if (
@@ -899,13 +901,29 @@ export class CodexSecurity {
             );
           }
           const cost = snapshot.cost;
-          await workbench(workbenchOptions, [
+          const completion = await workbench(workbenchOptions, [
             "complete-scan",
             "--scan-id",
             scanId,
             ...(cost === null ? [] : ["--cost-json", JSON.stringify(cost)]),
           ]);
           activeScan = null;
+          const completedScan = completion["scan"];
+          if (
+            isRecord(completedScan) &&
+            Array.isArray(completedScan["warnings"])
+          ) {
+            for (const warning of completedScan["warnings"]) {
+              if (typeof warning === "string") {
+                notifyObserver(
+                  "onWarning",
+                  options.onWarning,
+                  options.onObserverError,
+                  warning,
+                );
+              }
+            }
+          }
           return snapshot.usage;
         },
         onScanStarted: options.onScanStarted,
