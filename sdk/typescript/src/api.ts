@@ -297,6 +297,7 @@ export class CodexSecurity {
       ...(options.signal === undefined ? [] : [options.signal]),
     ]);
     let scanDir = "";
+    let archivedScanDir: string | null = null;
     let targetPathsFile: string | null = null;
     let knowledgeBase: PreparedKnowledgeBase | null = null;
     let costTracker: ScanCostTracker | null = null;
@@ -445,13 +446,15 @@ export class CodexSecurity {
         scanOutputRoot,
         (path) => requireOutputOutsideRepository(protectedRoot, path),
         options.archiveExisting,
-        (archiveDir) =>
+        (archiveDir) => {
+          archivedScanDir = archiveDir;
           notifyObserver(
             "onOutputArchived",
             options.onOutputArchived,
             options.onObserverError,
             archiveDir,
-          ),
+          );
+        },
       );
       requireOutputOutsideRepository(protectedRoot, scanDir);
       requireModelSafeOutputDir(scanDir);
@@ -552,6 +555,10 @@ export class CodexSecurity {
         scanDir,
         "--recipe-json",
         JSON.stringify(recipe),
+        ...(options.archiveExisting === true ? ["--archive-existing"] : []),
+        ...(archivedScanDir === null
+          ? []
+          : ["--archived-scan-dir", archivedScanDir]),
         ...(options.parentScanId === undefined
           ? []
           : ["--parent-scan-id", options.parentScanId]),

@@ -8,6 +8,7 @@ import os
 import sqlite3
 import sys
 import tempfile
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -68,6 +69,47 @@ def scan_diff_identity(
         diff_target["baseRevision"],
         diff_target["headRevision"],
         diff_target.get("contentDigest"),
+    )
+
+
+def archive_scan(
+    connection: sqlite3.Connection,
+    args: argparse.Namespace,
+    scan_dir: Path,
+    timestamp: str,
+    canonical_directory: Callable[[Path], Path],
+) -> None:
+    archived_scan_dir = (
+        canonical_directory(Path(args.archived_scan_dir).expanduser())
+        if args.archived_scan_dir is not None
+        else None
+    )
+    if archived_scan_dir is not None and (
+        not args.archive_existing
+        or archived_scan_dir.parent != scan_dir.parent
+        or not archived_scan_dir.name.startswith(f"{scan_dir.name}.previous-")
+    ):
+        raise SystemExit("The archived scan must be a previous sibling of the scan directory.")
+
+    previous_scan = connection.execute(
+        "SELECT id, status FROM scans WHERE scan_dir = ?", (str(scan_dir),)
+    ).fetchone()
+    if previous_scan is None:
+        return
+    if not args.archive_existing:
+        raise SystemExit(
+            "The scan artifact directory belongs to an existing scan. "
+            "Use --archive-existing to preserve that scan and start a new one."
+        )
+    if previous_scan["status"] == "running":
+        raise SystemExit("Cannot archive the output of a running scan.")
+    if archived_scan_dir is None:
+        archived_scan_dir = Path(
+            tempfile.mkdtemp(prefix=f"{scan_dir.name}.previous-", dir=scan_dir.parent)
+        ).resolve()
+    connection.execute(
+        "UPDATE scans SET scan_dir = ?, updated_at = ? WHERE id = ?",
+        (str(archived_scan_dir), timestamp, previous_scan["id"]),
     )
 
 
