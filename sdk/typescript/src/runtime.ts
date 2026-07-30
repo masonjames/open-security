@@ -113,13 +113,82 @@ export function codexSecurityStateDirectory(
   return resolve(expandHome(codexHome), "state", "plugins", "codex-security");
 }
 
+export function requirePrivateScanPlatformSupport(
+  platform: NodeJS.Platform = process.platform,
+): void {
+  if (platform === "win32") {
+    throw new OutputDirectoryError(
+      "Private scan output is not supported on Windows until DACL validation is available.",
+    );
+  }
+}
+
+export async function preparePrivateDirectoryPath(
+  path: string,
+): Promise<string> {
+  const requested = resolve(path);
+  requirePrivateScanPlatformSupport();
+
+  let existingAncestor = requested;
+  const missingSegments: string[] = [];
+  while (true) {
+    const metadata = await lstat(existingAncestor).catch((error: unknown) => {
+      if (nodeErrorCode(error) === "ENOENT") return null;
+      throw error;
+    });
+    if (metadata !== null) break;
+    const parent = dirname(existingAncestor);
+    if (parent === existingAncestor) {
+      throw new OutputDirectoryError(
+        `Private state parent must be an existing ordinary directory: ${requested}`,
+      );
+    }
+    missingSegments.push(basename(existingAncestor));
+    existingAncestor = parent;
+  }
+  await validateArchiveSafeParentDirectories(existingAncestor, true);
+
+  let current = existingAncestor;
+  const createdDirectories: string[] = [];
+  try {
+    for (const segment of missingSegments.reverse()) {
+      current = join(current, segment);
+      try {
+        await mkdir(current, { mode: 0o700 });
+        createdDirectories.push(current);
+        await chmod(current, 0o700);
+      } catch (error) {
+        if (nodeErrorCode(error) !== "EEXIST") throw error;
+      }
+    }
+    const metadata = await lstat(requested);
+    if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
+      throw new OutputDirectoryError(
+        `Private state path must be an ordinary directory: ${requested}`,
+      );
+    }
+    await chmod(requested, 0o700);
+    const privateMetadata = await lstat(requested);
+    requirePrivateOutputDirectory(privateMetadata, requested);
+    const canonical = await realpath(requested);
+    await requirePrivateDirectoryAcl(canonical);
+    await validateArchiveSafeParentDirectories(dirname(canonical), true);
+    return canonical;
+  } catch (error) {
+    for (const created of createdDirectories.reverse()) {
+      await rmdir(created).catch(() => undefined);
+    }
+    throw error;
+  }
+}
+
 export async function preparePersistentScanRoot(
   stateDirectory: string,
   repositoryName: string,
 ): Promise<string> {
-  const root = join(stateDirectory, "scans", safePrefix(repositoryName));
-  await mkdir(root, { recursive: true, mode: 0o700 });
-  return await realpath(root);
+  return await preparePrivateDirectoryPath(
+    join(stateDirectory, "scans", safePrefix(repositoryName)),
+  );
 }
 
 export async function runWorkbench(
@@ -233,6 +302,9 @@ export async function validateOutputDir(
       requirePrivateOutputDirectory(metadata, path);
       const canonical = await realpath(path);
       requireModelSafeOutputDir(canonical);
+      if (archiveExisting) {
+        await validateArchiveSafeParentDirectories(dirname(canonical));
+      }
       return canonical;
     }
 
@@ -245,6 +317,9 @@ export async function validateOutputDir(
             relative(parent, path),
           );
           requireModelSafeOutputDir(canonical);
+          if (archiveExisting) {
+            await validateArchiveSafeParentDirectories(dirname(canonical));
+          }
           return canonical;
         }
         break;
@@ -297,7 +372,6 @@ export async function prepareOutputDir(
   temporaryRoot: string = tmpdir(),
   validateLocation?: (path: string) => void,
   archiveExisting = false,
-  onOutputArchived?: (archiveDir: string) => void,
 ): Promise<string> {
   if (outputDirectory === undefined) {
     requireModelSafeOutputDir(temporaryRoot);
@@ -319,23 +393,19 @@ export async function prepareOutputDir(
   }
   let createdRoot: string | undefined;
   try {
-    let existing = await lstat(path).catch((error: unknown) => {
+    const existing = await lstat(path).catch((error: unknown) => {
       if (nodeErrorCode(error) === "ENOENT") return null;
       throw error;
     });
-    if (existing !== null && archiveExisting) {
-      const archiveDir = await planOutputArchive(path);
-      if (archiveDir !== null) {
-        await rename(path, archiveDir);
-        onOutputArchived?.(archiveDir);
-        existing = null;
-      }
-    }
     if (existing === null) {
       createdRoot = await mkdir(path, { recursive: true, mode: 0o700 });
       if ((process.umask() & 0o700) !== 0) await chmod(path, 0o700);
     }
-    return await validatePreparedOutputDir(path, validateLocation);
+    return await validatePreparedOutputDir(
+      path,
+      validateLocation,
+      archiveExisting,
+    );
   } catch (error) {
     if (createdRoot !== undefined) {
       await removeEmptyDirectories(path, createdRoot);
@@ -353,6 +423,7 @@ export async function prepareOutputDir(
 export async function validatePreparedOutputDir(
   path: string,
   validateLocation?: (path: string) => void,
+  allowNonEmpty = false,
 ): Promise<string> {
   const metadata = await lstat(path);
   if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
@@ -362,13 +433,184 @@ export async function validatePreparedOutputDir(
   requireModelSafeOutputDir(canonical);
   validateLocation?.(canonical);
   const entries = await readdir(canonical);
-  if (entries.length !== 0) {
+  if (!allowNonEmpty && entries.length !== 0) {
     throw new OutputDirectoryError(
       `Scan output directory must be empty: ${path}`,
     );
   }
   requirePrivateOutputDirectory(metadata, path);
+  await requirePrivateDirectoryAcl(canonical);
+  await validateArchiveSafeParentDirectories(
+    dirname(canonical),
+    !allowNonEmpty,
+  );
   return canonical;
+}
+
+export async function validateArchiveSafeParentDirectories(
+  parent: string,
+  allowImmediateTrustedSticky = false,
+): Promise<void> {
+  if (process.platform === "win32") {
+    throw new OutputDirectoryError(
+      "Private scan output is not supported on Windows until DACL validation is available.",
+    );
+  }
+  let current = parent;
+  while (true) {
+    const metadata = await lstat(current).catch((error: unknown) => {
+      if (nodeErrorCode(error) === "ENOENT") return null;
+      throw error;
+    });
+    if (metadata !== null) {
+      if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
+        throw new OutputDirectoryError(
+          `Scan output parent is not an ordinary directory: ${current}`,
+        );
+      }
+      requireArchiveSafeParentDirectory(
+        metadata,
+        current,
+        process.geteuid?.(),
+        current !== parent || allowImmediateTrustedSticky,
+      );
+      await requirePrivateDirectoryAcl(current);
+    }
+    const next = dirname(current);
+    if (next === current) return;
+    current = next;
+  }
+}
+
+export function requirePrivateAclListing(listing: string, path: string): void {
+  for (const line of listing.split(/\r?\n/u).slice(1)) {
+    const entry = line.trim();
+    if (!entry) continue;
+    const match = /^\d+:\s+.+?\s+(allow|deny)\s+(.+)$/u.exec(entry);
+    if (match === null) {
+      throw new OutputDirectoryError(
+        `Private scan directory has an unrecognized ACL: ${path}`,
+      );
+    }
+    if (match[1] === "allow") {
+      throw new OutputDirectoryError(
+        `Private scan directories require paths without extended ACL allow grants: ${path}`,
+      );
+    }
+  }
+}
+
+export function requirePrivateLinuxXattrListing(
+  listing: string,
+  path: string,
+): void {
+  for (const line of listing.split(/\r?\n/u)) {
+    const entry = line.trim();
+    if (!entry || entry.startsWith("#")) continue;
+    const separator = entry.indexOf("=");
+    if (separator <= 0) {
+      throw new OutputDirectoryError(
+        `Private scan directory has an unrecognized extended attribute: ${path}`,
+      );
+    }
+    const attribute = entry.slice(0, separator);
+    const lower = attribute.toLowerCase();
+    if (
+      attribute === "system.posix_acl_access" ||
+      attribute === "system.posix_acl_default" ||
+      (lower.includes("acl") &&
+        (attribute.startsWith("system.") || attribute.startsWith("trusted.")))
+    ) {
+      throw new OutputDirectoryError(
+        `Private scan directories require paths without extended ACLs: ${path}`,
+      );
+    }
+  }
+}
+
+export async function requirePrivateDirectoryAcl(path: string): Promise<void> {
+  if (process.platform === "linux" || process.platform === "android") {
+    const getfattr = ["/usr/bin/getfattr", "/bin/getfattr"].find((candidate) =>
+      existsSync(candidate),
+    );
+    if (getfattr === undefined) {
+      throw new OutputDirectoryError(
+        `Private scan directory ACLs could not be verified because getfattr is unavailable: ${path}`,
+      );
+    }
+    try {
+      const result = await execFile(
+        getfattr,
+        ["--absolute-names", "--dump", "--no-dereference", "--match=-", path],
+        {
+          encoding: "utf8",
+          env: { LANG: "C", LC_ALL: "C" },
+          maxBuffer: 64 * 1024,
+          timeout: 5_000,
+          windowsHide: true,
+        },
+      );
+      if (result.stderr.trim()) throw new Error(result.stderr.trim());
+      requirePrivateLinuxXattrListing(result.stdout, path);
+      return;
+    } catch (error) {
+      if (error instanceof OutputDirectoryError) throw error;
+      throw new OutputDirectoryError(
+        `Private scan directory ACLs could not be verified: ${path}`,
+        { cause: error },
+      );
+    }
+  }
+  if (process.platform !== "darwin") {
+    if (process.platform === "win32") return;
+    throw new OutputDirectoryError(
+      `Private scan output is not supported on this POSIX platform until ACL validation is available: ${path}`,
+    );
+  }
+  let stdout: string;
+  try {
+    const result = await execFile("/bin/ls", ["-lde", path], {
+      encoding: "utf8",
+      env: { LANG: "C", LC_ALL: "C" },
+      maxBuffer: 64 * 1024,
+      timeout: 5_000,
+      windowsHide: true,
+    });
+    if (result.stderr.trim()) throw new Error(result.stderr.trim());
+    stdout = result.stdout;
+  } catch (error) {
+    throw new OutputDirectoryError(
+      `Private scan directory ACLs could not be verified: ${path}`,
+      { cause: error },
+    );
+  }
+  requirePrivateAclListing(stdout, path);
+}
+
+export function requireArchiveSafeParentDirectory(
+  metadata: Pick<Stats, "mode" | "uid">,
+  path: string,
+  effectiveUid = process.geteuid?.(),
+  allowTrustedStickyAncestor = false,
+): void {
+  if (process.platform === "win32") return;
+  const trustedOwner =
+    metadata.uid === 0 ||
+    (effectiveUid !== undefined && metadata.uid === effectiveUid);
+  if (!trustedOwner) {
+    throw new OutputDirectoryError(
+      `Private scan output requires parent directories owned by the current user or root: ${path}`,
+    );
+  }
+  const writableByOtherUsers = (metadata.mode & 0o022) !== 0;
+  const sticky = (metadata.mode & 0o1000) !== 0;
+  const trustedStickyAncestor =
+    allowTrustedStickyAncestor && sticky && trustedOwner;
+  if (writableByOtherUsers && !trustedStickyAncestor) {
+    throw new OutputDirectoryError(
+      `Private scan output requires a parent directory that other users cannot rewrite: ${path}`,
+    );
+  }
 }
 
 export function requirePrivateOutputDirectory(
@@ -376,13 +618,17 @@ export function requirePrivateOutputDirectory(
   path: string,
   effectiveUid = process.geteuid?.(),
 ): void {
-  if (process.platform === "win32") return;
-  if ((metadata.mode & 0o077) !== 0) {
+  if (process.platform === "win32") {
     throw new OutputDirectoryError(
-      `Scan output directory must not be accessible to other users (chmod 700): ${path}`,
+      `Private scan output is not supported on Windows until DACL validation is available: ${path}`,
     );
   }
-  if (effectiveUid !== undefined && metadata.uid !== effectiveUid) {
+  if ((metadata.mode & 0o777) !== 0o700) {
+    throw new OutputDirectoryError(
+      `Scan output directory must use owner-only read, write, and execute permissions (chmod 700): ${path}`,
+    );
+  }
+  if (effectiveUid === undefined || metadata.uid !== effectiveUid) {
     throw new OutputDirectoryError(
       `Scan output directory must be owned by the current user: ${path}`,
     );

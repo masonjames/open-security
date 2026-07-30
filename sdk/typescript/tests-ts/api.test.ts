@@ -1,4 +1,5 @@
 import {
+  chmod,
   copyFile,
   cp,
   mkdir,
@@ -6,6 +7,7 @@ import {
   readFile,
   readdir,
   realpath,
+  rename,
   rm,
   stat,
   symlink,
@@ -51,6 +53,7 @@ type ScanObserverName = Parameters<
 const REPOSITORY_ROOT = fileURLToPath(new URL("../../..", import.meta.url));
 const EXAMPLE = join(PLUGIN_ROOT, "examples", "completed-scan");
 const temporaryDirectories: string[] = [];
+const testArchive = process.platform === "win32" ? test.skip : test;
 const TestClientBase = CodexSecurity as unknown as new (
   config: Record<string, unknown>,
   dependencies: Record<string, unknown>,
@@ -1167,109 +1170,347 @@ describe("CodexSecurity orchestration", () => {
     await client.close();
   });
 
-  test("previews an existing output archive without changing files", async () => {
-    const root = await temporaryDirectory();
-    const repository = join(root, "repository");
-    const output = join(root, "scan");
-    await mkdir(repository);
-    await mkdir(output, { mode: 0o700 });
-    await writeFile(join(output, "previous.txt"), "previous scan\n");
-    let runtimeStarted = false;
-    const client = new TestClient(
-      {},
-      {
-        environment: {},
-        prepareRuntime: async () => {
-          runtimeStarted = true;
-          throw new Error("runtime should not initialize");
+  testArchive(
+    "previews an existing output archive without changing files",
+    async () => {
+      const root = await temporaryDirectory();
+      const repository = join(root, "repository");
+      const output = join(root, "scan");
+      const stateContainer = join(root, "state-container");
+      const stateContainerCaseAlias = join(root, "STATE-CONTAINER");
+      const stateDirectory = join(stateContainer, "state");
+      const archiveJournal = join(stateDirectory, "archive-journal");
+      const reservedOutput = join(archiveJournal, "scan");
+      const poisonOutput = join(archiveJournal, "poison");
+      const stateLink = join(root, "state-link");
+      await mkdir(repository);
+      await mkdir(output, { mode: 0o700 });
+      await mkdir(stateDirectory, { recursive: true, mode: 0o700 });
+      await mkdir(reservedOutput, { recursive: true, mode: 0o700 });
+      await symlink(stateDirectory, stateLink);
+      const archiveStateRoot = await stat(stateContainerCaseAlias).then(
+        () => stateContainerCaseAlias,
+        () => stateContainer,
+      );
+      await writeFile(join(output, "previous.txt"), "previous scan\n");
+      await writeFile(
+        join(stateDirectory, "state-sentinel.txt"),
+        "keep state\n",
+      );
+      let runtimeStarted = false;
+      const client = new TestClient(
+        {},
+        {
+          environment: { OPEN_SECURITY_STATE_DIR: stateLink },
+          prepareRuntime: async () => {
+            runtimeStarted = true;
+            throw new Error("runtime should not initialize");
+          },
         },
-      },
-    );
+      );
 
-    const preflight = await client.preflight(repository, {
-      outputDir: output,
-      archiveExisting: true,
-    });
-    expect(preflight.outputDir).toBe(output);
-    expect(preflight.archiveDir?.startsWith(`${output}.previous-`)).toBe(true);
-    expect(await readFile(join(output, "previous.txt"), "utf8")).toBe(
-      "previous scan\n",
-    );
-    await expect(stat(preflight.archiveDir!)).rejects.toThrow();
-
-    const repositoryOutput = join(repository, "scan");
-    await mkdir(repositoryOutput, { mode: 0o700 });
-    await writeFile(join(repositoryOutput, "previous.txt"), "keep me\n");
-    await expect(
-      client.preflight(repository, {
-        outputDir: repositoryOutput,
-        archiveExisting: true,
-      }),
-    ).rejects.toBeInstanceOf(OutputDirectoryError);
-    expect(await readFile(join(repositoryOutput, "previous.txt"), "utf8")).toBe(
-      "keep me\n",
-    );
-    expect(runtimeStarted).toBe(false);
-    await client.close();
-  });
-
-  test("archives existing output before starting a fresh scan", async () => {
-    const root = await temporaryDirectory();
-    const repository = join(root, "repository");
-    const codexHome = join(root, "codex-home");
-    const output = join(root, "scan");
-    await mkdir(repository);
-    await mkdir(codexHome);
-    await mkdir(output, { mode: 0o700 });
-    await writeFile(join(output, "previous.txt"), "previous scan\n");
-    let archived: string | undefined;
-    const observerErrors: Array<[ScanObserverName, string]> = [];
-    const client = new TestClient(
-      {},
-      {
-        environment: {},
-        prepareRuntime: async () => preparedRuntime(codexHome),
-        resolvePluginPython: async () => "/managed/python",
-        repositoryRevision: async () => null,
-        createCodex: () => ({
-          startThread: () => ({
-            id: null,
-            async runStreamed() {
-              throw new Error("scan did not start");
-            },
-          }),
-        }),
-      },
-    );
-
-    await expect(
-      client.run(repository, {
+      const preflight = await client.preflight(repository, {
         outputDir: output,
         archiveExisting: true,
-        onOutputArchived: (archiveDir) => {
-          archived = archiveDir;
-          throw new Error("archive observer exploded");
+      });
+      expect(preflight.outputDir).toBe(output);
+      expect(preflight.archiveDir?.startsWith(`${output}.previous-`)).toBe(
+        true,
+      );
+      expect(await readFile(join(output, "previous.txt"), "utf8")).toBe(
+        "previous scan\n",
+      );
+      await expect(stat(preflight.archiveDir!)).rejects.toThrow();
+      await expect(
+        client.preflight(repository, {
+          outputDir: stateDirectory,
+          archiveExisting: true,
+        }),
+      ).rejects.toThrow(
+        "cannot contain the Open Security workbench state directory",
+      );
+      await expect(
+        client.preflight(repository, {
+          outputDir: archiveStateRoot,
+          archiveExisting: true,
+        }),
+      ).rejects.toThrow(
+        "cannot contain the Open Security workbench state directory",
+      );
+      await expect(
+        client.preflight(repository, {
+          outputDir: reservedOutput,
+          archiveExisting: true,
+        }),
+      ).rejects.toThrow(
+        "cannot use the Open Security archive-journal directory or its descendants",
+      );
+      await expect(
+        client.run(repository, { outputDir: poisonOutput }),
+      ).rejects.toThrow(
+        "cannot use the Open Security archive-journal directory or its descendants",
+      );
+      await expect(stat(poisonOutput)).rejects.toThrow();
+      expect(runtimeStarted).toBe(false);
+      expect(
+        await readFile(join(stateDirectory, "state-sentinel.txt"), "utf8"),
+      ).toBe("keep state\n");
+
+      const repositoryOutput = join(repository, "scan");
+      await mkdir(repositoryOutput, { mode: 0o700 });
+      await writeFile(join(repositoryOutput, "previous.txt"), "keep me\n");
+      await expect(
+        client.preflight(repository, {
+          outputDir: repositoryOutput,
+          archiveExisting: true,
+        }),
+      ).rejects.toBeInstanceOf(OutputDirectoryError);
+      expect(
+        await readFile(join(repositoryOutput, "previous.txt"), "utf8"),
+      ).toBe("keep me\n");
+      if (process.platform !== "win32") {
+        const sharedParent = join(root, "shared-parent");
+        const sharedOutput = join(sharedParent, "scan");
+        await mkdir(sharedParent, { mode: 0o700 });
+        await mkdir(sharedOutput, { mode: 0o700 });
+        await writeFile(join(sharedOutput, "previous.txt"), "keep me\n");
+        await chmod(sharedParent, 0o777);
+        await expect(
+          client.preflight(repository, {
+            outputDir: sharedOutput,
+            archiveExisting: true,
+          }),
+        ).rejects.toThrow("parent directory that other users cannot rewrite");
+        await expect(
+          client.preflight(repository, {
+            outputDir: join(sharedParent, "absent-scan"),
+            archiveExisting: true,
+          }),
+        ).rejects.toThrow("parent directory that other users cannot rewrite");
+        await chmod(sharedParent, 0o700);
+      }
+      expect(runtimeStarted).toBe(false);
+      await client.close();
+    },
+  );
+
+  testArchive(
+    "rejects an absent case-aliased archive journal before creating output",
+    async () => {
+      const root = await temporaryDirectory();
+      const repository = join(root, "repository");
+      const stateDirectory = join(root, "fresh-state");
+      await mkdir(repository, { mode: 0o700 });
+      await mkdir(stateDirectory, { mode: 0o700 });
+      const caseProbe = join(stateDirectory, "case-probe");
+      await mkdir(caseProbe, { mode: 0o700 });
+      const caseInsensitive = await stat(
+        join(stateDirectory, "CASE-PROBE"),
+      ).then(
+        () => true,
+        () => false,
+      );
+      await rm(caseProbe, { recursive: true, force: true });
+      if (!caseInsensitive) return;
+
+      const poisonOutput = join(stateDirectory, "ARCHIVE-JOURNAL", "poison");
+      let runtimeStarted = false;
+      const client = new TestClient(
+        {},
+        {
+          environment: { OPEN_SECURITY_STATE_DIR: stateDirectory },
+          prepareRuntime: async () => {
+            runtimeStarted = true;
+            throw new Error("runtime should not initialize");
+          },
         },
-        onObserverError: (observer, error) => {
-          observerErrors.push([observer, (error as Error).message]);
+      );
+
+      await expect(
+        client.run(repository, { outputDir: poisonOutput }),
+      ).rejects.toThrow(
+        "cannot use the Open Security archive-journal directory or its descendants",
+      );
+      await expect(stat(poisonOutput)).rejects.toThrow();
+      expect(await stat(join(stateDirectory, "archive-journal"))).toBeDefined();
+      expect(runtimeStarted).toBe(false);
+      await client.close();
+
+      const absentState = join(root, "absent-state");
+      const stateAlias = join(root, "ABSENT-STATE");
+      const aliasClient = new TestClient(
+        {},
+        {
+          environment: { OPEN_SECURITY_STATE_DIR: absentState },
         },
-      }),
-    ).rejects.toThrow("scan did not start");
-    expect(observerErrors).toEqual([
-      ["onOutputArchived", "archive observer exploded"],
-    ]);
-    expect(archived?.startsWith(`${output}.previous-`)).toBe(true);
-    expect(await readFile(join(archived!, "previous.txt"), "utf8")).toBe(
-      "previous scan\n",
-    );
-    await expect(stat(output)).resolves.toBeDefined();
-    await client.close();
-  });
+      );
+      await expect(
+        aliasClient.preflight(repository, { outputDir: stateAlias }),
+      ).rejects.toThrow(
+        "cannot contain the Open Security workbench state directory",
+      );
+      expect(await stat(absentState)).toBeDefined();
+      await aliasClient.close();
+    },
+  );
+
+  testArchive(
+    "archives existing output before starting a fresh scan",
+    async () => {
+      const root = await temporaryDirectory();
+      const repository = join(root, "repository");
+      const codexHome = join(root, "codex-home");
+      const output = join(root, "scan");
+      await mkdir(repository);
+      await mkdir(codexHome);
+      await mkdir(output, { mode: 0o700 });
+      await writeFile(join(output, "previous.txt"), "previous scan\n");
+      let archived: string | undefined;
+      let registration: readonly string[] | undefined;
+      const observerErrors: Array<[ScanObserverName, string]> = [];
+      const outputEvents: string[] = [];
+      const client = new TestClient(
+        {},
+        {
+          environment: { OPEN_SECURITY_STATE_DIR: root },
+          prepareRuntime: async () => preparedRuntime(codexHome),
+          resolvePluginPython: async () => "/managed/python",
+          repositoryRevision: async () => null,
+          runWorkbench: async (_options: unknown, args: readonly string[]) => {
+            if (args[0] === "get-scan-feedback") {
+              return {
+                scanId: "scan_example_001",
+                targetId: "target_sha256_example",
+                falsePositives: [],
+              };
+            }
+            if (args[0] !== "register-cli-scan") return {};
+            registration = args;
+            const archiveDir = `${output}.previous-20260729T000000Z-scanex01`;
+            await rename(output, archiveDir);
+            await mkdir(output, { mode: 0o700 });
+            return {
+              archivedScanDir: archiveDir,
+              scanId: "scan_example_001",
+              targetId: "target_sha256_example",
+              scanDir: output,
+            };
+          },
+          createCodex: () => ({
+            startThread: () => ({
+              id: null,
+              async runStreamed() {
+                throw new Error("scan did not start");
+              },
+            }),
+          }),
+        },
+      );
+
+      await expect(
+        client.run(repository, {
+          outputDir: output,
+          archiveExisting: true,
+          onOutputArchived: (archiveDir) => {
+            archived = archiveDir;
+            outputEvents.push("archived");
+            throw new Error("archive observer exploded");
+          },
+          onOutputDirReady: (scanDir) => {
+            expect(scanDir).toBe(output);
+            expect(existsSync(scanDir)).toBe(true);
+            outputEvents.push("ready");
+          },
+          onObserverError: (observer, error) => {
+            observerErrors.push([observer, (error as Error).message]);
+          },
+        }),
+      ).rejects.toThrow("scan did not start");
+      expect(observerErrors).toEqual([
+        ["onOutputArchived", "archive observer exploded"],
+      ]);
+      expect(outputEvents).toEqual(["archived", "ready"]);
+      expect(archived?.startsWith(`${output}.previous-`)).toBe(true);
+      expect(registration).toContain("--archive-existing");
+      expect(registration).not.toContain("--archived-scan-dir");
+      expect(await readFile(join(archived!, "previous.txt"), "utf8")).toBe(
+        "previous scan\n",
+      );
+      await expect(stat(output)).resolves.toBeDefined();
+      await client.close();
+    },
+  );
+
+  testArchive(
+    "leaves existing output untouched when scan registration fails",
+    async () => {
+      const root = await temporaryDirectory();
+      const repository = join(root, "repository");
+      const codexHome = join(root, "codex-home");
+      const output = join(root, "scan");
+      await mkdir(repository);
+      await mkdir(codexHome);
+      await mkdir(output, { mode: 0o700 });
+      await writeFile(join(output, "previous.txt"), "previous scan\n");
+      const archiveEvents: string[] = [];
+      const readyEvents: string[] = [];
+      const client = new TestClient(
+        {},
+        {
+          environment: { OPEN_SECURITY_STATE_DIR: root },
+          prepareRuntime: async () => preparedRuntime(codexHome),
+          resolvePluginPython: async () => "/managed/python",
+          repositoryRevision: async () => null,
+          runWorkbench: async (_options: unknown, args: readonly string[]) => {
+            if (args[0] === "register-cli-scan") {
+              throw new Error("registration rejected");
+            }
+            return {};
+          },
+        },
+      );
+
+      await expect(
+        client.run(repository, {
+          outputDir: output,
+          archiveExisting: true,
+          onOutputArchived: (archiveDir) => archiveEvents.push(archiveDir),
+          onOutputDirReady: (scanDir) => readyEvents.push(scanDir),
+        }),
+      ).rejects.toThrow("registration rejected");
+      expect(archiveEvents).toEqual([]);
+      expect(readyEvents).toEqual([]);
+      expect(await readFile(join(output, "previous.txt"), "utf8")).toBe(
+        "previous scan\n",
+      );
+      expect(
+        (await readdir(root)).filter((name) =>
+          name.startsWith("scan.previous-"),
+        ),
+      ).toEqual([]);
+      await client.close();
+    },
+  );
 
   test("rejects scan output inside the repository before runtime initialization", async () => {
     const root = await temporaryDirectory();
     const repository = join(root, "repository");
-    await mkdir(repository);
+    const repositoryCaseAlias = join(root, "REPOSITORY");
+    await mkdir(repository, { mode: 0o700 });
+    await writeFile(join(repository, "source.ts"), "export const value = 1;\n");
+    const aliasedRepository = await stat(repositoryCaseAlias).then(
+      () => repositoryCaseAlias,
+      () => repository,
+    );
+    const nestedOutput = join(repository, "output");
+    await mkdir(nestedOutput, { mode: 0o700 });
+    await writeFile(join(nestedOutput, "sentinel.txt"), "keep output\n");
+    const aliasedNestedOutput = await stat(
+      join(aliasedRepository, "OUTPUT"),
+    ).then(
+      () => join(aliasedRepository, "OUTPUT"),
+      () => nestedOutput,
+    );
     let runtimeStarted = false;
     const client = new TestClient(
       {},
@@ -1285,6 +1526,29 @@ describe("CodexSecurity orchestration", () => {
     await expect(
       client.run(repository, { outputDir: join(repository, "scan") }),
     ).rejects.toBeInstanceOf(OutputDirectoryError);
+    await expect(
+      client.run(repository, {
+        outputDir: aliasedRepository,
+        archiveExisting: true,
+      }),
+    ).rejects.toBeInstanceOf(OutputDirectoryError);
+    await expect(
+      client.run(repository, {
+        outputDir: aliasedNestedOutput,
+        archiveExisting: true,
+      }),
+    ).rejects.toBeInstanceOf(OutputDirectoryError);
+    expect(await readFile(join(nestedOutput, "sentinel.txt"), "utf8")).toBe(
+      "keep output\n",
+    );
+    expect(await readFile(join(repository, "source.ts"), "utf8")).toBe(
+      "export const value = 1;\n",
+    );
+    expect(
+      (await readdir(root)).filter((name) =>
+        name.startsWith("repository.previous-"),
+      ),
+    ).toEqual([]);
     if (process.platform !== "win32") {
       const linkedRepository = join(root, "linked-repository");
       await symlink(repository, linkedRepository);
@@ -1294,6 +1558,19 @@ describe("CodexSecurity orchestration", () => {
         }),
       ).rejects.toBeInstanceOf(OutputDirectoryError);
     }
+
+    const stateInsideRepository = join(repository, "workbench-state");
+    const stateClient = new TestClient(
+      {},
+      {
+        environment: { OPEN_SECURITY_STATE_DIR: stateInsideRepository },
+      },
+    );
+    await expect(stateClient.preflight(repository)).rejects.toBeInstanceOf(
+      OutputDirectoryError,
+    );
+    await expect(stat(stateInsideRepository)).rejects.toThrow();
+    await stateClient.close();
     expect(runtimeStarted).toBe(false);
     await client.close();
   });
@@ -4621,6 +4898,7 @@ appendFileSync(${JSON.stringify(keyLog)}, apiKey.trim() + "\\n");
     const repository = join(root, "repository");
     const codexHome = join(root, "codex-home");
     const fakeCodex = join(root, "codex.mjs");
+    const keyLog = join(root, "api-keys");
     const scanDir = join(root, "scan");
     await mkdir(repository);
     await mkdir(codexHome);
@@ -4628,12 +4906,19 @@ appendFileSync(${JSON.stringify(keyLog)}, apiKey.trim() + "\\n");
     await writeFile(
       fakeCodex,
       `
+import { appendFileSync } from "node:fs";
+
 const args = process.argv.slice(2).join(" ");
 if (args === "login --with-api-key") {
-  process.exit(0);
+  let apiKey = "";
+  for await (const chunk of process.stdin) apiKey += chunk;
+  if (!["secret-key", "ambient-key"].includes(apiKey.trim())) {
+    process.exitCode = 3;
+  } else {
+    appendFileSync(${JSON.stringify(keyLog)}, apiKey);
+  }
 } else if (args === "login") {
   console.error("Open https://auth.example.test/login");
-  process.exit(0);
 } else {
   process.exitCode = 2;
 }
@@ -4683,16 +4968,20 @@ if (args === "login --with-api-key") {
         },
       },
     );
-    await client.loginApiKey("secret-key");
-    const login = await client.loginChatGPT();
-    await expect(login.wait()).resolves.toMatchObject({ success: true });
-    await client.run(repository);
-    expect((codexOptions as CodexOptions | null)?.apiKey).toBeUndefined();
-    expect((codexOptions as CodexOptions | null)?.env).toMatchObject({
-      OPENAI_API_KEY: "ambient-key",
-      CODEX_API_KEY: "secondary-ambient-key",
-    });
-    await client.close();
+    try {
+      await client.loginApiKey("secret-key");
+      const login = await client.loginChatGPT();
+      await expect(login.wait()).resolves.toMatchObject({ success: true });
+      await client.run(repository);
+      expect((codexOptions as CodexOptions | null)?.apiKey).toBeUndefined();
+      expect((codexOptions as CodexOptions | null)?.env).toMatchObject({
+        OPENAI_API_KEY: "ambient-key",
+        CODEX_API_KEY: "secondary-ambient-key",
+      });
+      expect(await readFile(keyLog, "utf8")).toBe("secret-key\nambient-key\n");
+    } finally {
+      await client.close();
+    }
   });
 
   test("aborts and waits for an in-flight API-key login during close", async () => {

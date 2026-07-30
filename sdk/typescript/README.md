@@ -31,10 +31,13 @@ npm install ./dist-package/masonjames-open-security-*.tgz
 ./node_modules/.bin/open-security --version
 ```
 
-The package supports macOS, Linux, and Windows and requires Node.js 22 or
-later. Scanning and exporting findings also require Python 3.10 or later. If
-you use Python 3.10, install the `tomli` package. Select another interpreter
-with `--python`, `pythonPath`, or `PYTHON` when needed.
+The package CLI supports macOS, Linux, and Windows and requires Node.js 22 or
+later. Security scans currently fail closed on Windows until the CLI can verify
+private NTFS DACLs; authentication, configuration, and other non-scan commands
+remain available. Scanning and exporting findings on supported scan platforms
+also require Python 3.10 or later. If you use Python 3.10, install the `tomli`
+package. Select another interpreter with `--python`, `pythonPath`, or `PYTHON`
+when needed.
 
 When a newer version is available, the CLI shows the update command for your
 installation method. Set `OPEN_SECURITY_NO_UPDATE_NOTICE=1` to hide the notice;
@@ -186,11 +189,11 @@ pass it on stdin:
 printenv OPENAI_API_KEY | open-security login --with-api-key
 ```
 
-On Windows, set the API key in PowerShell:
+On Windows, set the API key in PowerShell. Scan execution will fail closed
+until private NTFS DACL validation is available:
 
 ```powershell
 $env:OPENAI_API_KEY = "<your-api-key>"
-open-security scan C:\code\repository
 ```
 
 Check or remove the stored sign-in with `open-security login status` and
@@ -291,7 +294,8 @@ user (`chmod 700`).
 If the output directory already contains results, add `--archive-existing`.
 The CLI moves them to `<output-dir>.previous-<timestamp>-<id>` and starts the
 scan in a new, empty directory at the original path. Add `--dry-run` to see
-the destination without moving files.
+the destination without moving files. All scan execution currently fails
+closed on Windows until the CLI can verify private NTFS DACLs.
 
 Scans are report-only by default. Use `--fail-on-severity` in CI to exit 1 when
 a completed scan contains a finding at or above the selected severity.
@@ -316,6 +320,9 @@ default is `0` (disabled). Bounded pre-stream retry behavior is configured with
 `OPEN_SECURITY_OPENROUTER_MAX_RETRIES`,
 `OPEN_SECURITY_OPENROUTER_RETRY_BASE_DELAY_MS`, and
 `OPEN_SECURITY_OPENROUTER_MAX_RETRY_DELAY_MS`.
+
+These overrides do not change the scan's approval policy or filesystem
+permissions. See [Local security model](#local-security-model).
 
 Scan progress identifies the requested paths and reports actual ranking,
 file-review, validation, and attack-path phases as they become available.
@@ -485,6 +492,30 @@ Terminals and noninteractive CI logs also show how to retry with
 Progress remains on stderr so JSON output stays machine readable. Network
 failures and rate limits remain retryable; definitive authentication and model
 authorization failures stop immediately.
+
+## Local security model
+
+Codex Security runs with your local operating-system permissions. Scan only
+repositories you trust and either own or are authorized to assess. Your
+repository, Git installation, configured tools, and other scans under the
+same account are not separate security principals.
+
+Every scan uses the `codex_security_scan` filesystem profile and
+`approvalPolicy: "never"`. It can read the local filesystem and write to
+workspace roots and the selected scan state directory. Scans do not request
+interactive approval. Setting `approval_policy`, `sandbox_mode`, or permissions
+through `--codex` or SDK `codexOverrides` does not replace these controls or
+make them more restrictive. Independently enforced host and network
+restrictions still apply.
+
+Scan and workbench subprocesses can inherit your environment, including
+unrelated API tokens and cloud credentials. Start a scan with only the
+credentials it needs.
+
+The scanner must stay within the target and output paths you authorize and
+must not disclose private data beyond the operation you requested. Its results
+must accurately report the scan mode, reviewed files, and exclusions. Consult
+the security policy for the full threat model and private reporting process.
 
 ## Documentation and security
 

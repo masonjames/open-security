@@ -1,9 +1,25 @@
 /// <reference lib="esnext.disposable" preserve="true" />
 
-import { chmod, lstat, mkdir, realpath, rm, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  lstat,
+  mkdir,
+  realpath,
+  rm,
+  rmdir,
+  writeFile,
+} from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { homedir, tmpdir } from "node:os";
-import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
+import {
+  basename,
+  dirname,
+  isAbsolute,
+  join,
+  relative,
+  resolve,
+  sep,
+} from "node:path";
 import { Codex, type CodexOptions } from "@openai/codex-sdk";
 import {
   accountStatus,
@@ -88,7 +104,9 @@ import {
   planOutputArchive,
   prepareOutputDir,
   preparePersistentScanRoot,
+  preparePrivateDirectoryPath,
   requireModelSafeOutputDir,
+  requirePrivateScanPlatformSupport,
   resolveCodexCommand,
   resolvePluginPath,
   resolvePluginPython,
@@ -338,6 +356,7 @@ export class CodexSecurity {
     options: ScanOptions = {},
   ): Promise<ScanPreflight> {
     this.#requireOpen();
+    requirePrivateScanPlatformSupport();
     options = scanOptionsWithEnvironmentCostLimit(
       options,
       this.#dependencies.environment,
@@ -347,7 +366,22 @@ export class CodexSecurity {
       options,
       options.signal,
     );
-    requireOutputOutsideRepository(
+    const stateDirectory = await canonicalWorkbenchStateDirectory(
+      codexSecurityStateDirectory(this.#dependencies.environment),
+    );
+    await requireOutputOutsideRepositoryIdentity(
+      inputs.protectedRoot,
+      stateDirectory,
+    );
+    if (inputs.outputDir !== null) {
+      await requireOutputDoesNotContainState(inputs.outputDir, stateDirectory);
+      await requireOutputOutsideArchiveJournal(
+        inputs.outputDir,
+        stateDirectory,
+      );
+      await requireOutputDoesNotContainState(inputs.outputDir, stateDirectory);
+    }
+    await requireOutputOutsideRepositoryIdentity(
       inputs.protectedRoot,
       await realpath(tmpdir()),
       "temporary",
@@ -416,6 +450,7 @@ export class CodexSecurity {
 
   async #run(repository: string, options: ScanOptions): Promise<ScanResult> {
     this.#requireOpen();
+    requirePrivateScanPlatformSupport();
     const costAbortController = new AbortController();
     const signal = AbortSignal.any([
       this.#abortController.signal,
@@ -445,10 +480,21 @@ export class CodexSecurity {
         outputDir: requestedOutput,
         protectedRoot,
       } = await this.#validateLocalInputs(repository, options, signal);
-      const stateDirectory = codexSecurityStateDirectory(
-        this.#dependencies.environment,
+      const stateDirectory = await canonicalWorkbenchStateDirectory(
+        codexSecurityStateDirectory(this.#dependencies.environment),
       );
-      requireOutputOutsideRepository(protectedRoot, stateDirectory);
+      await requireOutputOutsideRepositoryIdentity(
+        protectedRoot,
+        stateDirectory,
+      );
+      if (requestedOutput !== null) {
+        await requireOutputDoesNotContainState(requestedOutput, stateDirectory);
+        await requireOutputOutsideArchiveJournal(
+          requestedOutput,
+          stateDirectory,
+        );
+        await requireOutputDoesNotContainState(requestedOutput, stateDirectory);
+      }
       checkOpen();
       let temporaryRoot: string | undefined;
       if (
@@ -457,14 +503,17 @@ export class CodexSecurity {
         options.knowledgeBasePaths?.length
       ) {
         temporaryRoot = await realpath(tmpdir());
-        requireOutputOutsideRepository(
+        await requireOutputOutsideRepositoryIdentity(
           protectedRoot,
           temporaryRoot,
           "temporary",
         );
       }
       if (requestedOutput !== null) {
-        requireOutputOutsideRepository(protectedRoot, requestedOutput);
+        await requireOutputOutsideRepositoryIdentity(
+          protectedRoot,
+          requestedOutput,
+        );
       }
       if (options.knowledgeBasePaths?.length) {
         knowledgeBase = await prepareKnowledgeBase(
@@ -506,7 +555,11 @@ export class CodexSecurity {
         );
       }
       const runtimeHome = await realpath(runtime.codexHome);
-      requireOutputOutsideRepository(protectedRoot, runtimeHome, "runtime");
+      await requireOutputOutsideRepositoryIdentity(
+        protectedRoot,
+        runtimeHome,
+        "runtime",
+      );
       if (
         options.expectedPluginVersion !== undefined &&
         runtime.plugin.version !== options.expectedPluginVersion
@@ -582,30 +635,43 @@ export class CodexSecurity {
           ? await preparePersistentScanRoot(stateDirectory, basename(repo))
           : temporaryRoot;
       if (scanOutputRoot !== undefined) {
-        requireOutputOutsideRepository(protectedRoot, scanOutputRoot);
+        await requireOutputOutsideRepositoryIdentity(
+          protectedRoot,
+          scanOutputRoot,
+        );
       }
+      const requestedOutputExisted =
+        requestedOutput === null
+          ? null
+          : (await filesystemMetadataOrNull(requestedOutput)) !== null;
       scanDir = await (this.#dependencies.prepareOutputDir ?? prepareOutputDir)(
         requestedOutput ?? undefined,
         basename(repo),
         scanOutputRoot,
         (path) => requireOutputOutsideRepository(protectedRoot, path),
         options.archiveExisting,
-        (archiveDir) =>
-          notifyObserver(
-            "onOutputArchived",
-            options.onOutputArchived,
-            options.onObserverError,
-            archiveDir,
-          ),
       );
-      requireOutputOutsideRepository(protectedRoot, scanDir);
-      requireModelSafeOutputDir(scanDir);
-      notifyObserver(
-        "onOutputDirReady",
-        options.onOutputDirReady,
-        options.onObserverError,
-        scanDir,
-      );
+      try {
+        await requireOutputOutsideRepositoryIdentity(protectedRoot, scanDir);
+        await requireOutputDoesNotContainState(scanDir, stateDirectory);
+        await requireOutputOutsideArchiveJournal(scanDir, stateDirectory);
+        requireModelSafeOutputDir(scanDir);
+      } catch (error) {
+        if (requestedOutput !== null && requestedOutputExisted === false) {
+          const requestedMetadata =
+            await filesystemMetadataOrNull(requestedOutput);
+          const scanMetadata = await filesystemMetadataOrNull(scanDir);
+          if (
+            requestedMetadata !== null &&
+            scanMetadata !== null &&
+            requestedMetadata.dev === scanMetadata.dev &&
+            requestedMetadata.ino === scanMetadata.ino
+          ) {
+            await rmdir(scanDir).catch(() => undefined);
+          }
+        }
+        throw error;
+      }
       checkOpen();
 
       const shellPluginRoot = runtime.plugin.pluginRoot;
@@ -702,21 +768,43 @@ export class CodexSecurity {
         scanDir,
         "--recipe-json",
         JSON.stringify(recipe),
+        ...(options.archiveExisting === true ? ["--archive-existing"] : []),
         ...(options.parentScanId === undefined
           ? []
           : ["--parent-scan-id", options.parentScanId]),
       ]);
       const scanId = registration["scanId"];
       const targetId = registration["targetId"];
+      const archivedScanDir = registration["archivedScanDir"];
       if (
         typeof scanId !== "string" ||
         typeof targetId !== "string" ||
-        registration["scanDir"] !== scanDir
+        registration["scanDir"] !== scanDir ||
+        (archivedScanDir !== undefined &&
+          (options.archiveExisting !== true ||
+            typeof archivedScanDir !== "string" ||
+            dirname(archivedScanDir) !== dirname(scanDir) ||
+            !archivedScanDir.startsWith(`${scanDir}.previous-`)))
       ) {
         throw new CodexSecurityError(
           "The Codex Security workbench returned an invalid scan registration.",
         );
       }
+      if (typeof archivedScanDir === "string") {
+        requireModelSafeOutputDir(archivedScanDir);
+        notifyObserver(
+          "onOutputArchived",
+          options.onOutputArchived,
+          options.onObserverError,
+          archivedScanDir,
+        );
+      }
+      notifyObserver(
+        "onOutputDirReady",
+        options.onOutputDirReady,
+        options.onObserverError,
+        scanDir,
+      );
       activeScan = { id: scanId, options: workbenchOptions };
       checkOpen();
       const feedback = await workbench(
@@ -1277,7 +1365,10 @@ export class CodexSecurity {
       options.archiveExisting,
     );
     if (requestedOutput !== null) {
-      requireOutputOutsideRepository(protectedRoot, requestedOutput);
+      await requireOutputOutsideRepositoryIdentity(
+        protectedRoot,
+        requestedOutput,
+      );
     }
     return {
       repository: repo,
@@ -2220,6 +2311,122 @@ export function scanPreflightCodexConfig(config: JsonObject): JsonObject {
     );
   }
   return result;
+}
+
+async function canonicalWorkbenchStateDirectory(path: string): Promise<string> {
+  let existingAncestor = resolve(path);
+  const missingSegments: string[] = [];
+  while (true) {
+    try {
+      return resolve(
+        await realpath(existingAncestor),
+        ...missingSegments.reverse(),
+      );
+    } catch (error) {
+      if (!isRecord(error) || error["code"] !== "ENOENT") throw error;
+      const parent = dirname(existingAncestor);
+      if (parent === existingAncestor) return resolve(path);
+      missingSegments.push(basename(existingAncestor));
+      existingAncestor = parent;
+    }
+  }
+}
+
+async function filesystemMetadataOrNull(path: string) {
+  return await lstat(path).catch((error: unknown) => {
+    if (isRecord(error) && error["code"] === "ENOENT") return null;
+    throw error;
+  });
+}
+
+async function pathIsWithinByFilesystemIdentity(
+  path: string,
+  directory: string,
+): Promise<boolean> {
+  if (process.platform === "win32") return false;
+  const directoryMetadata = await filesystemMetadataOrNull(directory);
+  if (directoryMetadata === null) return false;
+  let current = path;
+  while (true) {
+    const currentMetadata = await filesystemMetadataOrNull(current);
+    if (
+      currentMetadata !== null &&
+      currentMetadata.dev === directoryMetadata.dev &&
+      currentMetadata.ino === directoryMetadata.ino
+    ) {
+      return true;
+    }
+    const parent = dirname(current);
+    if (parent === current) return false;
+    current = parent;
+  }
+}
+
+async function requireOutputDoesNotContainState(
+  outputDirectory: string,
+  stateDirectory: string,
+): Promise<void> {
+  const stateRelative = relative(outputDirectory, stateDirectory);
+  const lexicallyContained =
+    stateRelative === "" ||
+    (stateRelative !== ".." &&
+      !stateRelative.startsWith(`..${sep}`) &&
+      !isAbsolute(stateRelative));
+  if (
+    lexicallyContained ||
+    (await pathIsWithinByFilesystemIdentity(stateDirectory, outputDirectory))
+  ) {
+    throw new OutputDirectoryError(
+      "Scan output directory cannot contain the Open Security workbench state directory.",
+    );
+  }
+}
+
+async function canonicalArchiveJournalDirectory(
+  stateDirectory: string,
+): Promise<string> {
+  const privateStateDirectory =
+    await preparePrivateDirectoryPath(stateDirectory);
+  return await preparePrivateDirectoryPath(
+    join(privateStateDirectory, "archive-journal"),
+  );
+}
+
+async function requireOutputOutsideArchiveJournal(
+  outputDirectory: string,
+  stateDirectory: string,
+): Promise<void> {
+  const journalDirectory =
+    await canonicalArchiveJournalDirectory(stateDirectory);
+  const outputRelative = relative(journalDirectory, outputDirectory);
+  const lexicallyContained =
+    outputRelative === "" ||
+    (outputRelative !== ".." &&
+      !outputRelative.startsWith(`..${sep}`) &&
+      !isAbsolute(outputRelative));
+  if (
+    lexicallyContained ||
+    (await pathIsWithinByFilesystemIdentity(outputDirectory, journalDirectory))
+  ) {
+    throw new OutputDirectoryError(
+      "Scan output directory cannot use the Open Security archive-journal directory or its descendants.",
+    );
+  }
+}
+
+async function requireOutputOutsideRepositoryIdentity(
+  repository: string,
+  outputDirectory: string,
+  pathKind: ProtectedScanPathKind = "output",
+): Promise<void> {
+  requireOutputOutsideRepository(repository, outputDirectory, pathKind);
+  if (await pathIsWithinByFilesystemIdentity(outputDirectory, repository)) {
+    throw new OutputInsideProtectedRootError(
+      outputDirectory,
+      repository,
+      pathKind,
+    );
+  }
 }
 
 function requireOutputOutsideRepository(

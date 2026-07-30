@@ -18,6 +18,7 @@ import {
 import * as fsPromises from "node:fs/promises";
 import { tmpdir } from "node:os";
 import {
+  basename,
   delimiter,
   dirname,
   isAbsolute,
@@ -51,13 +52,21 @@ import {
   isPythonPathCandidate,
   planOutputArchive,
   preparePersistentScanRoot,
+  preparePrivateDirectoryPath,
+  requirePrivateAclListing,
+  requireArchiveSafeParentDirectory,
+  requirePrivateDirectoryAcl,
+  requirePrivateLinuxXattrListing,
   requirePrivateOutputDirectory,
+  requirePrivateScanPlatformSupport,
   runWorkbench,
 } from "../src/runtime.js";
 import { PLUGIN_ROOT } from "./plugin-root.js";
 
 const temporaryDirectories: string[] = [];
 const testPosix = process.platform === "win32" ? test.skip : test;
+const testMac = process.platform === "darwin" ? test : test.skip;
+const testWindows = process.platform === "win32" ? test : test.skip;
 
 afterEach(async () => {
   await Promise.all(
@@ -513,7 +522,7 @@ describe("plugin runtime preparation", () => {
           "    def register(name):",
           "        scan_dir = root_path / name",
           "        scan_dir.mkdir(mode=0o700)",
-          "        registered = module['register_cli_scan'](connection, argparse.Namespace(repository=str(repository), scan_dir=str(scan_dir), recipe_json=recipe, parent_scan_id=None))",
+          "        registered = module['register_cli_scan'](connection, argparse.Namespace(repository=str(repository), scan_dir=str(scan_dir), recipe_json=recipe, parent_scan_id=None, archive_existing=False, archived_scan_dir=None))",
           "        return registered['scanId'], scan_dir",
           "    scan_id, scan_dir = register('recoverable')",
           "    manifest = {'scan': {'target': {'kind': 'git_revision', 'targetId': 'draft', 'displayName': 'draft', 'revision': '0' * 40}, 'scope': {'includePaths': [target_path], 'excludePaths': []}}}",
@@ -523,6 +532,15 @@ describe("plugin runtime preparation", () => {
           "        (scan_dir / filename).write_text(json.dumps(payload), encoding='utf-8')",
           "    cost = {'model': 'qwen/qwen3.7-flash', 'inputTokens': 11, 'cachedInputTokens': 2, 'cacheWriteInputTokens': 0, 'outputTokens': 3, 'estimatedUsd': 0.001}",
           "    module['fail_scan'](connection, argparse.Namespace(scan_id=scan_id, cost_json=json.dumps(cost), claim_token=None, message='artifact validation failed'))",
+          "    warning_checks = iter([None, 'Repository changed during finalization.', 'Repository changed during finalization.'])",
+          "    workbench_globals = module['complete_scan_locked'].__globals__",
+          "    workbench_globals['scan_target_warning'] = lambda scan: next(warning_checks)",
+          "    prepared_warning_inputs = []",
+          "    original_prepare = workbench_globals['_prepare_scan_finalization']",
+          "    def tracked_prepare(*args, **kwargs):",
+          "        prepared_warning_inputs.append(list(kwargs['completion_warnings']))",
+          "        return original_prepare(*args, **kwargs)",
+          "    workbench_globals['_prepare_scan_finalization'] = tracked_prepare",
           "    completed = module['complete_scan'](connection, argparse.Namespace(scan_id=scan_id, cost_json=None, claim_token=None))",
           "    row = module['require_scan'](connection, scan_id)",
           "    sealed_manifest = json.loads((scan_dir / 'scan-manifest.json').read_text(encoding='utf-8'))",
@@ -534,7 +552,7 @@ describe("plugin runtime preparation", () => {
           "        canceled_error = str(error)",
           "    else:",
           "        canceled_error = None",
-          "    print(json.dumps({'status': completed['scan']['progress']['status'], 'failureMessage': completed['scan']['failureMessage'], 'cost': completed['scan']['cost'], 'completedAtMatches': row['completed_at'] == sealed_manifest['scan']['completedAt'], 'canceledError': canceled_error, 'databaseIsolated': database_isolated}, sort_keys=True))",
+          "    print(json.dumps({'status': completed['scan']['progress']['status'], 'failureMessage': completed['scan']['failureMessage'], 'cost': completed['scan']['cost'], 'completedAtMatches': row['completed_at'] == sealed_manifest['scan']['completedAt'], 'canceledError': canceled_error, 'databaseIsolated': database_isolated, 'preparedWarningInputs': prepared_warning_inputs, 'savedWarnings': json.loads(row['completion_warnings_json'])}, sort_keys=True))",
           "    connection.close()",
         ].join("\n"),
         workbench,
@@ -557,6 +575,11 @@ describe("plugin runtime preparation", () => {
           outputTokens: 3,
         },
         failureMessage: null,
+        preparedWarningInputs: [
+          [],
+          ["Repository changed during finalization."],
+        ],
+        savedWarnings: ["Repository changed during finalization."],
         status: "complete",
       });
     },
@@ -1120,6 +1143,76 @@ describe("plugin runtime preparation", () => {
 });
 
 describe("runtime directories and plugin Python boundary", () => {
+  test("fails closed on Windows before provisioning private state", async () => {
+    const root = await temporaryDirectory();
+    const sdkState = join(root, "sdk-state");
+    const workbenchState = join(root, "workbench-state");
+    const message =
+      "Private scan output is not supported on Windows until DACL validation is available.";
+
+    expect(() => requirePrivateScanPlatformSupport("win32")).toThrow(message);
+
+    const sdkResult = spawnSync(
+      process.execPath,
+      [
+        "-e",
+        [
+          'Object.defineProperty(process, "platform", { value: "win32" });',
+          "const runtime = await import(process.argv[1]);",
+          "try {",
+          "  await runtime.preparePrivateDirectoryPath(process.argv[2]);",
+          "} catch (error) {",
+          "  console.error(error instanceof Error ? error.message : String(error));",
+          "  process.exit(7);",
+          "}",
+        ].join("\n"),
+        new URL("../src/runtime.ts", import.meta.url).href,
+        sdkState,
+      ],
+      { encoding: "utf8" },
+    );
+    expect(sdkResult.status).toBe(7);
+    expect(sdkResult.stderr).toContain(message);
+    await expect(stat(sdkState)).rejects.toThrow();
+
+    const python = Bun.which("python3") ?? Bun.which("python");
+    expect(python).not.toBeNull();
+    const workbenchResult = spawnSync(
+      python!,
+      [
+        "-I",
+        "-B",
+        "-c",
+        [
+          "import sys",
+          "from pathlib import Path",
+          "sys.path.insert(0, sys.argv[1])",
+          "import workbench_db as db",
+          "state = Path(sys.argv[2])",
+          "db.os.name = 'nt'",
+          "for operation in (",
+          "    lambda: db.prepare_private_state_directory(state),",
+          "    db.connect,",
+          "):",
+          "    try:",
+          "        operation()",
+          "    except SystemExit as error:",
+          "        assert str(error) == sys.argv[3]",
+          "    else:",
+          "        raise AssertionError('Windows state provisioning was accepted')",
+          "assert not state.exists(), 'Windows state was provisioned before rejection'",
+        ].join("\n"),
+        join(PLUGIN_ROOT, "scripts"),
+        workbenchState,
+        message,
+      ],
+      { encoding: "utf8" },
+    );
+    expect(workbenchResult.status).toBe(0);
+    expect(workbenchResult.stderr).toBe("");
+    await expect(stat(workbenchState)).rejects.toThrow();
+  });
+
   test("derives persistent state from the ambient home or explicit override", async () => {
     const root = await temporaryDirectory();
     expect(codexSecurityStateDirectory({ CODEX_HOME: root })).toBe(
@@ -1248,6 +1341,1099 @@ describe("runtime directories and plugin Python boundary", () => {
     expect(result).toEqual({ ok: true });
   });
 
+  test("preserves recorded artifact paths when archiving a completed scan", async () => {
+    const root = await temporaryDirectory();
+    const scanDir = join(root, "scan");
+    const journalRoot = join(root, "journal");
+    await mkdir(scanDir, { mode: 0o700 });
+    await writeFile(join(scanDir, "coverage.json"), "{}\n");
+    const storedScanDir = await stat(join(root, "SCAN")).then(
+      () => join(root, "SCAN"),
+      () => scanDir,
+    );
+
+    const python = Bun.which("python3") ?? Bun.which("python");
+    expect(python).not.toBeNull();
+    const result = spawnSync(
+      python!,
+      [
+        "-I",
+        "-B",
+        "-c",
+        [
+          "import argparse, json, sqlite3, sys",
+          "from pathlib import Path",
+          "sys.path.insert(0, sys.argv[1])",
+          "from workbench_scan_start import archive_scan",
+          "scan_dir, stored_scan_dir = map(Path, sys.argv[2:4])",
+          "journal_root = Path(sys.argv[4])",
+          "previous_scan_id = '11111111-1111-4111-8111-111111111111'",
+          "new_scan_id = '22222222-2222-4222-8222-222222222222'",
+          "connection = sqlite3.connect(':memory:')",
+          "connection.row_factory = sqlite3.Row",
+          "connection.execute('CREATE TABLE scans (id TEXT PRIMARY KEY, status TEXT NOT NULL, scan_dir TEXT NOT NULL, updated_at TEXT NOT NULL)')",
+          "connection.execute('CREATE TABLE scan_artifacts (scan_id TEXT NOT NULL, kind TEXT NOT NULL, path TEXT NOT NULL, PRIMARY KEY (scan_id, kind))')",
+          "connection.execute('INSERT INTO scans VALUES (?, ?, ?, ?)', (previous_scan_id, 'complete', str(stored_scan_dir), 'before'))",
+          "artifacts = {'coverage': 'coverage.json', 'findings': 'findings.json', 'manifest': 'scan-manifest.json', 'markdownReport': 'report.md'}",
+          "connection.executemany('INSERT INTO scan_artifacts VALUES (?, ?, ?)', [(previous_scan_id, kind, str(stored_scan_dir / path)) for kind, path in artifacts.items()])",
+          "args = argparse.Namespace(archive_existing=True)",
+          "archived_scan_dir, _, _ = archive_scan(connection, args, scan_dir, 'after', new_scan_id=new_scan_id, journal_root=journal_root)",
+          "scan = connection.execute('SELECT scan_dir FROM scans WHERE id = ?', (previous_scan_id,)).fetchone()",
+          "rows = connection.execute('SELECT kind, path FROM scan_artifacts WHERE scan_id = ? ORDER BY kind', (previous_scan_id,))",
+          "print(json.dumps({'archiveDir': str(archived_scan_dir), 'scanDir': scan['scan_dir'], 'artifacts': [dict(row) for row in rows]}))",
+        ].join("\n"),
+        join(PLUGIN_ROOT, "scripts"),
+        scanDir,
+        storedScanDir,
+        journalRoot,
+      ],
+      { encoding: "utf8" },
+    );
+
+    expect(result.status).toBe(0);
+    expect(result.stderr).toBe("");
+    const payload = JSON.parse(result.stdout) as {
+      archiveDir: string;
+      scanDir: string;
+      artifacts: Array<{ kind: string; path: string }>;
+    };
+    expect(payload.archiveDir.startsWith(`${scanDir}.previous-`)).toBe(true);
+    expect(payload.scanDir).toBe(payload.archiveDir);
+    expect(payload.artifacts).toEqual([
+      { kind: "coverage", path: join(payload.archiveDir, "coverage.json") },
+      { kind: "findings", path: join(payload.archiveDir, "findings.json") },
+      {
+        kind: "manifest",
+        path: join(payload.archiveDir, "scan-manifest.json"),
+      },
+      { kind: "markdownReport", path: join(payload.archiveDir, "report.md") },
+    ]);
+    expect(
+      await readFile(join(payload.archiveDir, "coverage.json"), "utf8"),
+    ).toBe("{}\n");
+    expect(await readdir(scanDir)).toEqual([]);
+  });
+
+  test("rejects a running scan before moving its output", async () => {
+    const root = await temporaryDirectory();
+    const scanDir = join(root, "scan");
+    await mkdir(scanDir, { mode: 0o700 });
+    await writeFile(join(scanDir, "sentinel.txt"), "running\n");
+
+    const python = Bun.which("python3") ?? Bun.which("python");
+    expect(python).not.toBeNull();
+    const result = spawnSync(
+      python!,
+      [
+        "-I",
+        "-B",
+        "-c",
+        [
+          "import argparse, sqlite3, sys",
+          "from pathlib import Path",
+          "sys.path.insert(0, sys.argv[1])",
+          "from workbench_scan_start import archive_scan",
+          "scan_dir = Path(sys.argv[2])",
+          "connection = sqlite3.connect(':memory:')",
+          "connection.row_factory = sqlite3.Row",
+          "connection.execute('CREATE TABLE scans (id TEXT PRIMARY KEY, status TEXT NOT NULL, scan_dir TEXT NOT NULL, updated_at TEXT NOT NULL)')",
+          "connection.execute('CREATE TABLE scan_artifacts (scan_id TEXT NOT NULL, kind TEXT NOT NULL, path TEXT NOT NULL, PRIMARY KEY (scan_id, kind))')",
+          "connection.execute('INSERT INTO scans VALUES (?, ?, ?, ?)', ('11111111-1111-4111-8111-111111111111', 'running', str(scan_dir), 'before'))",
+          "archive_scan(connection, argparse.Namespace(archive_existing=True), scan_dir, 'after', new_scan_id='22222222-2222-4222-8222-222222222222', journal_root=Path(sys.argv[3]))",
+        ].join("\n"),
+        join(PLUGIN_ROOT, "scripts"),
+        scanDir,
+        join(root, "journal"),
+      ],
+      { encoding: "utf8" },
+    );
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain(
+      "Cannot archive the output of a running scan.",
+    );
+    expect(await readFile(join(scanDir, "sentinel.txt"), "utf8")).toBe(
+      "running\n",
+    );
+    expect(
+      (await readdir(root)).filter((name) => name.startsWith("scan.previous-")),
+    ).toEqual([]);
+  });
+
+  test("rejects archiving a parent that contains registered child scans", async () => {
+    const root = await temporaryDirectory();
+    const scanDir = join(root, "scan-root");
+    const firstChild = join(scanDir, "first-scan");
+    const secondChild = join(scanDir, "second-scan");
+    await mkdir(firstChild, { recursive: true, mode: 0o700 });
+    await mkdir(secondChild, { recursive: true, mode: 0o700 });
+    await writeFile(join(firstChild, "sentinel.txt"), "first\n");
+    await writeFile(join(secondChild, "sentinel.txt"), "second\n");
+    const firstStoredPath = await stat(join(scanDir, "FIRST-SCAN")).then(
+      () => join(scanDir, "FIRST-SCAN"),
+      () => firstChild,
+    );
+    const secondStoredPath = await stat(join(scanDir, "SECOND-SCAN")).then(
+      () => join(scanDir, "SECOND-SCAN"),
+      () => secondChild,
+    );
+
+    const python = Bun.which("python3") ?? Bun.which("python");
+    expect(python).not.toBeNull();
+    const result = spawnSync(
+      python!,
+      [
+        "-I",
+        "-B",
+        "-c",
+        [
+          "import argparse, sqlite3, sys",
+          "from pathlib import Path",
+          "sys.path.insert(0, sys.argv[1])",
+          "from workbench_scan_start import archive_scan",
+          "scan_dir, first_child, second_child = map(Path, sys.argv[2:5])",
+          "connection = sqlite3.connect(':memory:')",
+          "connection.row_factory = sqlite3.Row",
+          "connection.execute('CREATE TABLE scans (id TEXT PRIMARY KEY, status TEXT NOT NULL, scan_dir TEXT NOT NULL, updated_at TEXT NOT NULL)')",
+          "connection.execute('CREATE TABLE scan_artifacts (scan_id TEXT NOT NULL, kind TEXT NOT NULL, path TEXT NOT NULL, PRIMARY KEY (scan_id, kind))')",
+          "connection.executemany('INSERT INTO scans VALUES (?, ?, ?, ?)', [('11111111-1111-4111-8111-111111111111', 'complete', str(first_child), 'before'), ('22222222-2222-4222-8222-222222222222', 'complete', str(second_child), 'before')])",
+          "archive_scan(connection, argparse.Namespace(archive_existing=True), scan_dir, 'after', new_scan_id='33333333-3333-4333-8333-333333333333', journal_root=Path(sys.argv[5]))",
+        ].join("\n"),
+        join(PLUGIN_ROOT, "scripts"),
+        scanDir,
+        firstStoredPath,
+        secondStoredPath,
+        join(root, "journal"),
+      ],
+      { encoding: "utf8" },
+    );
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain(
+      "Cannot archive a directory that contains registered scan output directories.",
+    );
+    expect(await readFile(join(firstChild, "sentinel.txt"), "utf8")).toBe(
+      "first\n",
+    );
+    expect(await readFile(join(secondChild, "sentinel.txt"), "utf8")).toBe(
+      "second\n",
+    );
+    expect(
+      (await readdir(root)).filter((name) =>
+        name.startsWith("scan-root.previous-"),
+      ),
+    ).toEqual([]);
+  });
+
+  testPosix(
+    "rejects direct workbench state inside the target before opening SQLite",
+    async () => {
+      const root = await temporaryDirectory();
+      const repository = join(root, "repository");
+      const scanDir = join(root, "scan");
+      const stateDirectory = join(repository, ".open-security-state");
+      await mkdir(repository, { mode: 0o700 });
+      await mkdir(scanDir, { mode: 0o700 });
+      await writeFile(
+        join(repository, "source.ts"),
+        "export const value = 1;\n",
+      );
+      const recipe = JSON.stringify({
+        config: {},
+        mode: "standard",
+        repository,
+        target: { kind: "repository", paths: [] },
+      });
+      const python = Bun.which("python3") ?? Bun.which("python");
+      expect(python).not.toBeNull();
+      const result = spawnSync(
+        python!,
+        [
+          "-I",
+          "-B",
+          join(PLUGIN_ROOT, "scripts", "workbench_db.py"),
+          "register-cli-scan",
+          "--repository",
+          repository,
+          "--scan-dir",
+          scanDir,
+          "--recipe-json",
+          recipe,
+        ],
+        {
+          encoding: "utf8",
+          env: {
+            ...process.env,
+            CODEX_SECURITY_STATE_DIR: stateDirectory,
+          },
+        },
+      );
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain(
+        "workbench state directory must be outside the selected target",
+      );
+      await expect(stat(stateDirectory)).rejects.toThrow();
+      expect(await readdir(scanDir)).toEqual([]);
+    },
+  );
+
+  testPosix(
+    "rejects archive output containing a symlinked workbench state directory",
+    async () => {
+      const root = await temporaryDirectory();
+      const repository = join(root, "repository");
+      const stateContainer = join(root, "state-container");
+      const stateContainerCaseAlias = join(root, "STATE-CONTAINER");
+      const stateDirectory = join(stateContainer, "state");
+      const stateLink = join(root, "state-link");
+      await mkdir(repository, { mode: 0o700 });
+      await writeFile(
+        join(repository, "source.ts"),
+        "export const value = 1;\n",
+      );
+      await mkdir(stateDirectory, { recursive: true, mode: 0o700 });
+      await symlink(stateDirectory, stateLink);
+      const archiveStateRoot = await stat(stateContainerCaseAlias).then(
+        () => stateContainerCaseAlias,
+        () => stateContainer,
+      );
+      await writeFile(
+        join(stateDirectory, "state-sentinel.txt"),
+        "keep state\n",
+      );
+
+      const python = Bun.which("python3") ?? Bun.which("python");
+      expect(python).not.toBeNull();
+      const recipe = JSON.stringify({
+        config: {},
+        mode: "standard",
+        repository,
+        target: { kind: "repository", paths: [] },
+      });
+      const result = spawnSync(
+        python!,
+        [
+          "-I",
+          "-B",
+          join(PLUGIN_ROOT, "scripts", "workbench_db.py"),
+          "register-cli-scan",
+          "--repository",
+          repository,
+          "--scan-dir",
+          archiveStateRoot,
+          "--recipe-json",
+          recipe,
+          "--archive-existing",
+        ],
+        {
+          encoding: "utf8",
+          env: {
+            ...process.env,
+            CODEX_SECURITY_STATE_DIR: stateLink,
+          },
+        },
+      );
+
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain(
+        "The scan artifact directory cannot contain the workbench state directory.",
+      );
+      expect(
+        await readFile(join(stateDirectory, "state-sentinel.txt"), "utf8"),
+      ).toBe("keep state\n");
+      expect(
+        await stat(join(stateDirectory, "workbench.sqlite3")),
+      ).toBeDefined();
+      expect(
+        (await readdir(root)).filter((name) =>
+          name.startsWith("state-container.previous-"),
+        ),
+      ).toEqual([]);
+    },
+  );
+
+  testPosix(
+    "rejects archive-journal descendants before opening the workbench database",
+    async () => {
+      const root = await temporaryDirectory();
+      const repository = join(root, "repository");
+      const stateDirectory = join(root, "state");
+      const archiveJournal = join(stateDirectory, "archive-journal");
+      const archiveJournalCaseAlias = join(stateDirectory, "ARCHIVE-JOURNAL");
+      await mkdir(repository, { mode: 0o700 });
+      await writeFile(
+        join(repository, "source.ts"),
+        "export const value = 1;\n",
+      );
+      const scanDir = join(archiveJournal, "scan");
+      await mkdir(scanDir, { recursive: true, mode: 0o700 });
+      await writeFile(join(scanDir, "scan-manifest.json"), "{}\n");
+      const scanDirAlias = await stat(archiveJournalCaseAlias).then(
+        () => join(archiveJournalCaseAlias, "scan"),
+        () => scanDir,
+      );
+
+      const python = Bun.which("python3") ?? Bun.which("python");
+      expect(python).not.toBeNull();
+      const recipe = JSON.stringify({
+        config: {},
+        mode: "standard",
+        repository,
+        target: { kind: "repository", paths: [] },
+      });
+      const result = spawnSync(
+        python!,
+        [
+          "-I",
+          "-B",
+          join(PLUGIN_ROOT, "scripts", "workbench_db.py"),
+          "register-cli-scan",
+          "--repository",
+          repository,
+          "--scan-dir",
+          scanDirAlias,
+          "--recipe-json",
+          recipe,
+        ],
+        {
+          encoding: "utf8",
+          env: {
+            ...process.env,
+            CODEX_SECURITY_STATE_DIR: stateDirectory,
+          },
+        },
+      );
+
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain(
+        "cannot use the workbench archive-journal directory or its descendants",
+      );
+      await expect(
+        stat(join(stateDirectory, "workbench.sqlite3")),
+      ).rejects.toThrow();
+      expect(await readFile(join(scanDir, "scan-manifest.json"), "utf8")).toBe(
+        "{}\n",
+      );
+    },
+  );
+
+  testMac(
+    "rejects an absent case-aliased native archive-journal root",
+    async () => {
+      const root = await temporaryDirectory();
+      const repository = join(root, "repository");
+      const stateDirectory = join(root, "fresh-state");
+      await mkdir(repository, { mode: 0o700 });
+      await mkdir(stateDirectory, { mode: 0o700 });
+      const caseProbe = join(stateDirectory, "case-probe");
+      await mkdir(caseProbe, { mode: 0o700 });
+      const caseInsensitive = await stat(
+        join(stateDirectory, "CASE-PROBE"),
+      ).then(
+        () => true,
+        () => false,
+      );
+      await rm(caseProbe, { recursive: true, force: true });
+      if (!caseInsensitive) return;
+
+      const aliasedJournal = join(stateDirectory, "ARCHIVE-JOURNAL");
+      const python = Bun.which("python3") ?? Bun.which("python");
+      expect(python).not.toBeNull();
+      const result = spawnSync(
+        python!,
+        [
+          "-I",
+          "-B",
+          "-c",
+          [
+            "import sys",
+            "from pathlib import Path",
+            "sys.path.insert(0, sys.argv[1])",
+            "import workbench_db as db",
+            "try:",
+            "    db.scan_target_root(sys.argv[3], Path(sys.argv[2]))",
+            "except SystemExit as error:",
+            "    print(error)",
+            "else:",
+            "    raise AssertionError('case-aliased native journal root was accepted')",
+          ].join("\n"),
+          join(PLUGIN_ROOT, "scripts"),
+          repository,
+          aliasedJournal,
+        ],
+        {
+          encoding: "utf8",
+          env: {
+            ...process.env,
+            CODEX_SECURITY_STATE_DIR: stateDirectory,
+          },
+        },
+      );
+
+      expect(result.status).toBe(0);
+      expect(result.stderr).toBe("");
+      expect(result.stdout).toContain(
+        "cannot use the workbench archive-journal directory or its descendants",
+      );
+      await expect(
+        stat(join(aliasedJournal, basename(repository))),
+      ).rejects.toThrow();
+      expect(await stat(join(stateDirectory, "archive-journal"))).toBeDefined();
+    },
+  );
+
+  testPosix(
+    "rejects unsafe and reserved native scan roots before provisioning",
+    async () => {
+      const root = await temporaryDirectory();
+      const repository = join(root, "repository");
+      const stateDirectory = join(root, "state");
+      const archiveJournal = join(stateDirectory, "archive-journal");
+      const unsafeRoot = join(root, "unsafe");
+      await mkdir(repository, { mode: 0o700 });
+      await mkdir(archiveJournal, { recursive: true, mode: 0o700 });
+      await mkdir(unsafeRoot, { mode: 0o700 });
+      await chmod(unsafeRoot, 0o777);
+
+      const python = Bun.which("python3") ?? Bun.which("python");
+      expect(python).not.toBeNull();
+      const result = spawnSync(
+        python!,
+        [
+          "-I",
+          "-B",
+          "-c",
+          [
+            "import sys",
+            "from pathlib import Path",
+            "sys.path.insert(0, sys.argv[1])",
+            "import workbench_db as db",
+            "repository, journal, unsafe_root, safe_root = map(Path, sys.argv[2:6])",
+            "try:",
+            "    db.scan_target_root(str(journal), repository)",
+            "except SystemExit as error:",
+            "    print(error)",
+            "else:",
+            "    raise AssertionError('reserved native scan root was accepted')",
+            "assert not (journal / repository.name).exists(), 'reserved target root was provisioned'",
+            "unsafe_target = unsafe_root / 'target'",
+            "try:",
+            "    db.prepare_native_scan_target_root(unsafe_target)",
+            "except SystemExit as error:",
+            "    print(error)",
+            "else:",
+            "    raise AssertionError('unsafe native scan root was accepted')",
+            "assert not unsafe_target.exists(), 'unsafe target root was provisioned'",
+            "windows_target = safe_root / 'windows-target'",
+            "db.os.name = 'nt'",
+            "try:",
+            "    db.prepare_native_scan_target_root(windows_target)",
+            "except SystemExit as error:",
+            "    print(error)",
+            "else:",
+            "    raise AssertionError('native Windows scan root was accepted')",
+            "assert not windows_target.exists(), 'Windows target root was provisioned'",
+          ].join("\n"),
+          join(PLUGIN_ROOT, "scripts"),
+          repository,
+          archiveJournal,
+          unsafeRoot,
+          root,
+        ],
+        {
+          encoding: "utf8",
+          env: {
+            ...process.env,
+            CODEX_SECURITY_STATE_DIR: stateDirectory,
+          },
+        },
+      );
+
+      expect(result.status).toBe(0);
+      expect(result.stderr).toBe("");
+      expect(result.stdout).toContain(
+        "cannot use the workbench archive-journal directory or its descendants",
+      );
+      expect(result.stdout).toContain(
+        "parent directory that other users cannot rewrite",
+      );
+      expect(result.stdout).toContain(
+        "not supported on Windows until DACL validation is available",
+      );
+    },
+  );
+
+  testPosix(
+    "rejects rewritable state parents before provisioning",
+    async () => {
+      const root = await temporaryDirectory();
+      const unsafeParent = join(root, "unsafe-state-parent");
+      const stateDirectory = join(unsafeParent, "state");
+      await mkdir(unsafeParent, { mode: 0o700 });
+      await chmod(unsafeParent, 0o777);
+
+      await expect(preparePrivateDirectoryPath(stateDirectory)).rejects.toThrow(
+        "parent directory that other users cannot rewrite",
+      );
+      await expect(stat(stateDirectory)).rejects.toThrow();
+
+      const python = Bun.which("python3") ?? Bun.which("python");
+      expect(python).not.toBeNull();
+      const authoritative = spawnSync(
+        python!,
+        [
+          "-I",
+          "-B",
+          "-c",
+          [
+            "import sys",
+            "sys.path.insert(0, sys.argv[1])",
+            "import workbench_db as db",
+            "db.connect()",
+          ].join("\n"),
+          join(PLUGIN_ROOT, "scripts"),
+        ],
+        {
+          encoding: "utf8",
+          env: {
+            ...process.env,
+            CODEX_SECURITY_STATE_DIR: stateDirectory,
+          },
+        },
+      );
+      expect(authoritative.status).toBe(1);
+      expect(authoritative.stderr).toContain(
+        "parent directory that other users cannot rewrite",
+      );
+      await expect(stat(stateDirectory)).rejects.toThrow();
+    },
+  );
+
+  testPosix(
+    "restores private native directory modes under a restrictive umask",
+    async () => {
+      const root = await temporaryDirectory();
+      const stateDirectory = join(root, "state");
+      const targetRoot = join(root, "native", "nested", "target");
+      const python = Bun.which("python3") ?? Bun.which("python");
+      expect(python).not.toBeNull();
+      const result = spawnSync(
+        python!,
+        [
+          "-I",
+          "-B",
+          "-c",
+          [
+            "import os, stat, sys",
+            "from pathlib import Path",
+            "sys.path.insert(0, sys.argv[1])",
+            "import workbench_db as db",
+            "import workbench_scan_start as start",
+            "target_root = Path(sys.argv[2])",
+            "previous_umask = os.umask(0o700)",
+            "try:",
+            "    connection = db.connect()",
+            "    connection.close()",
+            "    db.prepare_native_scan_target_root(target_root)",
+            "    scan_dir = start.create_private_native_scan_directory(target_root, 'a' * 40)",
+            "finally:",
+            "    os.umask(previous_umask)",
+            "state_dir = Path(os.environ['CODEX_SECURITY_STATE_DIR'])",
+            "for path in [state_dir, state_dir / 'archive-journal', target_root.parent.parent, target_root.parent, target_root, scan_dir]:",
+            "    assert stat.S_IMODE(path.stat().st_mode) == 0o700, (path, oct(stat.S_IMODE(path.stat().st_mode)))",
+            "assert stat.S_IMODE((state_dir / 'workbench.sqlite3').stat().st_mode) == 0o600",
+            "scan_dir.rmdir()",
+          ].join("\n"),
+          join(PLUGIN_ROOT, "scripts"),
+          targetRoot,
+        ],
+        {
+          encoding: "utf8",
+          env: {
+            ...process.env,
+            CODEX_SECURITY_STATE_DIR: stateDirectory,
+          },
+        },
+      );
+
+      expect(result.status).toBe(0);
+      expect(result.stderr).toBe("");
+      expect((await stat(targetRoot)).mode & 0o777).toBe(0o700);
+      expect((await stat(stateDirectory)).mode & 0o777).toBe(0o700);
+      expect(
+        (await stat(join(stateDirectory, "workbench.sqlite3"))).mode & 0o777,
+      ).toBe(0o600);
+
+      const sdkState = join(root, "sdk", "state");
+      const previousUmask = process.umask(0o700);
+      let persistentRoot: string;
+      try {
+        persistentRoot = await preparePersistentScanRoot(
+          sdkState,
+          "repository",
+        );
+      } finally {
+        process.umask(previousUmask);
+      }
+      for (const path of [
+        join(root, "sdk"),
+        sdkState,
+        join(sdkState, "scans"),
+        persistentRoot,
+      ]) {
+        expect((await stat(path)).mode & 0o777).toBe(0o700);
+      }
+    },
+  );
+
+  testPosix("rejects a case-aliased repository as scan output", async () => {
+    const root = await temporaryDirectory();
+    const repository = join(root, "Repository");
+    const repositoryCaseAlias = join(root, "repository");
+    const stateDirectory = join(root, "state");
+    await mkdir(repository, { mode: 0o700 });
+    await writeFile(join(repository, "source.ts"), "export const value = 1;\n");
+    const scanDir = await stat(repositoryCaseAlias).then(
+      () => repositoryCaseAlias,
+      () => repository,
+    );
+
+    const python = Bun.which("python3") ?? Bun.which("python");
+    expect(python).not.toBeNull();
+    const recipe = JSON.stringify({
+      config: {},
+      mode: "standard",
+      repository,
+      target: { kind: "repository", paths: [] },
+    });
+    const result = spawnSync(
+      python!,
+      [
+        "-I",
+        "-B",
+        join(PLUGIN_ROOT, "scripts", "workbench_db.py"),
+        "register-cli-scan",
+        "--repository",
+        repository,
+        "--scan-dir",
+        scanDir,
+        "--recipe-json",
+        recipe,
+        "--archive-existing",
+      ],
+      {
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          CODEX_SECURITY_STATE_DIR: stateDirectory,
+        },
+      },
+    );
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain(
+      "The scan artifact directory must be outside the selected target.",
+    );
+    expect(await readFile(join(repository, "source.ts"), "utf8")).toBe(
+      "export const value = 1;\n",
+    );
+    expect(
+      (await readdir(root)).filter(
+        (name) =>
+          name.startsWith("Repository.previous-") ||
+          name.startsWith("repository.previous-"),
+      ),
+    ).toEqual([]);
+  });
+
+  testWindows(
+    "rejects scan output until private Windows DACLs can be verified",
+    async () => {
+      const root = await temporaryDirectory();
+      const scanDir = join(root, "MixedCaseScan");
+      const storedScanDir = join(root, "mixedcasescan");
+      await mkdir(scanDir, { mode: 0o700 });
+      await writeFile(join(scanDir, "sentinel.txt"), "running\n");
+      expect(() =>
+        requirePrivateOutputDirectory(
+          { mode: 0o40700, uid: 0 },
+          scanDir,
+          undefined,
+        ),
+      ).toThrow("not supported on Windows until DACL validation is available");
+
+      const python = Bun.which("python3") ?? Bun.which("python");
+      expect(python).not.toBeNull();
+      const result = spawnSync(
+        python!,
+        [
+          "-I",
+          "-B",
+          "-c",
+          [
+            "import argparse, sqlite3, sys",
+            "from pathlib import Path",
+            "sys.path.insert(0, sys.argv[1])",
+            "from workbench_scan_start import archive_scan",
+            "scan_dir, stored_scan_dir = map(Path, sys.argv[2:4])",
+            "connection = sqlite3.connect(':memory:')",
+            "connection.row_factory = sqlite3.Row",
+            "connection.execute('CREATE TABLE scans (id TEXT PRIMARY KEY, status TEXT NOT NULL, scan_dir TEXT NOT NULL, updated_at TEXT NOT NULL)')",
+            "connection.execute('CREATE TABLE scan_artifacts (scan_id TEXT NOT NULL, kind TEXT NOT NULL, path TEXT NOT NULL, PRIMARY KEY (scan_id, kind))')",
+            "connection.execute('INSERT INTO scans VALUES (?, ?, ?, ?)', ('11111111-1111-4111-8111-111111111111', 'running', str(stored_scan_dir), 'before'))",
+            "archive_scan(connection, argparse.Namespace(archive_existing=True), scan_dir, 'after', new_scan_id='22222222-2222-4222-8222-222222222222', journal_root=Path(sys.argv[4]))",
+          ].join("\n"),
+          join(PLUGIN_ROOT, "scripts"),
+          scanDir,
+          storedScanDir,
+          join(root, "journal"),
+        ],
+        { encoding: "utf8" },
+      );
+
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain(
+        "Private scan output is not supported on Windows until DACL validation is available.",
+      );
+      expect(await readFile(join(scanDir, "sentinel.txt"), "utf8")).toBe(
+        "running\n",
+      );
+    },
+  );
+
+  testPosix(
+    "reruns recovery after a pre-opened connection acquires the write lock",
+    async () => {
+      const root = await temporaryDirectory();
+      const scanDir = join(root, "scan");
+      const journalRoot = join(root, "journal");
+      const database = join(root, "workbench.sqlite3");
+      await mkdir(scanDir, { mode: 0o700 });
+      await writeFile(join(scanDir, "sentinel.txt"), "completed\n");
+
+      const python = Bun.which("python3") ?? Bun.which("python");
+      expect(python).not.toBeNull();
+      const result = spawnSync(
+        python!,
+        [
+          "-I",
+          "-B",
+          "-c",
+          [
+            "import argparse, json, os, sqlite3, sys",
+            "from pathlib import Path",
+            "sys.path.insert(0, sys.argv[1])",
+            "from workbench_scan_start import archive_scan, recover_pending_archives",
+            "scan_dir, journal_root, database = map(Path, sys.argv[2:5])",
+            "previous_scan_id = '11111111-1111-4111-8111-111111111111'",
+            "setup = sqlite3.connect(database)",
+            "setup.execute('CREATE TABLE scans (id TEXT PRIMARY KEY, status TEXT NOT NULL, scan_dir TEXT NOT NULL, updated_at TEXT NOT NULL)')",
+            "setup.execute('CREATE TABLE scan_artifacts (scan_id TEXT NOT NULL, kind TEXT NOT NULL, path TEXT NOT NULL, PRIMARY KEY (scan_id, kind))')",
+            "setup.execute('INSERT INTO scans VALUES (?, ?, ?, ?)', (previous_scan_id, 'complete', str(scan_dir), 'before'))",
+            "setup.commit()",
+            "setup.close()",
+            "waiting = sqlite3.connect(database, timeout=5)",
+            "waiting.row_factory = sqlite3.Row",
+            "pid = os.fork()",
+            "if pid == 0:",
+            "    connection = sqlite3.connect(database, timeout=5)",
+            "    connection.row_factory = sqlite3.Row",
+            "    connection.execute('BEGIN IMMEDIATE')",
+            "    archive_scan(connection, argparse.Namespace(archive_existing=True), scan_dir, 'after', new_scan_id='22222222-2222-4222-8222-222222222222', journal_root=journal_root)",
+            "    os._exit(73)",
+            "_, status = os.waitpid(pid, 0)",
+            "assert os.waitstatus_to_exitcode(status) == 73",
+            "waiting.execute('BEGIN IMMEDIATE')",
+            "recover_pending_archives(waiting, journal_root, transaction_open=True)",
+            "scan = waiting.execute('SELECT scan_dir FROM scans').fetchone()",
+            "waiting.commit()",
+            "print(json.dumps({'scanDir': scan['scan_dir']}))",
+          ].join("\n"),
+          join(PLUGIN_ROOT, "scripts"),
+          scanDir,
+          journalRoot,
+          database,
+        ],
+        { encoding: "utf8" },
+      );
+
+      expect(result.status).toBe(0);
+      expect(result.stderr).toBe("");
+      expect(JSON.parse(result.stdout)).toEqual({ scanDir });
+      expect(await readFile(join(scanDir, "sentinel.txt"), "utf8")).toBe(
+        "completed\n",
+      );
+      expect(await readdir(journalRoot)).toEqual([]);
+    },
+  );
+
+  test("recovers an interrupted archive before the next workbench operation", async () => {
+    const root = await temporaryDirectory();
+    const scanDir = join(root, "scan");
+    const journalRoot = join(root, "journal");
+    const database = join(root, "workbench.sqlite3");
+    await mkdir(scanDir, { mode: 0o700 });
+    await writeFile(join(scanDir, "sentinel.txt"), "completed\n");
+
+    const python = Bun.which("python3") ?? Bun.which("python");
+    expect(python).not.toBeNull();
+    const interrupted = spawnSync(
+      python!,
+      [
+        "-I",
+        "-B",
+        "-c",
+        [
+          "import argparse, os, sqlite3, sys",
+          "from pathlib import Path",
+          "sys.path.insert(0, sys.argv[1])",
+          "from workbench_scan_start import archive_scan",
+          "scan_dir, journal_root, database = map(Path, sys.argv[2:5])",
+          "previous_scan_id = '11111111-1111-4111-8111-111111111111'",
+          "connection = sqlite3.connect(database)",
+          "connection.row_factory = sqlite3.Row",
+          "connection.execute('CREATE TABLE scans (id TEXT PRIMARY KEY, status TEXT NOT NULL, scan_dir TEXT NOT NULL, updated_at TEXT NOT NULL)')",
+          "connection.execute('CREATE TABLE scan_artifacts (scan_id TEXT NOT NULL, kind TEXT NOT NULL, path TEXT NOT NULL, PRIMARY KEY (scan_id, kind))')",
+          "connection.execute('INSERT INTO scans VALUES (?, ?, ?, ?)', (previous_scan_id, 'complete', str(scan_dir), 'before'))",
+          "connection.commit()",
+          "connection.execute('BEGIN IMMEDIATE')",
+          "archive_scan(connection, argparse.Namespace(archive_existing=True), scan_dir, 'after', new_scan_id='22222222-2222-4222-8222-222222222222', journal_root=journal_root)",
+          "os._exit(73)",
+        ].join("\n"),
+        join(PLUGIN_ROOT, "scripts"),
+        scanDir,
+        journalRoot,
+        database,
+      ],
+      { encoding: "utf8" },
+    );
+    expect(interrupted.status).toBe(73);
+    expect(await readdir(scanDir)).toEqual([]);
+    expect(
+      (await readdir(root)).some((name) => name.startsWith("scan.previous-")),
+    ).toBe(true);
+
+    const recovered = spawnSync(
+      python!,
+      [
+        "-I",
+        "-B",
+        "-c",
+        [
+          "import json, sqlite3, sys",
+          "from pathlib import Path",
+          "sys.path.insert(0, sys.argv[1])",
+          "from workbench_scan_start import recover_pending_archives",
+          "connection = sqlite3.connect(sys.argv[2])",
+          "connection.row_factory = sqlite3.Row",
+          "recover_pending_archives(connection, Path(sys.argv[3]))",
+          "scan = connection.execute('SELECT scan_dir FROM scans').fetchone()",
+          "print(json.dumps({'scanDir': scan['scan_dir']}))",
+        ].join("\n"),
+        join(PLUGIN_ROOT, "scripts"),
+        database,
+        journalRoot,
+      ],
+      { encoding: "utf8" },
+    );
+    expect(recovered.status).toBe(0);
+    expect(recovered.stderr).toBe("");
+    expect(JSON.parse(recovered.stdout)).toEqual({ scanDir });
+    expect(await readFile(join(scanDir, "sentinel.txt"), "utf8")).toBe(
+      "completed\n",
+    );
+    expect(await readdir(journalRoot)).toEqual([]);
+    expect(
+      (await readdir(root)).filter((name) => name.startsWith("scan.previous-")),
+    ).toEqual([]);
+  });
+
+  testPosix(
+    "fails closed when interrupted archive recovery finds a replacement entry",
+    async () => {
+      const root = await temporaryDirectory();
+      const python = Bun.which("python3") ?? Bun.which("python");
+      expect(python).not.toBeNull();
+      const result = spawnSync(
+        python!,
+        [
+          "-I",
+          "-B",
+          "-c",
+          [
+            "import json, sys",
+            "from pathlib import Path",
+            "sys.path.insert(0, sys.argv[1])",
+            "from workbench_scan_start import _restore_uncommitted_archive",
+            "root = Path(sys.argv[2])",
+            "outcomes = []",
+            "for kind in ('file', 'symlink'):",
+            "    case = root / kind",
+            "    case.mkdir(mode=0o700)",
+            "    scan_dir = case / 'scan'",
+            "    archive_dir = case / 'scan.previous-test'",
+            "    archive_dir.mkdir(mode=0o700)",
+            "    (archive_dir / 'sentinel.txt').write_text('completed\\n')",
+            "    if kind == 'file':",
+            "        scan_dir.write_text('replacement\\n')",
+            "    else:",
+            "        scan_dir.symlink_to(case / 'missing-target')",
+            "    try:",
+            "        _restore_uncommitted_archive(scan_dir, archive_dir)",
+            "    except SystemExit as error:",
+            "        outcomes.append({'kind': kind, 'error': str(error), 'archive': (archive_dir / 'sentinel.txt').read_text(), 'replacement': scan_dir.lstat().st_mode})",
+            "    else:",
+            "        raise AssertionError(f'{kind} replacement was overwritten')",
+            "print(json.dumps(outcomes))",
+          ].join("\n"),
+          join(PLUGIN_ROOT, "scripts"),
+          root,
+        ],
+        { encoding: "utf8" },
+      );
+
+      expect(result.status).toBe(0);
+      expect(result.stderr).toBe("");
+      const outcomes = JSON.parse(result.stdout) as Array<{
+        kind: string;
+        error: string;
+        archive: string;
+        replacement: number;
+      }>;
+      expect(
+        outcomes.map(({ kind, error, archive }) => ({
+          kind,
+          error,
+          archive,
+        })),
+      ).toEqual([
+        {
+          kind: "file",
+          error:
+            "Interrupted scan archive recovery found an unsafe filesystem entry.",
+          archive: "completed\n",
+        },
+        {
+          kind: "symlink",
+          error:
+            "Interrupted scan archive recovery found an unsafe filesystem entry.",
+          archive: "completed\n",
+        },
+      ]);
+      expect(outcomes.every(({ replacement }) => replacement > 0)).toBe(true);
+    },
+  );
+
+  test("removes an incomplete atomic journal temp before recovery", async () => {
+    const root = await temporaryDirectory();
+    const journalRoot = join(root, "journal");
+    const python = Bun.which("python3") ?? Bun.which("python");
+    expect(python).not.toBeNull();
+    const result = spawnSync(
+      python!,
+      [
+        "-I",
+        "-B",
+        "-c",
+        [
+          "import os, sqlite3, sys",
+          "from pathlib import Path",
+          "sys.path.insert(0, sys.argv[1])",
+          "from workbench_scan_start import recover_pending_archives, require_archive_journal_root",
+          "journal_root = require_archive_journal_root(Path(sys.argv[2]))",
+          "temporary = journal_root / '.11111111-1111-4111-8111-111111111111.tmp'",
+          "descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)",
+          "try:",
+          "    os.write(descriptor, b'{\\\"truncated\\\":')",
+          "    os.fsync(descriptor)",
+          "finally:",
+          "    os.close(descriptor)",
+          "connection = sqlite3.connect(':memory:')",
+          "recover_pending_archives(connection, journal_root)",
+          "assert list(journal_root.iterdir()) == []",
+        ].join("\n"),
+        join(PLUGIN_ROOT, "scripts"),
+        journalRoot,
+      ],
+      { encoding: "utf8" },
+    );
+    expect(result.status).toBe(0);
+    expect(result.stderr).toBe("");
+    expect(await readdir(journalRoot)).toEqual([]);
+  });
+
+  test("cleans a committed archive journal without reverting either directory", async () => {
+    const root = await temporaryDirectory();
+    const scanDir = join(root, "scan");
+    const journalRoot = join(root, "journal");
+    const database = join(root, "workbench.sqlite3");
+    await mkdir(scanDir, { mode: 0o700 });
+    await writeFile(join(scanDir, "sentinel.txt"), "completed\n");
+
+    const python = Bun.which("python3") ?? Bun.which("python");
+    expect(python).not.toBeNull();
+    const result = spawnSync(
+      python!,
+      [
+        "-I",
+        "-B",
+        "-c",
+        [
+          "import argparse, json, sqlite3, sys",
+          "from pathlib import Path",
+          "sys.path.insert(0, sys.argv[1])",
+          "from workbench_scan_start import archive_scan, recover_pending_archives",
+          "scan_dir, journal_root, database = map(Path, sys.argv[2:5])",
+          "previous_scan_id = '11111111-1111-4111-8111-111111111111'",
+          "new_scan_id = '22222222-2222-4222-8222-222222222222'",
+          "connection = sqlite3.connect(database)",
+          "connection.row_factory = sqlite3.Row",
+          "connection.execute('CREATE TABLE scans (id TEXT PRIMARY KEY, status TEXT NOT NULL, scan_dir TEXT NOT NULL, updated_at TEXT NOT NULL)')",
+          "connection.execute('CREATE TABLE scan_artifacts (scan_id TEXT NOT NULL, kind TEXT NOT NULL, path TEXT NOT NULL, PRIMARY KEY (scan_id, kind))')",
+          "connection.execute('INSERT INTO scans VALUES (?, ?, ?, ?)', (previous_scan_id, 'complete', str(scan_dir), 'before'))",
+          "connection.commit()",
+          "connection.execute('BEGIN IMMEDIATE')",
+          "archived_scan_dir, _, _ = archive_scan(connection, argparse.Namespace(archive_existing=True), scan_dir, 'after', new_scan_id=new_scan_id, journal_root=journal_root)",
+          "connection.execute('INSERT INTO scans VALUES (?, ?, ?, ?)', (new_scan_id, 'running', str(scan_dir), 'after'))",
+          "connection.commit()",
+          "connection.close()",
+          "reopened = sqlite3.connect(database)",
+          "reopened.row_factory = sqlite3.Row",
+          "recover_pending_archives(reopened, journal_root)",
+          "rows = reopened.execute('SELECT id, scan_dir FROM scans ORDER BY id').fetchall()",
+          "print(json.dumps({'archiveDir': str(archived_scan_dir), 'rows': [dict(row) for row in rows]}))",
+        ].join("\n"),
+        join(PLUGIN_ROOT, "scripts"),
+        scanDir,
+        journalRoot,
+        database,
+      ],
+      { encoding: "utf8" },
+    );
+
+    expect(result.status).toBe(0);
+    expect(result.stderr).toBe("");
+    const payload = JSON.parse(result.stdout) as {
+      archiveDir: string;
+      rows: Array<{ id: string; scan_dir: string }>;
+    };
+    expect(payload.rows).toEqual([
+      {
+        id: "11111111-1111-4111-8111-111111111111",
+        scan_dir: payload.archiveDir,
+      },
+      {
+        id: "22222222-2222-4222-8222-222222222222",
+        scan_dir: scanDir,
+      },
+    ]);
+    expect(
+      await readFile(join(payload.archiveDir, "sentinel.txt"), "utf8"),
+    ).toBe("completed\n");
+    expect(await readdir(scanDir)).toEqual([]);
+    expect(await readdir(journalRoot)).toEqual([]);
+  });
+
   test("reports an unwritable SQLite state directory without a Python traceback", async () => {
     const root = await temporaryDirectory();
     const pluginRoot = join(root, "plugin");
@@ -1290,22 +2476,475 @@ describe("runtime directories and plugin Python boundary", () => {
     expect(message).not.toContain("Traceback");
   });
 
-  testPosix("rejects private output directories owned by another user", () => {
-    expect(() =>
-      requirePrivateOutputDirectory(
-        { mode: 0o40700, uid: 1001 },
-        "/scan",
-        1000,
-      ),
-    ).toThrow("must be owned by the current user");
-    expect(() =>
-      requirePrivateOutputDirectory(
-        { mode: 0o40700, uid: 1000 },
-        "/scan",
-        1000,
-      ),
-    ).not.toThrow();
+  testPosix(
+    "rejects directly writable archive parents and trusts sticky ancestors",
+    () => {
+      expect(() =>
+        requireArchiveSafeParentDirectory(
+          { mode: 0o41777, uid: 1001 },
+          "/shared",
+          1000,
+        ),
+      ).toThrow("parent directories owned by the current user or root");
+      expect(() =>
+        requireArchiveSafeParentDirectory(
+          { mode: 0o41777, uid: 0 },
+          "/tmp",
+          1000,
+        ),
+      ).toThrow("parent directory that other users cannot rewrite");
+      expect(() =>
+        requireArchiveSafeParentDirectory(
+          { mode: 0o41777, uid: 0 },
+          "/tmp",
+          1000,
+          true,
+        ),
+      ).not.toThrow();
+      expect(() =>
+        requireArchiveSafeParentDirectory(
+          { mode: 0o41777, uid: 1000 },
+          "/private-tmp",
+          1000,
+          true,
+        ),
+      ).not.toThrow();
+    },
+  );
+
+  testMac(
+    "rejects a real macOS rewrite ACL on the archive parent",
+    async () => {
+      const root = await temporaryDirectory();
+      const parent = join(root, "acl-parent");
+      const scanDir = join(parent, "scan");
+      await mkdir(scanDir, { recursive: true, mode: 0o700 });
+      await writeFile(join(scanDir, "sentinel.txt"), "completed\n");
+      const acl = spawnSync(
+        "/bin/chmod",
+        ["+a", "group:everyone allow add_file,delete_child", parent],
+        { encoding: "utf8" },
+      );
+      expect(acl.status).toBe(0);
+      expect(acl.stderr).toBe("");
+
+      await expect(validateOutputDir(scanDir, true)).rejects.toThrow(
+        "without extended ACL allow grants",
+      );
+      expect(await readFile(join(scanDir, "sentinel.txt"), "utf8")).toBe(
+        "completed\n",
+      );
+    },
+  );
+
+  testMac("rejects an inherited read ACL on newly created output", async () => {
+    const root = await temporaryDirectory();
+    const parent = join(root, "inherited-acl-parent");
+    const scanDir = join(parent, "scan");
+    await mkdir(parent, { mode: 0o700 });
+    const acl = spawnSync(
+      "/bin/chmod",
+      [
+        "+a",
+        "group:everyone allow read,readattr,file_inherit,directory_inherit",
+        parent,
+      ],
+      { encoding: "utf8" },
+    );
+    expect(acl.status).toBe(0);
+    expect(acl.stderr).toBe("");
+
+    const pythonScanDir = join(parent, "python-scan");
+    await mkdir(pythonScanDir, { mode: 0o700 });
+    const python = Bun.which("python3") ?? Bun.which("python");
+    expect(python).not.toBeNull();
+    const authoritative = spawnSync(
+      python!,
+      [
+        "-I",
+        "-B",
+        "-c",
+        [
+          "import sys",
+          "from pathlib import Path",
+          "sys.path.insert(0, sys.argv[1])",
+          "from workbench_scan_start import require_private_directory_acl",
+          "require_private_directory_acl(Path(sys.argv[2]))",
+        ].join("\n"),
+        join(PLUGIN_ROOT, "scripts"),
+        pythonScanDir,
+      ],
+      { encoding: "utf8" },
+    );
+    expect(authoritative.status).toBe(1);
+    expect(authoritative.stderr).toContain("without extended ACL allow grants");
+
+    await expect(prepareOutputDir(scanDir, "repo")).rejects.toThrow(
+      "without extended ACL allow grants",
+    );
+    await expect(stat(scanDir)).rejects.toThrow();
   });
+
+  testMac("rejects allow ACLs on the archive journal root", async () => {
+    const root = await temporaryDirectory();
+    const journal = join(root, "archive-journal");
+    await mkdir(journal, { mode: 0o700 });
+    const acl = spawnSync(
+      "/bin/chmod",
+      [
+        "+a",
+        "group:everyone allow read,readattr,add_file,delete_child",
+        journal,
+      ],
+      { encoding: "utf8" },
+    );
+    expect(acl.status).toBe(0);
+    expect(acl.stderr).toBe("");
+
+    await expect(requirePrivateDirectoryAcl(journal)).rejects.toThrow(
+      "without extended ACL allow grants",
+    );
+    const python = Bun.which("python3") ?? Bun.which("python");
+    expect(python).not.toBeNull();
+    const authoritative = spawnSync(
+      python!,
+      [
+        "-I",
+        "-B",
+        "-c",
+        [
+          "import sys",
+          "from pathlib import Path",
+          "sys.path.insert(0, sys.argv[1])",
+          "from workbench_scan_start import require_archive_journal_root",
+          "require_archive_journal_root(Path(sys.argv[2]))",
+        ].join("\n"),
+        join(PLUGIN_ROOT, "scripts"),
+        journal,
+      ],
+      { encoding: "utf8" },
+    );
+    expect(authoritative.status).toBe(1);
+    expect(authoritative.stderr).toContain("without extended ACL allow grants");
+  });
+
+  testPosix("rejects all ACL allow grants at both private boundaries", () => {
+    const safeListing = [
+      "drwxr-xr-x+ 1 owner group 0 Jan 1 00:00 /safe",
+      " 0: group:everyone deny delete",
+    ].join("\n");
+    expect(() => requirePrivateAclListing(safeListing, "/safe")).not.toThrow();
+    for (const grant of [
+      "user:auditor allow read,readattr,readextattr,readsecurity",
+      "user:other allow add_file,delete_child",
+      "group:everyone allow list,readattr,file_inherit,directory_inherit",
+    ]) {
+      expect(() =>
+        requirePrivateAclListing(`${safeListing}\n 2: ${grant}`, "/unsafe"),
+      ).toThrow("without extended ACL allow grants");
+    }
+    expect(() =>
+      requirePrivateAclListing(
+        `${safeListing}\n unexpected acl entry`,
+        "/unknown",
+      ),
+    ).toThrow("unrecognized ACL");
+
+    const safeLinuxListing = [
+      "# file: /safe",
+      'user.backup="allowed non-ACL metadata"',
+    ].join("\n");
+    expect(() =>
+      requirePrivateLinuxXattrListing(safeLinuxListing, "/safe"),
+    ).not.toThrow();
+    for (const attribute of [
+      "system.posix_acl_access",
+      "system.posix_acl_default",
+      "system.nfs4_acl",
+      "trusted.custom_acl",
+    ]) {
+      expect(() =>
+        requirePrivateLinuxXattrListing(
+          `${safeLinuxListing}\n${attribute}=0sAAAA`,
+          "/unsafe",
+        ),
+      ).toThrow("without extended ACLs");
+    }
+    expect(() =>
+      requirePrivateLinuxXattrListing(
+        `${safeLinuxListing}\nmalformed`,
+        "/unknown",
+      ),
+    ).toThrow("unrecognized extended attribute");
+
+    const python = Bun.which("python3") ?? Bun.which("python");
+    expect(python).not.toBeNull();
+    const result = spawnSync(
+      python!,
+      [
+        "-I",
+        "-B",
+        "-c",
+        [
+          "import sys",
+          "sys.path.insert(0, sys.argv[1])",
+          "import workbench_scan_start as start",
+          `safe_listing = ${JSON.stringify("drwxr-xr-x+ 1 owner group 0 Jan 1 00:00 /safe\n 0: group:everyone deny delete")}`,
+          "start._require_private_acl_listing(safe_listing)",
+          "try:",
+          "    start._require_private_acl_listing(safe_listing + '\\n 1: user:auditor allow read,readattr,file_inherit')",
+          "except SystemExit as error:",
+          "    print(error)",
+          "else:",
+          "    raise AssertionError('read ACL was accepted')",
+        ].join("\n"),
+        join(PLUGIN_ROOT, "scripts"),
+      ],
+      { encoding: "utf8" },
+    );
+    expect(result.status).toBe(0);
+    expect(result.stderr).toBe("");
+    expect(result.stdout).toContain("without extended ACL allow grants");
+  });
+
+  testPosix("enforces scan parent ownership at the Python boundary", () => {
+    const python = Bun.which("python3") ?? Bun.which("python");
+    expect(python).not.toBeNull();
+    const result = spawnSync(
+      python!,
+      [
+        "-I",
+        "-B",
+        "-c",
+        [
+          "import sys",
+          "from pathlib import Path",
+          "from types import SimpleNamespace",
+          "sys.path.insert(0, sys.argv[1])",
+          "import workbench_scan_start as start",
+          "start.os.geteuid = lambda: 1000",
+          "start._require_ordinary_directory = lambda path, label: SimpleNamespace(st_mode=0o41777, st_uid=1001)",
+          "try:",
+          "    start.require_safe_scan_parents(Path('/shared'), allow_immediate_trusted_sticky=True)",
+          "except SystemExit as error:",
+          "    print(error)",
+          "else:",
+          "    raise AssertionError('attacker-owned sticky parent was accepted')",
+        ].join("\n"),
+        join(PLUGIN_ROOT, "scripts"),
+      ],
+      { encoding: "utf8" },
+    );
+    expect(result.status).toBe(0);
+    expect(result.stderr).toBe("");
+    expect(result.stdout).toContain(
+      "parent directories owned by the current user or root",
+    );
+  });
+
+  testPosix(
+    "uses filesystem identity containment for native scan roots",
+    async () => {
+      const root = await temporaryDirectory();
+      const repository = join(root, "repository");
+      const targetRoot = join(root, "native-root");
+      const stateDirectory = join(root, "state");
+      await mkdir(repository, { mode: 0o700 });
+      await mkdir(targetRoot, { mode: 0o700 });
+      const python = Bun.which("python3") ?? Bun.which("python");
+      expect(python).not.toBeNull();
+      const result = spawnSync(
+        python!,
+        [
+          "-I",
+          "-B",
+          "-c",
+          [
+            "import sys",
+            "from pathlib import Path",
+            "sys.path.insert(0, sys.argv[1])",
+            "import workbench_db as db",
+            "import workbench_scan_start as start",
+            "repository, target_root = map(Path, sys.argv[2:4])",
+            "db.path_is_within = lambda path, directory: True",
+            "try:",
+            "    db.scan_target_root(str(target_root), repository)",
+            "except SystemExit as error:",
+            "    print(error)",
+            "else:",
+            "    raise AssertionError('identity-aliased native root was accepted')",
+            "start.path_is_within = lambda path, directory: True",
+            "start.tempfile.mkdtemp = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError('output created before identity validation'))",
+            "try:",
+            "    start.insert_running_scan(None, scan_id='00000000-0000-0000-0000-000000000001', workspace={}, target=repository, scope='.', diff_target=None, target_identity=('a' * 40, None, 1, 2), target_root=target_root, target_summary=None, scope_file_count=0, timestamp='2026-07-29T00:00:00Z')",
+            "except SystemExit as error:",
+            "    print(error)",
+            "else:",
+            "    raise AssertionError('identity changed before registration')",
+            "assert not any(target_root.iterdir()), 'scan output was created before identity validation'",
+          ].join("\n"),
+          join(PLUGIN_ROOT, "scripts"),
+          repository,
+          targetRoot,
+        ],
+        {
+          encoding: "utf8",
+          env: {
+            ...process.env,
+            CODEX_SECURITY_STATE_DIR: stateDirectory,
+          },
+        },
+      );
+      expect(result.status).toBe(0);
+      expect(result.stderr).toBe("");
+      expect(
+        result.stdout.match(/must be outside the selected target/g),
+      ).toHaveLength(2);
+    },
+  );
+
+  testPosix(
+    "rejects unsafe native scan parents before creating output or writing the database",
+    async () => {
+      const root = await temporaryDirectory();
+      const targetRoot = join(root, "target");
+      await mkdir(targetRoot, { mode: 0o700 });
+      await chmod(root, 0o777);
+      const python = Bun.which("python3") ?? Bun.which("python");
+      expect(python).not.toBeNull();
+      const result = spawnSync(
+        python!,
+        [
+          "-I",
+          "-B",
+          "-c",
+          [
+            "import sys",
+            "from pathlib import Path",
+            "sys.path.insert(0, sys.argv[1])",
+            "import workbench_scan_start as start",
+            "class NoDatabaseWrites:",
+            "    def execute(self, *args, **kwargs):",
+            "        raise AssertionError('database write happened before validation')",
+            "target_root = Path(sys.argv[2])",
+            "try:",
+            "    start.insert_running_scan(NoDatabaseWrites(), scan_id='00000000-0000-0000-0000-000000000001', workspace={}, target=Path('/unused'), scope='.', diff_target=None, target_identity=('a' * 40, None, 1, 2), target_root=target_root, target_summary=None, scope_file_count=0, timestamp='2026-07-29T00:00:00Z')",
+            "except SystemExit as error:",
+            "    print(error)",
+            "else:",
+            "    raise AssertionError('unsafe native scan parent was accepted')",
+            "assert not any(target_root.iterdir()), 'scan output was created before validation'",
+          ].join("\n"),
+          join(PLUGIN_ROOT, "scripts"),
+          targetRoot,
+        ],
+        { encoding: "utf8" },
+      );
+      expect(result.status).toBe(0);
+      expect(result.stderr).toBe("");
+      expect(result.stdout).toContain(
+        "parent directory that other users cannot rewrite",
+      );
+    },
+  );
+
+  test("fails native scan insertion closed on Windows before creating output", () => {
+    const python = Bun.which("python3") ?? Bun.which("python");
+    expect(python).not.toBeNull();
+    const result = spawnSync(
+      python!,
+      [
+        "-I",
+        "-B",
+        "-c",
+        [
+          "import sys",
+          "from pathlib import Path",
+          "sys.path.insert(0, sys.argv[1])",
+          "import workbench_scan_start as start",
+          "target_root = Path('/unused')",
+          "start.os.name = 'nt'",
+          "start.tempfile.mkdtemp = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError('output created before Windows DACL validation'))",
+          "try:",
+          "    start.insert_running_scan(None, scan_id='00000000-0000-0000-0000-000000000001', workspace={}, target=target_root, scope='.', diff_target=None, target_identity=('a' * 40, None, 1, 2), target_root=target_root, target_summary=None, scope_file_count=0, timestamp='2026-07-29T00:00:00Z')",
+          "except SystemExit as error:",
+          "    print(error)",
+          "else:",
+          "    raise AssertionError('native Windows scan was accepted')",
+        ].join("\n"),
+        join(PLUGIN_ROOT, "scripts"),
+      ],
+      { encoding: "utf8" },
+    );
+    expect(result.status).toBe(0);
+    expect(result.stderr).toBe("");
+    expect(result.stdout).toContain(
+      "not supported on Windows until DACL validation is available",
+    );
+  });
+
+  testPosix(
+    "rejects non-private output at TypeScript and authoritative Python boundaries",
+    async () => {
+      expect(() =>
+        requirePrivateOutputDirectory(
+          { mode: 0o40700, uid: 1001 },
+          "/scan",
+          1000,
+        ),
+      ).toThrow("must be owned by the current user");
+      expect(() =>
+        requirePrivateOutputDirectory(
+          { mode: 0o40700, uid: 1000 },
+          "/scan",
+          1000,
+        ),
+      ).not.toThrow();
+
+      const root = await temporaryDirectory();
+      const scanDir = join(root, "scan");
+      await mkdir(scanDir, { mode: 0o755 });
+      const python = Bun.which("python3") ?? Bun.which("python");
+      expect(python).not.toBeNull();
+      const result = spawnSync(
+        python!,
+        [
+          "-I",
+          "-B",
+          "-c",
+          [
+            "import os, sys",
+            "from pathlib import Path",
+            "from types import SimpleNamespace",
+            "sys.path.insert(0, sys.argv[1])",
+            "import workbench_scan_start as start",
+            "scan_dir = Path(sys.argv[2])",
+            "try:",
+            "    start.require_private_scan_directory(scan_dir)",
+            "except SystemExit as error:",
+            "    print(error)",
+            "else:",
+            "    raise AssertionError('world-readable output was accepted')",
+            "start._require_ordinary_directory = lambda path, label: SimpleNamespace(st_mode=0o40700, st_uid=os.geteuid() + 1)",
+            "start.require_private_directory_acl = lambda path: None",
+            "try:",
+            "    start.require_private_scan_directory(scan_dir)",
+            "except SystemExit as error:",
+            "    print(error)",
+            "else:",
+            "    raise AssertionError('wrong-owner output was accepted')",
+          ].join("\n"),
+          join(PLUGIN_ROOT, "scripts"),
+          scanDir,
+        ],
+        { encoding: "utf8" },
+      );
+      expect(result.status).toBe(0);
+      expect(result.stderr).toBe("");
+      expect(result.stdout).toContain("chmod 700");
+      expect(result.stdout).toContain("owned by the current user");
+    },
+  );
 
   test("archives a non-empty private output directory", async () => {
     const root = await temporaryDirectory();
@@ -1324,41 +2963,60 @@ describe("runtime directories and plugin Python boundary", () => {
     );
     await expect(stat(preview!)).rejects.toThrow();
 
-    let archived: string | undefined;
     expect(
-      await prepareOutputDir(
-        output,
-        "repo",
-        undefined,
-        undefined,
-        true,
-        (archiveDir) => {
-          archived = archiveDir;
-        },
-      ),
+      await prepareOutputDir(output, "repo", undefined, undefined, true),
     ).toBe(output);
-    expect(archived?.startsWith(`${output}.previous-`)).toBe(true);
-    expect(await readFile(join(archived!, "previous.txt"), "utf8")).toBe(
+    expect(await readFile(join(output, "previous.txt"), "utf8")).toBe(
       "previous scan\n",
     );
-    expect(await readdir(output)).toEqual([]);
+    expect(
+      (await readdir(root)).filter((name) => name.startsWith("scan.previous-")),
+    ).toEqual([]);
     if (process.platform !== "win32") {
       expect((await stat(output)).mode & 0o777).toBe(0o700);
 
       const linkedOutput = join(root, "linked-scan");
-      await symlink(archived!, linkedOutput);
+      await symlink(output, linkedOutput);
       await expect(validateOutputDir(linkedOutput, true)).rejects.toThrow(
         "not a directory",
       );
 
-      await chmod(archived!, 0o770);
-      await expect(validateOutputDir(archived!, true)).rejects.toThrow(
-        "must not be accessible to other users",
+      await chmod(output, 0o770);
+      await expect(validateOutputDir(output, true)).rejects.toThrow(
+        "owner-only read, write, and execute permissions",
       );
-      await chmod(archived!, 0o700);
+      await chmod(output, 0o700);
     }
 
-    expect(await planOutputArchive(output)).toBeNull();
+    expect(
+      (await planOutputArchive(output))?.startsWith(`${output}.previous-`),
+    ).toBe(true);
+
+    if (process.platform !== "win32") {
+      const sharedParent = join(root, "shared-parent");
+      const sharedOutput = join(sharedParent, "scan");
+      const emptySharedOutput = join(sharedParent, "empty-scan");
+      await mkdir(sharedParent, { mode: 0o700 });
+      await mkdir(sharedOutput, { mode: 0o700 });
+      await mkdir(emptySharedOutput, { mode: 0o700 });
+      await writeFile(join(sharedOutput, "previous.txt"), "previous scan\n");
+      await chmod(sharedParent, 0o777);
+      await expect(prepareOutputDir(emptySharedOutput, "repo")).rejects.toThrow(
+        "parent directory that other users cannot rewrite",
+      );
+      await expect(
+        prepareOutputDir(sharedOutput, "repo", undefined, undefined, true),
+      ).rejects.toThrow("parent directory that other users cannot rewrite");
+      const sticky = spawnSync("/bin/chmod", ["1777", sharedParent], {
+        encoding: "utf8",
+      });
+      expect(sticky.status).toBe(0);
+      expect(sticky.stderr).toBe("");
+      expect(await prepareOutputDir(emptySharedOutput, "repo")).toBe(
+        emptySharedOutput,
+      );
+      await chmod(sharedParent, 0o700);
+    }
   });
 
   test("validates explicit output directories and creates private temporary paths", async () => {
@@ -1381,13 +3039,13 @@ describe("runtime directories and plugin Python boundary", () => {
     if (process.platform !== "win32") {
       const callerOwned = join(root, "caller-owned");
       await mkdir(callerOwned, { mode: 0o700 });
-      for (const mode of [0o770, 0o777]) {
+      for (const mode of [0o500, 0o770, 0o777]) {
         await chmod(callerOwned, mode);
         await expect(validateOutputDir(callerOwned)).rejects.toThrow(
-          "must not be accessible to other users",
+          "owner-only read, write, and execute permissions",
         );
         await expect(prepareOutputDir(callerOwned, "repo")).rejects.toThrow(
-          "must not be accessible to other users",
+          "owner-only read, write, and execute permissions",
         );
       }
       await chmod(callerOwned, 0o700);

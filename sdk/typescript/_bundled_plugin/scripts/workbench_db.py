@@ -80,11 +80,20 @@ from workbench_constants import (
 )
 from workbench_feedback import get_scan_feedback
 from workbench_scan_start import (
+    archive_scan,
     compact_timestamp,
     insert_running_scan,
+    path_is_within,
+    prepare_private_state_directory,
+    recover_archive_journal,
+    recover_pending_archives,
+    require_archive_journal_root,
+    require_private_scan_directory,
+    require_safe_scan_parents,
     safe_segment,
     scan_diff_identity,
     scan_target_identity,
+    validate_archive_guard,
 )
 from workbench_schema import MIGRATIONS, normalize_pre_release_migrations, sql_statements
 from workbench_source_excerpt import finding_source_excerpt
@@ -230,8 +239,13 @@ def release_completion_file_lock(descriptor: int) -> None:
 
 
 def connect() -> sqlite3.Connection:
+    if os.name == "nt":
+        raise SystemExit(
+            "Private scan output is not supported on Windows until DACL validation is available."
+        )
     path = database_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
+    private_state_dir = prepare_private_state_directory(path.parent)
+    path = private_state_dir / path.name
     for attempt in range(SQLITE_RETRY_ATTEMPTS):
         connection = sqlite3.connect(path, timeout=5)
         try:
@@ -240,6 +254,7 @@ def connect() -> sqlite3.Connection:
             connection.execute("PRAGMA busy_timeout = 5000")
             apply_migrations(connection)
             connection.execute("PRAGMA journal_mode = WAL")
+            recover_pending_archives(connection, state_dir() / "archive-journal")
             path.chmod(0o600)
             return connection
         except sqlite3.OperationalError as exc:
@@ -247,6 +262,9 @@ def connect() -> sqlite3.Connection:
             if attempt == SQLITE_RETRY_ATTEMPTS - 1 or not sqlite_busy(exc):
                 raise
             time.sleep(0.05 * (2**attempt))
+        except BaseException:
+            connection.close()
+            raise
     raise AssertionError("SQLite retry loop exhausted unexpectedly.")
 
 
@@ -1095,12 +1113,75 @@ def set_diff_target(connection: sqlite3.Connection, args: argparse.Namespace) ->
     return workspace_state(connection, workspace["id"])
 
 
+def require_state_outside_target(target: str | Path) -> None:
+    resolved_target = Path(target).expanduser().resolve()
+    if path_is_within(state_dir(), resolved_target):
+        raise SystemExit(
+            "The workbench state directory must be outside the selected target."
+        )
+
+
 def scan_target_root(scan_root: str | None, target: Path) -> Path:
+    if os.name == "nt":
+        raise SystemExit(
+            "Private scan output is not supported on Windows until DACL validation is available."
+        )
     root = Path(scan_root).expanduser().resolve() if scan_root else state_dir() / "scans"
     target_root = (root / safe_segment(target.name)).resolve()
-    if target_root == target or target in target_root.parents:
+    if path_is_within(target_root, target):
         raise SystemExit("The scan artifact directory must be outside the selected target.")
+    require_output_outside_archive_journal(target_root, state_dir())
     return target_root
+
+
+def prepare_native_scan_target_root(target_root: Path) -> None:
+    if os.name == "nt":
+        raise SystemExit(
+            "Private scan output is not supported on Windows until DACL validation is available."
+        )
+    require_output_outside_archive_journal(target_root, state_dir())
+    existing_ancestor = target_root
+    missing_segments: list[str] = []
+    while True:
+        try:
+            existing_ancestor.lstat()
+            break
+        except FileNotFoundError:
+            parent = existing_ancestor.parent
+            if parent == existing_ancestor:
+                raise SystemExit("Scan output parent must be an existing ordinary directory.")
+            missing_segments.append(existing_ancestor.name)
+            existing_ancestor = parent
+        except OSError as exc:
+            raise SystemExit(
+                "Scan output parent must be an existing ordinary directory."
+            ) from exc
+    require_safe_scan_parents(
+        existing_ancestor,
+        allow_immediate_trusted_sticky=True,
+    )
+    current = existing_ancestor
+    created_directories: list[Path] = []
+    try:
+        for segment in reversed(missing_segments):
+            current = current / segment
+            try:
+                current.mkdir(mode=0o700)
+                created_directories.append(current)
+                current.chmod(0o700)
+            except FileExistsError:
+                pass
+        require_safe_scan_parents(
+            target_root,
+            allow_immediate_trusted_sticky=False,
+        )
+    except BaseException:
+        for created_directory in reversed(created_directories):
+            try:
+                created_directory.rmdir()
+            except OSError:
+                pass
+        raise
 
 
 def start_scan(connection: sqlite3.Connection, args: argparse.Namespace) -> dict[str, Any]:
@@ -1124,6 +1205,7 @@ def start_scan(connection: sqlite3.Connection, args: argparse.Namespace) -> dict
         scan_id = str(uuid.uuid4())
         timestamp = now()
         target = require_target(workspace["target_path"])
+        require_state_outside_target(target)
         require_scannable_target(target)
         target_metadata = target.stat()
         scope = require_scope(workspace["default_scope"], workspace["default_mode"], target)
@@ -1150,7 +1232,7 @@ def start_scan(connection: sqlite3.Connection, args: argparse.Namespace) -> dict
             metadata=target_metadata,
         )
         target_root = scan_target_root(args.scan_root, target)
-        target_root.mkdir(parents=True, exist_ok=True)
+        prepare_native_scan_target_root(target_root)
         if manages_transaction:
             connection.execute("BEGIN IMMEDIATE")
         workspace = require_workspace(connection, workspace_id)
@@ -1227,6 +1309,7 @@ def start_prompt_only_scan(
         args.diff_content_digest,
     )
     target = Path(inspected["target"]["targetPath"])
+    require_state_outside_target(target)
     target_path = str(target)
     scope = inspected["scope"]
     diff_target = inspected["diffTarget"]
@@ -1296,7 +1379,7 @@ def start_prompt_only_scan(
         if existing is not None:
             connection.commit()
             return {**scan_context(connection, existing["id"]), "startDisposition": "joined"}
-        target_root.mkdir(parents=True, exist_ok=True)
+        prepare_native_scan_target_root(target_root)
         workspace_id = str(uuid.uuid4())
         scan_id = str(uuid.uuid4())
         timestamp = now()
@@ -1426,6 +1509,11 @@ def complete_scan_locked(
     scan = require_scan(connection, scan_id)
     if scan["status"] == "complete":
         scan_dir = require_canonical_scan_directory(Path(scan["scan_dir"]))
+        require_private_scan_directory(scan_dir)
+        require_safe_scan_parents(
+            scan_dir.parent,
+            allow_immediate_trusted_sticky=True,
+        )
         require_recorded_manifest_digest(scan, scan_dir)
         verify_manifest_binding(scan, read_json_object(scan_dir / ARTIFACTS["manifest"]))
         try:
@@ -1450,11 +1538,16 @@ def complete_scan_locked(
     )
     if scan["recipe_json"] is None:
         deep_scan.require_deep_scan_ready_for_parent_completion(connection, scan)
-    warnings = []
+    target_warnings = []
     warning = scan_target_warning(scan)
     if warning is not None:
-        warnings.append(warning)
+        target_warnings.append(warning)
     scan_dir = require_canonical_scan_directory(Path(scan["scan_dir"]))
+    require_private_scan_directory(scan_dir)
+    require_safe_scan_parents(
+        scan_dir.parent,
+        allow_immediate_trusted_sticky=True,
+    )
     operation_timestamp = now()
     completion_binding = workbench_completion_binding(scan, operation_timestamp)
     manifest = read_json_object(artifact_path(scan_dir, ARTIFACTS["manifest"], required=True))
@@ -1464,14 +1557,20 @@ def complete_scan_locked(
         completion_binding["completedAt"] = manifest_scan.get("completedAt")
     scan_completed_at = completion_binding["completedAt"]
     try:
-        prepared = _prepare_scan_finalization(
-            scan_dir,
-            expected_coverage_mode=expected_coverage_mode(scan),
-            completion_binding=completion_binding,
-        )
-        warning = scan_target_warning(scan)
-        if warning is not None and warning not in warnings:
-            warnings.append(warning)
+        for _ in range(3):
+            warnings = list(target_warnings)
+            prepared = _prepare_scan_finalization(
+                scan_dir,
+                expected_coverage_mode=expected_coverage_mode(scan),
+                completion_binding=completion_binding,
+                completion_warnings=warnings,
+            )
+            warning = scan_target_warning(scan)
+            if warning is None or warning in target_warnings:
+                break
+            target_warnings.append(warning)
+        else:
+            raise SystemExit("Scan target changed repeatedly while completion was being prepared.")
         manifest, findings, _ = _write_prepared_scan_finalization(prepared)
     except ContractError as exc:
         raise SystemExit(str(exc)) from exc
@@ -1553,14 +1652,37 @@ def complete_scan_locked(
     return scan_context(connection, scan["id"])
 
 
+def require_output_outside_archive_journal(
+    scan_dir: Path, workbench_state_dir: Path
+) -> None:
+    archive_journal_root = require_archive_journal_root(
+        workbench_state_dir / "archive-journal"
+    )
+    if path_is_within(scan_dir, archive_journal_root):
+        raise SystemExit(
+            "The scan artifact directory cannot use the workbench archive-journal directory or its descendants."
+        )
+
+
 def register_cli_scan(connection: sqlite3.Connection, args: argparse.Namespace) -> dict[str, Any]:
     repository = require_target(args.repository)
+    require_state_outside_target(repository)
     require_scannable_target(repository)
     scan_dir = require_canonical_scan_directory(Path(args.scan_dir).expanduser())
-    if scan_dir == repository or repository in scan_dir.parents:
+    require_private_scan_directory(scan_dir)
+    require_safe_scan_parents(
+        scan_dir.parent,
+        allow_immediate_trusted_sticky=not args.archive_existing,
+    )
+    if path_is_within(scan_dir, repository):
         raise SystemExit("The scan artifact directory must be outside the selected target.")
-    if next(scan_dir.iterdir(), None) is not None:
-        raise SystemExit("The scan artifact directory must be empty before the scan starts.")
+    workbench_state_dir = state_dir()
+    archive_journal_root = workbench_state_dir / "archive-journal"
+    if path_is_within(workbench_state_dir, scan_dir):
+        raise SystemExit(
+            "The scan artifact directory cannot contain the workbench state directory."
+        )
+    require_output_outside_archive_journal(scan_dir, workbench_state_dir)
 
     recipe = parse_scan_recipe(args.recipe_json, repository)
     requested_target = recipe["target"]
@@ -1601,13 +1723,42 @@ def register_cli_scan(connection: sqlite3.Connection, args: argparse.Namespace) 
     scan_id = str(uuid.uuid4())
     workspace_id = str(uuid.uuid4())
 
+    archived_scan_dir: Path | None = None
+    archive_journal: Path | None = None
+    archive_guard: tuple[os.stat_result, os.stat_result] | None = None
     connection.execute("BEGIN IMMEDIATE")
     try:
+        scan_dir = require_canonical_scan_directory(scan_dir)
+        require_private_scan_directory(scan_dir)
+        require_safe_scan_parents(
+            scan_dir.parent,
+            allow_immediate_trusted_sticky=not args.archive_existing,
+        )
+        if path_is_within(scan_dir, repository):
+            raise SystemExit("The scan artifact directory must be outside the selected target.")
+        if path_is_within(workbench_state_dir, scan_dir):
+            raise SystemExit(
+                "The scan artifact directory cannot contain the workbench state directory."
+            )
+        require_output_outside_archive_journal(scan_dir, workbench_state_dir)
+        recover_pending_archives(
+            connection,
+            archive_journal_root,
+            transaction_open=True,
+        )
         target_id = ensure_security_target(connection, str(repository))
         if parent_scan_id is not None:
             parent = require_scan(connection, parent_scan_id)
             if parent["target_id"] != target_id:
                 raise SystemExit("A rerun must belong to the same repository as its parent scan.")
+        archived_scan_dir, archive_journal, archive_guard = archive_scan(
+            connection,
+            args,
+            scan_dir,
+            timestamp,
+            new_scan_id=scan_id,
+            journal_root=archive_journal_root,
+        )
 
         connection.execute(
             """
@@ -1653,11 +1804,33 @@ def register_cli_scan(connection: sqlite3.Connection, args: argparse.Namespace) 
                 scan_id,
             ),
         )
+        if archived_scan_dir is not None and archive_guard is not None:
+            validate_archive_guard(scan_dir, archived_scan_dir, archive_guard)
         connection.commit()
     except BaseException:
         connection.rollback()
+        if archive_journal is not None:
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                recover_archive_journal(connection, archive_journal)
+                connection.commit()
+            except BaseException as recovery_error:
+                connection.rollback()
+                raise SystemExit(
+                    f"Scan registration failed and requires archive recovery from {archive_journal}."
+                ) from recovery_error
         raise
-    return {"scanDir": str(scan_dir), "scanId": scan_id, "targetId": target_id}
+    if archive_journal is not None:
+        try:
+            archive_journal.unlink()
+        except OSError:
+            pass
+    return {
+        **({"archivedScanDir": str(archived_scan_dir)} if archived_scan_dir is not None else {}),
+        "scanDir": str(scan_dir),
+        "scanId": scan_id,
+        "targetId": target_id,
+    }
 
 
 def parse_scan_recipe(value: str, repository: Path) -> dict[str, Any]:
@@ -3502,7 +3675,7 @@ def artifact_path(scan_dir: Path, file_name: str, *, required: bool) -> Path | N
         raise SystemExit(
             f"{file_name}: expected a regular file inside the scan directory."
         ) from exc
-    if resolved != candidate or not candidate.is_file():
+    if os.path.normcase(resolved) != os.path.normcase(candidate) or not candidate.is_file():
         raise SystemExit(f"{file_name}: expected a regular non-symlink file.")
     return resolved
 
@@ -3516,7 +3689,9 @@ def require_canonical_scan_directory(scan_dir: Path) -> Path:
         raise SystemExit(
             "Scan directory must be an existing canonical non-symlink directory."
         ) from exc
-    if not stat.S_ISDIR(metadata.st_mode) or resolved != scan_dir:
+    if not stat.S_ISDIR(metadata.st_mode) or os.path.normcase(resolved) != os.path.normcase(
+        scan_dir
+    ):
         raise SystemExit("Scan directory must be an existing canonical non-symlink directory.")
     return scan_dir
 
@@ -3536,6 +3711,38 @@ def read_json_object(path: Path) -> dict[str, Any]:
 
 def reject_non_finite_json(value: str) -> None:
     raise ValueError(f"non-finite JSON number {value!r} is not supported")
+
+
+def _start_scan_target_before_connect(workspace_id: str) -> str | None:
+    path = database_path()
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return None
+    if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+        return None
+    try:
+        uri = f"{path.resolve(strict=True).as_uri()}?mode=ro"
+        with closing(sqlite3.connect(uri, uri=True)) as connection:
+            row = connection.execute(
+                "SELECT target_path FROM workspaces WHERE id = ?",
+                (workspace_id,),
+            ).fetchone()
+    except (OSError, sqlite3.Error):
+        return None
+    if row is None or not isinstance(row[0], str) or not row[0]:
+        return None
+    return row[0]
+
+
+def require_preconnect_state_outside_target(args: argparse.Namespace) -> None:
+    target = getattr(args, "target_path", None) or getattr(args, "repository", None)
+    if target is None and args.command == "start-scan":
+        target = _start_scan_target_before_connect(args.workspace_id)
+    if target is not None:
+        require_state_outside_target(target)
 
 
 def main() -> None:
@@ -3564,6 +3771,12 @@ def main() -> None:
         result = inspect_setup(args)
         print(json.dumps(result, allow_nan=False, sort_keys=True))
         return
+    require_preconnect_state_outside_target(args)
+    if args.command == "register-cli-scan":
+        require_output_outside_archive_journal(
+            require_canonical_scan_directory(Path(args.scan_dir).expanduser()),
+            state_dir(),
+        )
     with closing(connect()) as connection:
         if args.command == "get-setup-preference":
             result = setup_preference(connection)
