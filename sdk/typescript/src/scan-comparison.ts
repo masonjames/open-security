@@ -8,6 +8,7 @@ import {
   type TurnOptions,
 } from "@openai/codex-sdk";
 import { z } from "incur";
+import { accountStatus } from "./auth.js";
 import { rejectUnsupportedScanCostLimit } from "./cost.js";
 import { CodexSecurityError } from "./errors.js";
 import { fetchOpenRouterModel } from "./openrouter-models.js";
@@ -16,6 +17,12 @@ import {
   resolveProviderSelection,
   type ScanProvider,
 } from "./provider.js";
+import {
+  codexSecurityCredentialAllowsAmbientImport,
+  codexSecurityCredentialHome,
+  prepareCodexSecurityCredentialHome,
+  resolveCodexCommand,
+} from "./runtime.js";
 
 type Finding = { occurrenceId: string } & Record<string, unknown>;
 
@@ -98,7 +105,12 @@ export async function matchScanFindings(
   const codex =
     options.codex ??
     new Codex({
-      env: comparisonEnvironment(selection.provider, environment),
+      env: await comparisonEnvironment(
+        environment,
+        accountStatus,
+        options.signal,
+        selection.provider,
+      ),
       config: {
         allow_login_shell: false,
         "features.apps": false,
@@ -161,15 +173,55 @@ function comparisonPrompt(input: ScanComparisonInput): string {
   ].join("\n");
 }
 
-function comparisonEnvironment(
-  provider: ScanProvider,
+export async function comparisonEnvironment(
   source: NodeJS.ProcessEnv = process.env,
-): Record<string, string> {
+  nativeAccountStatus: typeof accountStatus = accountStatus,
+  signal?: AbortSignal,
+  provider: ScanProvider = "openai",
+): Promise<Record<string, string>> {
+  signal?.throwIfAborted();
   const environment = Object.fromEntries(
-    Object.entries(source).filter(
+    Object.entries(modelProviderExecutionEnvironment(provider, source)).filter(
       (entry): entry is [string, string] => entry[1] !== undefined,
     ),
   );
+  if (
+    Object.entries(environment).some(
+      ([name, value]) =>
+        ["OPENAI_API_KEY", "CODEX_API_KEY"].includes(name.toUpperCase()) &&
+        value.trim().length > 0,
+    )
+  ) {
+    return environment;
+  }
+  const credentialHome = codexSecurityCredentialHome(source);
+  if (existsSync(credentialHome)) {
+    const canonicalCredentialHome =
+      await prepareCodexSecurityCredentialHome(source);
+    signal?.throwIfAborted();
+    const storedEnvironment: Record<string, string> = {
+      ...environment,
+      CODEX_HOME: canonicalCredentialHome,
+    };
+    for (const key of Object.keys(storedEnvironment)) {
+      if (["OPENAI_API_KEY", "CODEX_API_KEY"].includes(key.toUpperCase())) {
+        delete storedEnvironment[key];
+      }
+    }
+    const status = await nativeAccountStatus(
+      resolveCodexCommand(),
+      storedEnvironment,
+      signal,
+    );
+    if (status.authenticated) return storedEnvironment;
+    if (
+      !(await codexSecurityCredentialAllowsAmbientImport(
+        canonicalCredentialHome,
+      ))
+    ) {
+      return storedEnvironment;
+    }
+  }
   const configuredHome = environment["CODEX_HOME"]?.trim();
   const codexHome = configuredHome
     ? configuredHome === "~"
@@ -185,11 +237,7 @@ function comparisonEnvironment(
       }
     }
   }
-  return Object.fromEntries(
-    Object.entries(
-      modelProviderExecutionEnvironment(provider, environment),
-    ).filter((entry): entry is [string, string] => entry[1] !== undefined),
-  );
+  return environment;
 }
 
 function validateComparison(

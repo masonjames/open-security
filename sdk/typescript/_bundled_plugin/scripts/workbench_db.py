@@ -93,6 +93,7 @@ from workbench_scan_start import (
     safe_segment,
     scan_diff_identity,
     scan_target_identity,
+    stored_diff_target,
     validate_archive_guard,
 )
 from workbench_schema import MIGRATIONS, normalize_pre_release_migrations, sql_statements
@@ -536,19 +537,6 @@ def authoritative_target_kind(scan: sqlite3.Row) -> str:
     raise SystemExit(
         "Workbench target contract does not identify one authoritative target kind."
     )
-
-
-def stored_diff_target(row: sqlite3.Row) -> dict[str, str] | None:
-    if not row["diff_target_kind"]:
-        return None
-    target = {
-        "baseRevision": row["diff_base_revision"],
-        "headRevision": row["diff_head_revision"],
-        "kind": row["diff_target_kind"],
-    }
-    if row["diff_content_digest"]:
-        target["contentDigest"] = row["diff_content_digest"]
-    return target
 
 
 def requested_scan_paths(scan: sqlite3.Row) -> list[str]:
@@ -1474,11 +1462,15 @@ def pin_legacy_manifest_digest(
         raise
 
 
-def complete_scan(connection: sqlite3.Connection, args: argparse.Namespace) -> dict[str, Any]:
+def complete_scan(
+    connection: sqlite3.Connection, args: argparse.Namespace, *, prepare_only: bool = False
+) -> dict[str, Any]:
     scan_id = require_uuid(args.scan_id, "scan-id")
-    cost_json = parse_scan_cost(args.cost_json)
+    cost_json = None if prepare_only else parse_scan_cost(args.cost_json)
     with scan_completion_lock(scan_id):
-        return complete_scan_locked(connection, scan_id, args.claim_token, cost_json)
+        return complete_scan_locked(
+            connection, scan_id, args.claim_token, cost_json, prepare_only=prepare_only
+        )
 
 
 def _scan_allows_completion(scan: sqlite3.Row) -> bool:
@@ -1505,6 +1497,8 @@ def complete_scan_locked(
     scan_id: str,
     claim_token: str | None,
     cost_json: str | None,
+    *,
+    prepare_only: bool = False,
 ) -> dict[str, Any]:
     scan = require_scan(connection, scan_id)
     if scan["status"] == "complete":
@@ -1538,9 +1532,9 @@ def complete_scan_locked(
     )
     if scan["recipe_json"] is None:
         deep_scan.require_deep_scan_ready_for_parent_completion(connection, scan)
-    target_warnings = []
+    target_warnings = json.loads(scan["completion_warnings_json"])
     warning = scan_target_warning(scan)
-    if warning is not None:
+    if warning is not None and warning not in target_warnings:
         target_warnings.append(warning)
     scan_dir = require_canonical_scan_directory(Path(scan["scan_dir"]))
     require_private_scan_directory(scan_dir)
@@ -1548,6 +1542,21 @@ def complete_scan_locked(
         scan_dir.parent,
         allow_immediate_trusted_sticky=True,
     )
+    prepared_manifest_digest = scan["completion_prepared_manifest_digest"]
+    prepared_at = scan["completion_prepared_at"]
+    if not prepare_only:
+        if (
+            not isinstance(prepared_manifest_digest, str)
+            or re.fullmatch(r"sha256:[a-f0-9]{64}", prepared_manifest_digest) is None
+            or not isinstance(prepared_at, str)
+            or not prepared_at
+        ):
+            raise SystemExit("Scan completion must be prepared before it can be published.")
+        if (
+            scan_local_file_digest(scan_dir, ARTIFACTS["manifest"])
+            != prepared_manifest_digest
+        ):
+            raise SystemExit("The prepared scan manifest changed before completion.")
     operation_timestamp = now()
     completion_binding = workbench_completion_binding(scan, operation_timestamp)
     manifest = read_json_object(artifact_path(scan_dir, ARTIFACTS["manifest"], required=True))
@@ -1579,9 +1588,40 @@ def complete_scan_locked(
         for kind, filename in ARTIFACTS.items()
     }
     manifest_digest = published_manifest_digest(scan_dir, manifest)
+    if prepare_only:
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            updated = connection.execute(
+                """
+                UPDATE scans
+                SET completion_warnings_json = ?,
+                    completion_prepared_manifest_digest = ?,
+                    completion_prepared_at = ?
+                WHERE id = ? AND status = ? AND updated_at = ? AND canceled_at IS NULL
+                """,
+                (
+                    json.dumps(warnings),
+                    manifest_digest,
+                    operation_timestamp,
+                    scan["id"],
+                    admitted_status,
+                    admitted_updated_at,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise SystemExit(
+                    "Only a running or non-canceled failed scan can be prepared for completion."
+                )
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+        return scan_context(connection, scan["id"])
+    if manifest_digest != prepared_manifest_digest:
+        raise SystemExit("The prepared scan manifest changed before completion.")
     connection.execute("BEGIN IMMEDIATE")
     try:
-        timestamp = operation_timestamp
+        timestamp = manifest["scan"]["completedAt"]
         scan = require_scan(connection, scan["id"])
         if scan["status"] == "complete":
             connection.commit()
@@ -1592,6 +1632,16 @@ def complete_scan_locked(
             updated_at=admitted_updated_at,
         ):
             raise SystemExit("Scan state changed while completion was in progress.")
+        if (
+            scan["completion_prepared_manifest_digest"] != prepared_manifest_digest
+            or scan["completion_prepared_at"] != prepared_at
+        ):
+            raise SystemExit("Scan completion preparation changed before publication.")
+        if (
+            scan_local_file_digest(scan_dir, ARTIFACTS["manifest"])
+            != prepared_manifest_digest
+        ):
+            raise SystemExit("The prepared scan manifest changed before completion.")
         if scan["recipe_json"] is None:
             deep_scan.require_deep_scan_ready_for_parent_completion(connection, scan)
         handoff.require_current_continuation(
@@ -1629,8 +1679,10 @@ def complete_scan_locked(
             UPDATE scans
             SET status = 'complete', phase = 'reporting', completed_at = ?, updated_at = ?,
                 seal_manifest_digest = ?, cost_json = ?, completion_warnings_json = ?,
+                completion_prepared_manifest_digest = NULL, completion_prepared_at = NULL,
                 failure_message = NULL, canceled_at = NULL
             WHERE id = ? AND status = ? AND updated_at = ? AND canceled_at IS NULL
+                AND completion_prepared_manifest_digest = ? AND completion_prepared_at = ?
             """,
             (
                 scan_completed_at,
@@ -1641,6 +1693,8 @@ def complete_scan_locked(
                 scan["id"],
                 admitted_status,
                 admitted_updated_at,
+                prepared_manifest_digest,
+                prepared_at,
             ),
         )
         if updated.rowcount != 1:
@@ -1825,11 +1879,14 @@ def register_cli_scan(connection: sqlite3.Connection, args: argparse.Namespace) 
             archive_journal.unlink()
         except OSError:
             pass
+    scan = require_scan(connection, scan_id)
     return {
         **({"archivedScanDir": str(archived_scan_dir)} if archived_scan_dir is not None else {}),
+        "contract": scan_contract(scan),
         "scanDir": str(scan_dir),
         "scanId": scan_id,
         "targetId": target_id,
+        "targetRevision": scan["target_revision"],
     }
 
 
@@ -1936,6 +1993,15 @@ def fail_scan_locked(
         timestamp = now()
         scan = require_scan(connection, scan_id)
         if scan["status"] == "failed":
+            connection.execute(
+                """
+                UPDATE scans
+                SET completion_prepared_manifest_digest = NULL,
+                    completion_prepared_at = NULL
+                WHERE id = ?
+                """,
+                (scan["id"],),
+            )
             connection.commit()
             return scan_context(connection, scan["id"])
         if scan["status"] == "complete":
@@ -1949,7 +2015,8 @@ def fail_scan_locked(
             """
             UPDATE scans
             SET status = 'failed', failure_message = ?, completed_at = ?, updated_at = ?,
-                cost_json = ?
+                cost_json = ?, completion_prepared_manifest_digest = NULL,
+                completion_prepared_at = NULL
             WHERE id = ? AND status = 'running'
             """,
             (message, timestamp, timestamp, cost_json, scan["id"]),
@@ -1999,7 +2066,8 @@ def cancel_scan_locked(
         updated = connection.execute(
             """
             UPDATE scans
-            SET status = 'failed', canceled_at = ?, completed_at = ?, updated_at = ?
+            SET status = 'failed', canceled_at = ?, completed_at = ?, updated_at = ?,
+                completion_prepared_manifest_digest = NULL, completion_prepared_at = NULL
             WHERE id = ? AND status = 'running'
             """,
             (timestamp, timestamp, timestamp, scan["id"]),
@@ -3873,8 +3941,10 @@ def main() -> None:
                 require_scan=require_scan,
                 scan_context=scan_context,
             )
-        elif args.command == "complete-scan":
-            result = complete_scan(connection, args)
+        elif args.command in {"prepare-scan-completion", "complete-scan"}:
+            result = complete_scan(
+                connection, args, prepare_only=args.command == "prepare-scan-completion"
+            )
         elif args.command == "cancel-scan":
             result = cancel_scan(connection, args)
         elif args.command == "fail-scan":

@@ -610,6 +610,17 @@ MIGRATIONS = (
         ADD COLUMN completion_warnings_json TEXT NOT NULL DEFAULT '[]';
         """,
     ),
+    (
+        26,
+        "bind prepared scan completions",
+        """
+        ALTER TABLE scans
+        ADD COLUMN completion_prepared_manifest_digest TEXT;
+
+        ALTER TABLE scans
+        ADD COLUMN completion_prepared_at TEXT;
+        """,
+    ),
 )
 
 

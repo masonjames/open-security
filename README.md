@@ -5,6 +5,8 @@ Open Security is a provider-flexible security scanner CLI and TypeScript SDK. It
 > [!IMPORTANT]
 > Open Security is not an OpenAI product and is not affiliated with or endorsed by OpenAI. The internal `codex-security` plugin, artifact schemas, and TypeScript `CodexSecurity` class retain their upstream names for compatibility.
 
+**See the [Codex Security documentation](https://learn.chatgpt.com/docs/security/cli)** for more details.
+
 ## Current provider support
 
 | Provider   | Authentication                                        | Model selection                       | Pricing source                                         |
@@ -16,10 +18,11 @@ OpenRouter uses a fixed `https://openrouter.ai/api/v1` Responses API upstream. S
 
 ## Requirements
 
-- Node.js 22 or later
+- Node.js 22.13.0 or later in the 22.x release line, Node.js 24.x, or Node.js 26.x
 - Python 3.10 or later
 - pnpm 11.9.0 through Corepack
 - Permission to assess the repository being scanned
+- Access to the selected model provider
 
 ## Run from source
 
@@ -33,6 +36,14 @@ node sdk/typescript/bin/codex-security.mjs --help
 ```
 
 The package manifest declares `open-security` as the canonical executable and preserves `codex-security` as a backward-compatible alias. The package is not published to npm yet; use the source launcher or a locally packed tarball. The source launcher keeps its upstream filename to reduce merge conflicts.
+
+For CI, set `OPENAI_API_KEY` or `CODEX_API_KEY` instead of signing in. Environment API keys are
+passed directly to the current scan and are never stored in Codex's credential
+home or system keyring.
+
+Local sign-in honors Codex's configured credential backend, including a system
+keyring required by a managed device. Codex Security keeps login and scan
+credentials in the same private, persistent state directory.
 
 Until you install a local tarball or link the package, replace `open-security` in the examples below with `node sdk/typescript/bin/codex-security.mjs`.
 
@@ -158,6 +169,10 @@ try {
 ```
 
 See [sdk/typescript/README.md](sdk/typescript/README.md) for scan modes, history, exports, CI behavior, and the full SDK surface.
+
+For complete command help, runtime defaults, native multi-agent worker limits,
+environment variables, deep-scan configuration, and SDK options, also see the
+[official CLI reference](https://learn.chatgpt.com/docs/security/cli/reference).
 
 ## Development
 

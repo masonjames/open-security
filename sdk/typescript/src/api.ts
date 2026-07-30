@@ -95,22 +95,29 @@ import {
 } from "./worker-progress.js";
 import { CODEX_EXECUTABLE_VERSION, CODEX_SDK_VERSION } from "./version.js";
 import {
+  acquireCodexSecurityCredentialHomeLock,
   bootstrapPlugin,
   cleanupSdkDirectory,
+  codexSecurityCredentialAllowsAmbientImport,
+  codexSecurityHasStoredFileCredentials,
   codexSecurityStateDirectory,
   createIsolatedHome,
   importAmbientAuth,
+  prepareCodexSecurityCredentialHome,
+  preserveCodexSecurityPluginRegistration,
   pluginExecutionEnvironment,
   planOutputArchive,
   prepareOutputDir,
   preparePersistentScanRoot,
   preparePrivateDirectoryPath,
   requireModelSafeOutputDir,
+  requirePrivateOutputDirectory,
   requirePrivateScanPlatformSupport,
   resolveCodexCommand,
   resolvePluginPath,
   resolvePluginPython,
   runWorkbench,
+  setCodexSecurityCredentialLogout,
   type CodexCommand,
   type PluginInstall,
   type ProcessEnvironment,
@@ -153,6 +160,7 @@ interface CodexClientLike {
 
 interface PreparedRuntime {
   codexHome: string;
+  persistentCredentialHome?: boolean;
   bootstrapWorkspace?: string;
   configPath?: string;
   plugin: PluginInstall;
@@ -297,6 +305,8 @@ const DEFAULT_DEPENDENCIES: ClientDependencies = {
 };
 
 const SCAN_PERMISSION_PROFILE = "codex_security_scan";
+const SNAPSHOT_DIGEST_PATTERN =
+  /^codex-security-snapshot\/v1:sha256:[a-f0-9]{64}$/;
 const CANONICAL_SCAN_DRAFTS = [
   "scan-manifest.json",
   "findings.json",
@@ -461,6 +471,8 @@ export class CodexSecurity {
     let targetPathsFile: string | null = null;
     let knowledgeBase: PreparedKnowledgeBase | null = null;
     let costTracker: ScanCostTracker | null = null;
+    let releaseCredentialHome: (() => Promise<void>) | null = null;
+    let completionCost: ScanCost | null = null;
     let activeScan: {
       id: string;
       options: WorkbenchCommandOptions;
@@ -537,6 +549,21 @@ export class CodexSecurity {
         options.auth,
         provider,
       );
+      if (
+        authentication.method === "stored_credentials" &&
+        this.#dependencies.prepareRuntime === undefined
+      ) {
+        const credentialHome = await prepareCodexSecurityCredentialHome(
+          scanEnvironment,
+          (path) =>
+            requireOutputOutsideRepository(protectedRoot, path, "runtime"),
+        );
+        releaseCredentialHome = await acquireCodexSecurityCredentialHomeLock(
+          credentialHome,
+          signal,
+        );
+      }
+      const previousRuntime = this.#runtime;
       const runtime = await this.#ensureRuntime(
         signal,
         temporaryRoot,
@@ -553,6 +580,13 @@ export class CodexSecurity {
         throw new CodexSecurityError(
           "The isolated OpenRouter runtime is missing its credential bridge.",
         );
+      }
+      if (
+        runtime === previousRuntime &&
+        runtime.persistentCredentialHome === true &&
+        this.#dependencies.prepareRuntime === undefined
+      ) {
+        await this.#refreshPersistentRuntime(runtime, scanEnvironment, signal);
       }
       const runtimeHome = await realpath(runtime.codexHome);
       await requireOutputOutsideRepositoryIdentity(
@@ -589,23 +623,24 @@ export class CodexSecurity {
         authentication.method === "api_key"
           ? environmentApiKey(this.#dependencies.environment, provider)
           : null;
-      if (apiKey !== null && provider === "openai") {
-        const codexCommand = this.#codexCommand();
-        const login = await persistApiKey(
-          codexCommand,
-          runtime.environment,
-          apiKey,
-          signal,
-        );
-        if (!login.success) {
-          throw new CodexSecurityError(
-            `Codex API-key login failed: ${login.stderr.trim() || login.stdout.trim() || "unknown error"}`,
-          );
-        }
-        runtime.credentialsAvailable = true;
+      if (apiKey !== null) {
         this.#runtimeCredentialSource = "api_key";
       }
-      if (!runtime.credentialsAvailable) {
+      if (
+        !runtime.credentialsAvailable &&
+        authentication.method === "stored_credentials"
+      ) {
+        const status = await accountStatus(
+          this.#codexCommand(),
+          runtime.environment,
+          signal,
+        );
+        runtime.credentialsAvailable = status.authenticated;
+        this.#runtimeCredentialSource = status.authenticated
+          ? "stored_credentials"
+          : null;
+      }
+      if (!runtime.credentialsAvailable && apiKey === null) {
         throw new AuthenticationRequiredError(
           provider === "openrouter"
             ? "No OpenRouter credentials were found. Set OPENROUTER_API_KEY and retry."
@@ -776,15 +811,78 @@ export class CodexSecurity {
       const scanId = registration["scanId"];
       const targetId = registration["targetId"];
       const archivedScanDir = registration["archivedScanDir"];
+      const contract = registration["contract"];
+      const contractTarget = isRecord(contract)
+        ? contract["target"]
+        : undefined;
+      const allowedKinds = isRecord(contractTarget)
+        ? contractTarget["allowedKinds"]
+        : undefined;
+      const targetKind =
+        Array.isArray(allowedKinds) && allowedKinds.length === 1
+          ? allowedKinds[0]
+          : undefined;
+      const diffTarget = isRecord(contract)
+        ? contract["diffTarget"]
+        : undefined;
+      const expectedDiffTargetKind =
+        normalized.kind === "refs"
+          ? "range"
+          : normalized.kind === "working_tree"
+            ? "working_tree"
+            : null;
+      const validDiffTarget =
+        expectedDiffTargetKind === null
+          ? targetKind !== "git_diff"
+          : targetKind === "git_diff" &&
+            isRecord(diffTarget) &&
+            diffTarget["kind"] === expectedDiffTargetKind &&
+            diffTarget["baseRevision"] === normalized.base &&
+            diffTarget["headRevision"] === normalized.head &&
+            (expectedDiffTargetKind === "working_tree"
+              ? typeof diffTarget["contentDigest"] === "string" &&
+                SNAPSHOT_DIGEST_PATTERN.test(diffTarget["contentDigest"])
+              : diffTarget["contentDigest"] === undefined);
+      const snapshotDigest =
+        targetKind === "git_diff" && isRecord(diffTarget)
+          ? diffTarget["contentDigest"]
+          : isRecord(contractTarget)
+            ? contractTarget["requiredSnapshotDigest"]
+            : undefined;
+      const requiresSnapshotDigest =
+        targetKind === "git_worktree" ||
+        targetKind === "directory_snapshot" ||
+        expectedDiffTargetKind === "working_tree";
+      const registeredRevision = registration["targetRevision"];
       if (
         typeof scanId !== "string" ||
+        scanId.length < 8 ||
         typeof targetId !== "string" ||
         registration["scanDir"] !== scanDir ||
-        (archivedScanDir !== undefined &&
-          (options.archiveExisting !== true ||
-            typeof archivedScanDir !== "string" ||
-            dirname(archivedScanDir) !== dirname(scanDir) ||
-            !archivedScanDir.startsWith(`${scanDir}.previous-`)))
+        typeof targetKind !== "string" ||
+        ![
+          "git_revision",
+          "git_worktree",
+          "git_diff",
+          "directory_snapshot",
+        ].includes(targetKind) ||
+        !validDiffTarget ||
+        (snapshotDigest !== undefined &&
+          (typeof snapshotDigest !== "string" ||
+            !SNAPSHOT_DIGEST_PATTERN.test(snapshotDigest))) ||
+        (requiresSnapshotDigest && typeof snapshotDigest !== "string") ||
+        (targetKind === "git_revision" && snapshotDigest !== undefined) ||
+        typeof registeredRevision !== "string"
+      ) {
+        throw new CodexSecurityError(
+          "The Codex Security workbench returned an invalid scan registration.",
+        );
+      }
+      if (
+        archivedScanDir !== undefined &&
+        (options.archiveExisting !== true ||
+          typeof archivedScanDir !== "string" ||
+          !isExpectedArchivedScanDir(scanDir, archivedScanDir, scanId))
       ) {
         throw new CodexSecurityError(
           "The Codex Security workbench returned an invalid scan registration.",
@@ -792,6 +890,7 @@ export class CodexSecurity {
       }
       if (typeof archivedScanDir === "string") {
         requireModelSafeOutputDir(archivedScanDir);
+        await requireRegisteredArchiveDirectory(archivedScanDir);
         notifyObserver(
           "onOutputArchived",
           options.onOutputArchived,
@@ -805,6 +904,8 @@ export class CodexSecurity {
         options.onObserverError,
         scanDir,
       );
+      const targetRevision =
+        registeredRevision === "unversioned" ? null : registeredRevision;
       activeScan = { id: scanId, options: workbenchOptions };
       checkOpen();
       const feedback = await workbench(
@@ -871,6 +972,13 @@ export class CodexSecurity {
         CODEX_SECURITY_SCAN_ID: scanId,
         CODEX_SECURITY_TARGET_ID: targetId,
         CODEX_SECURITY_TARGET_DISPLAY_NAME: basename(repo),
+        CODEX_SECURITY_TARGET_KIND: targetKind,
+        ...(targetRevision === null
+          ? {}
+          : { CODEX_SECURITY_TARGET_REVISION: targetRevision }),
+        ...(typeof snapshotDigest === "string"
+          ? { CODEX_SECURITY_TARGET_SNAPSHOT_DIGEST: snapshotDigest }
+          : {}),
         ...(knowledgeBase === null
           ? {}
           : { CODEX_SECURITY_KNOWLEDGE_BASE: knowledgeBase.path }),
@@ -901,7 +1009,12 @@ export class CodexSecurity {
         ...runtimePaths,
       };
       const codex = this.#dependencies.createCodex({
-        env: definedEnvironment(environment),
+        ...(provider === "openai" && apiKey !== null ? { apiKey } : {}),
+        env: definedEnvironment(
+          provider === "openrouter"
+            ? environment
+            : selectedScanEnvironment(environment, "chatgpt", provider),
+        ),
         config: {
           default_permissions: SCAN_PERMISSION_PROFILE,
           allow_login_shell: false,
@@ -942,6 +1055,7 @@ export class CodexSecurity {
         scanDir,
         pluginRoot: runtime.plugin.installedRoot,
         expectation,
+        workbenchValidated: true,
         model,
         pricing: resolvedModel.pricing,
         onThreadStarted: (threadId) => tracker.start(threadId),
@@ -988,30 +1102,12 @@ export class CodexSecurity {
               "OpenRouter artifact recovery ended without the required canonical scan files.",
             );
           }
-          const cost = snapshot.cost;
-          const completion = await workbench(workbenchOptions, [
-            "complete-scan",
+          completionCost = snapshot.cost;
+          await workbench(workbenchOptions, [
+            "prepare-scan-completion",
             "--scan-id",
             scanId,
-            ...(cost === null ? [] : ["--cost-json", JSON.stringify(cost)]),
           ]);
-          activeScan = null;
-          const completedScan = completion["scan"];
-          if (
-            isRecord(completedScan) &&
-            Array.isArray(completedScan["warnings"])
-          ) {
-            for (const warning of completedScan["warnings"]) {
-              if (typeof warning === "string") {
-                notifyObserver(
-                  "onWarning",
-                  options.onWarning,
-                  options.onObserverError,
-                  warning,
-                );
-              }
-            }
-          }
           return snapshot.usage;
         },
         onScanStarted: options.onScanStarted,
@@ -1020,6 +1116,28 @@ export class CodexSecurity {
         onObserverError: options.onObserverError,
       });
       checkOpen();
+      const completion = await workbench(workbenchOptions, [
+        "complete-scan",
+        "--scan-id",
+        scanId,
+        ...(completionCost === null
+          ? []
+          : ["--cost-json", JSON.stringify(completionCost)]),
+      ]);
+      activeScan = null;
+      const completedScan = completion["scan"];
+      if (isRecord(completedScan) && Array.isArray(completedScan["warnings"])) {
+        for (const warning of completedScan["warnings"]) {
+          if (typeof warning === "string") {
+            notifyObserver(
+              "onWarning",
+              options.onWarning,
+              options.onObserverError,
+              warning,
+            );
+          }
+        }
+      }
       return result;
     } catch (error) {
       const snapshot = await costTracker?.stop().catch(() => null);
@@ -1050,10 +1168,14 @@ export class CodexSecurity {
       }
       throw failure;
     } finally {
-      await Promise.all([
-        knowledgeBase?.cleanup(),
-        removeTargetPathsFile(targetPathsFile),
-      ]);
+      try {
+        await Promise.all([
+          knowledgeBase?.cleanup(),
+          removeTargetPathsFile(targetPathsFile),
+        ]);
+      } finally {
+        await releaseCredentialHome?.();
+      }
     }
   }
 
@@ -1069,11 +1191,15 @@ export class CodexSecurity {
           signal,
         ),
       }),
+      "chatgpt",
     );
     if (!result.success) {
       throw new CodexSecurityError(
         `Codex API-key login failed: ${result.stderr.trim() || result.stdout.trim() || "unknown error"}`,
       );
+    }
+    if (runtime.persistentCredentialHome === true) {
+      await setCodexSecurityCredentialLogout(runtime.codexHome, false);
     }
     runtime.credentialsAvailable = true;
     this.#runtimeCredentialSource = "api_key";
@@ -1081,7 +1207,12 @@ export class CodexSecurity {
 
   public async loginChatGPT(): Promise<CodexLoginHandle> {
     this.#requireOpenAiAccountOperation();
-    const runtime = await this.#ensureRuntime();
+    const runtime = await this.#ensureRuntime(
+      undefined,
+      undefined,
+      undefined,
+      "chatgpt",
+    );
     this.#requireOpen();
     const handle = this.#trackLoginHandle(
       new CodexLoginHandle(
@@ -1101,7 +1232,12 @@ export class CodexSecurity {
 
   public async loginChatGPTDeviceCode(): Promise<CodexLoginHandle> {
     this.#requireOpenAiAccountOperation();
-    const runtime = await this.#ensureRuntime();
+    const runtime = await this.#ensureRuntime(
+      undefined,
+      undefined,
+      undefined,
+      "chatgpt",
+    );
     this.#requireOpen();
     const handle = this.#trackLoginHandle(
       new CodexLoginHandle(
@@ -1148,7 +1284,11 @@ export class CodexSecurity {
         );
         return preparedRuntime;
       },
+      "chatgpt",
     );
+    if (runtime.persistentCredentialHome === true) {
+      await setCodexSecurityCredentialLogout(runtime.codexHome, true);
+    }
     runtime.credentialsAvailable = false;
     this.#runtimeCredentialSource = null;
   }
@@ -1192,19 +1332,35 @@ export class CodexSecurity {
       await initialBridgeClose;
       return;
     }
+    await this.#cleanupRuntime(
+      runtime,
+      runtime === initiallyPreparedRuntime ? initialBridgeClose : undefined,
+      runtime !== initiallyPreparedRuntime && initialBridgeClose !== null
+        ? [initialBridgeClose]
+        : [],
+    );
+  }
 
-    const cleanupOperations: Promise<unknown>[] = [];
-    if (initialBridgeClose !== null) cleanupOperations.push(initialBridgeClose);
-    if (
-      runtime !== initiallyPreparedRuntime &&
-      runtime.openRouterBridge !== undefined
-    ) {
-      cleanupOperations.push(
-        Promise.resolve().then(() => runtime.openRouterBridge!.close()),
-      );
+  async #cleanupRuntime(
+    runtime: PreparedRuntime,
+    bridgeClose?: Promise<unknown> | null,
+    additionalOperations: readonly Promise<unknown>[] = [],
+  ): Promise<void> {
+    const selectedBridgeClose =
+      bridgeClose === undefined
+        ? runtime.openRouterBridge === undefined
+          ? null
+          : Promise.resolve().then(() => runtime.openRouterBridge!.close())
+        : bridgeClose;
+    const cleanupOperations: Promise<unknown>[] = [...additionalOperations];
+    if (selectedBridgeClose !== null) {
+      cleanupOperations.push(selectedBridgeClose);
     }
     cleanupOperations.push(
-      ...[runtime.codexHome, runtime.bootstrapWorkspace]
+      ...[
+        runtime.persistentCredentialHome ? undefined : runtime.codexHome,
+        runtime.bootstrapWorkspace,
+      ]
         .filter((path): path is string => path !== undefined)
         .map((path) => cleanupSdkDirectory(path)),
     );
@@ -1227,10 +1383,16 @@ export class CodexSecurity {
 
   async #runOperation<T>(
     operation: (runtime: PreparedRuntime, signal: AbortSignal) => Promise<T>,
+    auth: ScanAuthMode = "auto",
   ): Promise<T> {
     return await this.#trackOperation(async () => {
       const signal = this.#abortController.signal;
-      const runtime = await this.#ensureRuntime(signal);
+      const runtime = await this.#ensureRuntime(
+        signal,
+        undefined,
+        undefined,
+        auth,
+      );
       this.#requireOpen();
       const result = await operation(runtime, signal);
       this.#requireOpen();
@@ -1263,7 +1425,28 @@ export class CodexSecurity {
     auth: ScanAuthMode = "auto",
   ): Promise<PreparedRuntime> {
     this.#requireOpen();
-    if (this.#runtime !== null) return this.#runtime;
+    const provider = resolveProviderSelection({
+      provider: this.config.provider,
+      environment: this.#dependencies.environment,
+    }).provider;
+    const usePersistentCredentials =
+      scanAuthentication(this.#dependencies.environment, auth, provider)
+        .method === "stored_credentials";
+    if (this.#runtime !== null) {
+      const providerMatches = this.#runtime.provider === provider;
+      const credentialModeMatches =
+        this.#dependencies.prepareRuntime !== undefined ||
+        this.#runtime.persistentCredentialHome === undefined ||
+        this.#runtime.persistentCredentialHome === usePersistentCredentials;
+      if (providerMatches && credentialModeMatches) {
+        return this.#runtime;
+      }
+      await this.#cleanupRuntime(this.#runtime);
+      this.#runtime = null;
+      this.#runtimePromise = null;
+      this.#runtimeCredentialSource = null;
+      this.#requireOpen();
+    }
     if (this.#runtimePromise === null) {
       const runtimePromise = this.#prepareRuntime(
         signal ?? this.#abortController.signal,
@@ -1280,11 +1463,16 @@ export class CodexSecurity {
     }
     const runtime = await this.#runtimePromise;
     this.#requireOpen();
+    runtime.provider ??= provider;
+    if (runtime.provider !== provider) {
+      await this.#cleanupRuntime(runtime);
+      if (this.#runtimePromise !== null) this.#runtimePromise = null;
+      this.#runtimeCredentialSource = null;
+      throw new CodexSecurityError(
+        "The configured model provider changed while the isolated runtime was being prepared; retry the operation.",
+      );
+    }
     this.#runtime = runtime;
-    const provider = resolveProviderSelection({
-      provider: this.config.provider,
-      environment: this.#dependencies.environment,
-    }).provider;
     this.#runtimeCredentialSource = runtime.credentialsAvailable
       ? provider === "openrouter"
         ? "api_key"
@@ -1316,6 +1504,42 @@ export class CodexSecurity {
         "OpenRouter authentication is environment-only. Set OPENROUTER_API_KEY; login, account, and logout manage only OpenAI credentials.",
       );
     }
+  }
+
+  async #refreshPersistentRuntime(
+    runtime: PreparedRuntime,
+    environment: ProcessEnvironment,
+    signal: AbortSignal,
+  ): Promise<void> {
+    throwIfAborted(signal);
+    const mergedConfig = await mergedCodexConfig(
+      this.config,
+      this.#dependencies.environment,
+    );
+    const config = await preserveCodexSecurityPluginRegistration(
+      runtime.codexHome,
+      scanRuntimeCodexConfig(
+        mergedConfig,
+        codexSecurityStateDirectory(environment),
+        runtime.codexHome,
+      ),
+    );
+    await writeCodexConfig(join(runtime.codexHome, "config.toml"), config);
+    if (runtime.configPath !== undefined) {
+      await writeCodexConfig(
+        runtime.configPath,
+        scanPreflightCodexConfig(mergedConfig),
+      );
+    }
+    runtime.plugin = await bootstrapPlugin(
+      runtime.codexHome,
+      runtime.plugin.pluginRoot,
+      {
+        environment: withoutCodexHome(environment),
+        signal,
+      },
+    );
+    runtime.effectiveConfig = mergedConfig;
   }
 
   async #validateLocalInputs(
@@ -1388,28 +1612,37 @@ export class CodexSecurity {
     if (this.#dependencies.prepareRuntime !== undefined) {
       return await this.#dependencies.prepareRuntime(this.config, signal);
     }
-    const codexHome = await createIsolatedHome(temporaryRoot, validateLocation);
+    const provider = resolveProviderSelection({
+      provider: this.config.provider,
+      environment: this.#dependencies.environment,
+    }).provider;
+    const processEnvironment = selectedScanEnvironment(
+      this.#dependencies.environment,
+      auth,
+      provider,
+    );
+    const persistentCredentialHome =
+      provider === "openai" &&
+      scanAuthentication(this.#dependencies.environment, auth, provider)
+        .method === "stored_credentials";
+    const codexHome = persistentCredentialHome
+      ? await prepareCodexSecurityCredentialHome(
+          processEnvironment,
+          validateLocation,
+        )
+      : await createIsolatedHome(temporaryRoot, validateLocation);
     let bootstrapWorkspace: string | undefined;
     let openRouterBridge: OpenRouterResponsesBridge | undefined;
     try {
       throwIfAborted(signal);
       bootstrapWorkspace = await createIsolatedHome(
-        dirname(codexHome),
+        temporaryRoot,
         validateLocation,
       );
       const pluginRoot = await resolvePluginPath(
         this.config.pluginPath,
         bootstrapWorkspace,
         signal,
-      );
-      const provider = resolveProviderSelection({
-        provider: this.config.provider,
-        environment: this.#dependencies.environment,
-      }).provider;
-      const processEnvironment = selectedScanEnvironment(
-        this.#dependencies.environment,
-        auth,
-        provider,
       );
       const nodeAmbientHome = join(homedir(), ".codex");
       const configuredAmbientHome = environmentValue(
@@ -1459,9 +1692,13 @@ export class CodexSecurity {
           openRouterBridge.baseUrl,
         );
       }
-      const codexConfig = scanRuntimeCodexConfig(
-        runtimeConfig,
-        codexSecurityStateDirectory(processEnvironment),
+      const codexConfig = await preserveCodexSecurityPluginRegistration(
+        codexHome,
+        scanRuntimeCodexConfig(
+          runtimeConfig,
+          codexSecurityStateDirectory(processEnvironment),
+          persistentCredentialHome ? codexHome : undefined,
+        ),
       );
       await writeCodexConfig(join(codexHome, "config.toml"), codexConfig);
       const configPath = join(bootstrapWorkspace, "config-preflight.toml");
@@ -1484,9 +1721,23 @@ export class CodexSecurity {
         codexHome,
         importAmbientAuth,
         provider,
+        async (credentialHome) =>
+          (
+            await accountStatus(
+              this.#codexCommand(),
+              {
+                ...helperProcessEnvironment(
+                  withoutCodexHome(processEnvironment),
+                ),
+                CODEX_HOME: credentialHome,
+              },
+              signal,
+            )
+          ).authenticated,
       );
       return {
         codexHome,
+        persistentCredentialHome,
         bootstrapWorkspace,
         configPath,
         plugin,
@@ -1503,7 +1754,10 @@ export class CodexSecurity {
       };
     } catch (error) {
       const cleanupOperations: Promise<unknown>[] = [
-        ...[bootstrapWorkspace, codexHome]
+        ...[
+          bootstrapWorkspace,
+          persistentCredentialHome ? undefined : codexHome,
+        ]
           .filter((path): path is string => path !== undefined)
           .map((path) => cleanupSdkDirectory(path)),
       ];
@@ -1595,11 +1849,57 @@ export async function initialCredentialsAvailable(
   isolatedHome: string,
   importer: typeof importAmbientAuth = importAmbientAuth,
   provider: ScanProvider = "openai",
+  nativeCredentialsAvailable: (
+    credentialHome: string,
+  ) => Promise<boolean> = async (credentialHome) =>
+    (
+      await accountStatus(resolveCodexCommand(), {
+        ...helperProcessEnvironment(withoutCodexHome(environment)),
+        CODEX_HOME: credentialHome,
+      })
+    ).authenticated,
 ): Promise<boolean> {
   const credential = providerEnvironmentCredential(provider, environment);
   if (provider === "openrouter") return credential !== null;
   if (credential !== null) return false;
+  if (!(await codexSecurityCredentialAllowsAmbientImport(isolatedHome))) {
+    return false;
+  }
+  if (await codexSecurityHasStoredFileCredentials(isolatedHome)) return true;
+  if (await nativeCredentialsAvailable(isolatedHome)) return true;
   return await importer(ambientHome, isolatedHome);
+}
+
+function isExpectedArchivedScanDir(
+  scanDir: string,
+  archivedScanDir: string,
+  scanId: string,
+): boolean {
+  if (dirname(archivedScanDir) !== dirname(scanDir)) return false;
+  const prefix = `${basename(scanDir)}.previous-`;
+  const suffix = `-${scanId.slice(0, 8)}`;
+  const name = basename(archivedScanDir);
+  if (!name.startsWith(prefix) || !name.endsWith(suffix)) return false;
+  const timestamp = name.slice(prefix.length, name.length - suffix.length);
+  return /^\d{8}T\d{6}Z$/.test(timestamp);
+}
+
+async function requireRegisteredArchiveDirectory(path: string): Promise<void> {
+  try {
+    const metadata = await lstat(path);
+    if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
+      throw new Error("archive is not an ordinary directory");
+    }
+    requirePrivateOutputDirectory(metadata, path);
+    if ((await realpath(path)) !== path) {
+      throw new Error("archive is not canonical");
+    }
+  } catch (error) {
+    throw new CodexSecurityError(
+      "The Codex Security workbench returned an invalid scan registration.",
+      { cause: error },
+    );
+  }
 }
 
 async function removeTargetPathsFile(path: string | null): Promise<void> {
@@ -1635,6 +1935,7 @@ interface ScanEventRunOptions {
   scanDir: string;
   pluginRoot: string;
   expectation: ScanExpectation;
+  workbenchValidated?: boolean;
   model?: string;
   pricing?: Readonly<ModelPricingNanodollars>;
   onInitialTurnCompleted?: (
@@ -1705,6 +2006,7 @@ export async function runScanEvents(
       options.expectation,
       options.signal,
       options.pricing,
+      options.workbenchValidated,
     );
     if (options.signal.aborted) {
       throw new ScanInterruptedError(
@@ -1881,6 +2183,9 @@ async function scanPrompt(
     'Use exactly "$CODEX_SECURITY_SCAN_ID" as the scan ID in the manifest, findings, and coverage.',
     'Use exactly "$CODEX_SECURITY_TARGET_ID" as scan.target.targetId; do not derive a different target ID.',
     'Use exactly "$CODEX_SECURITY_TARGET_DISPLAY_NAME" as scan.target.displayName; do not infer a display name from the Git remote.',
+    'Use exactly "$CODEX_SECURITY_TARGET_KIND" as scan.target.kind; do not infer the target kind from the checkout.',
+    'When "$CODEX_SECURITY_TARGET_REVISION" is set, use its exact value as scan.target.revision.',
+    'When "$CODEX_SECURITY_TARGET_SNAPSHOT_DIGEST" is set, use its exact value as scan.target.snapshotDigest. For git_revision, omit scan.target.snapshotDigest.',
     'Use exactly "codex-security-plugin" as scan.producer.name.',
     ...(hasConfigPath
       ? [
@@ -1978,6 +2283,7 @@ async function collectResult(
   expectation: ScanExpectation,
   signal: AbortSignal,
   pricing?: Readonly<ModelPricingNanodollars>,
+  workbenchValidated = false,
 ): Promise<ScanResult> {
   const required = [
     "scan-manifest.json",
@@ -2002,6 +2308,7 @@ async function collectResult(
   const { manifest, findings, coverage } = await loadContract(scanDir, {
     pluginRoot,
     expectation,
+    workbenchValidated,
     signal,
   });
   let sarifPath: string | null = null;
@@ -2177,6 +2484,7 @@ export function classifyConnectionFailure(
 export function scanRuntimeCodexConfig(
   config: JsonObject,
   stateDirectory: string,
+  protectedCredentialHome?: string,
 ): JsonObject {
   const hardened = structuredClone(config);
   delete hardened["sandbox_mode"];
@@ -2194,6 +2502,9 @@ export function scanRuntimeCodexConfig(
           ":root": "read",
           ":workspace_roots": "write",
           [stateDirectory]: "write",
+          ...(protectedCredentialHome === undefined
+            ? {}
+            : { [protectedCredentialHome]: "read" }),
         },
         network: { enabled: false },
       },
