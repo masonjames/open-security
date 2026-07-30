@@ -69,7 +69,7 @@ jobs:
         run: pnpm --dir sdk/typescript install --frozen-lockfile
 
       - name: Audit production dependencies
-        run: sfw pnpm --dir sdk/typescript run audit:prod
+        run: pnpm --dir sdk/typescript run audit:prod
 
       - name: Verify
         run: |
