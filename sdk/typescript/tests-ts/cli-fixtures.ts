@@ -313,8 +313,11 @@ export function dependencies(
     ...(options.bulkScan === undefined ? {} : { bulkScan: options.bulkScan }),
     runWorkbench: async (args) =>
       (await options.onWorkbench?.(args)) ?? { scans: [] },
-    matchFindings: async (input) =>
-      (await options.onMatch?.(input)) ?? { matches: [], uncertain: [] },
+    matchFindings: async (input, matchOptions) =>
+      (await options.onMatch?.(input, matchOptions)) ?? {
+        matches: [],
+        uncertain: [],
+      },
     ...(options.fetchOpenRouterModel === undefined
       ? {}
       : { fetchOpenRouterModel: options.fetchOpenRouterModel }),

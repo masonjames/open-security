@@ -145,6 +145,11 @@ Open Security keeps provider credentials separated:
 
 Use a secret manager or ephemeral environment injection instead of committing keys to files.
 
+`scans compare BEFORE_SCAN_ID AFTER_SCAN_ID` automatically matches findings by
+root cause, reuses saved matches, and identifies new, persisting, reopened,
+resolved, or unknown findings. Missing findings remain unknown when coverage is
+incomplete or their original location was not reviewed.
+
 ## TypeScript SDK
 
 The upstream class name is retained for API compatibility:

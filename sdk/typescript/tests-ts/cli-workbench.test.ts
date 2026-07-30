@@ -121,10 +121,12 @@ describe("CLI workbench", () => {
           "before",
           "--after-scan-id",
           "after",
-          "--require-matches",
+          "--include-matching-inputs",
         ],
         {
           comparable: true,
+          matchingCached: true,
+          matchingInputs: { before: [], after: [] },
           summary: { persisting: 1, resolved: 1 },
         },
         { comparable: true, summary: { persisting: 1, resolved: 1 } },
@@ -169,7 +171,7 @@ describe("CLI workbench", () => {
     }
   });
 
-  test("matches findings and saves the result", async () => {
+  test("matches findings before matching or comparing scans", async () => {
     const before = [{ occurrenceId: "before" }];
     const after = [{ occurrenceId: "after" }];
     const matching = {
@@ -183,67 +185,112 @@ describe("CLI workbench", () => {
       ],
       uncertain: [],
     };
-    const calls: Array<readonly string[]> = [];
-    const stdout = capture();
+
+    for (const command of ["match", "compare"]) {
+      const calls: Array<readonly string[]> = [];
+      const stdout = capture();
+      const environment = { OPENAI_API_KEY: SYNTHETIC_CREDENTIALS };
+      const fetchOpenRouterModel = async () => {
+        throw new Error(
+          "OpenRouter catalog must not be loaded for OpenAI matching",
+        );
+      };
+
+      expect(
+        await main(
+          ["scans", command, "before", "after", "--json"],
+          stdout.stream,
+          capture().stream,
+          dependencies({
+            environment,
+            fetchOpenRouterModel,
+            onWorkbench: (args): JsonObject => {
+              calls.push(args);
+              return args[0] === "compare-scans"
+                ? { matchingCached: false, matchingInputs: { before, after } }
+                : { summary: { persisting: 1 } };
+            },
+            onMatch: async (input, options) => {
+              expect(input).toEqual({ before, after });
+              expect(options?.environment).toBe(environment);
+              expect(options?.fetchOpenRouterModel).toBe(fetchOpenRouterModel);
+              return matching;
+            },
+          }),
+        ),
+      ).toBe(0);
+      expect(calls.map((args) => args[0])).toEqual([
+        "compare-scans",
+        "save-scan-comparison",
+      ]);
+      expect(JSON.parse(calls[1]![6]!)).toEqual(matching);
+      expect(JSON.parse(stdout.text())).toEqual({ summary: { persisting: 1 } });
+    }
+  });
+
+  test("reports automatic matching failures without saving a comparison", async () => {
+    const calls: string[] = [];
+    const stderr = capture();
 
     expect(
       await main(
-        ["scans", "match", "before", "after", "--json"],
-        stdout.stream,
+        ["scans", "compare", "before", "after"],
         capture().stream,
+        stderr.stream,
         dependencies({
-          onWorkbench: (args): JsonObject => {
-            calls.push(args);
-            return args[0] === "compare-scans"
-              ? { matchingCached: false, matchingInputs: { before, after } }
-              : { summary: { persisting: 1 } };
+          onWorkbench: (args) => {
+            calls.push(args[0]!);
+            return {
+              matchingCached: false,
+              matchingInputs: {
+                before: [{ occurrenceId: "before" }],
+                after: [{ occurrenceId: "after" }],
+              },
+            };
           },
-          onMatch: async (input) => {
-            expect(input).toEqual({ before, after });
-            return matching;
+          onMatch: async () => {
+            throw new Error("Root-cause matching failed.");
           },
         }),
       ),
-    ).toBe(0);
-    expect(calls.map((args) => args[0])).toEqual([
-      "compare-scans",
-      "save-scan-comparison",
-    ]);
-    expect(JSON.parse(calls[1]![6]!)).toEqual(matching);
-    expect(JSON.parse(stdout.text())).toEqual({ summary: { persisting: 1 } });
+    ).toBe(2);
+    expect(stderr.text()).toContain("Root-cause matching failed.");
+    expect(calls).toEqual(["compare-scans"]);
   });
 
   test("fails closed before uncached semantic matching when a cost limit is configured", async () => {
     const before = [{ occurrenceId: "before" }];
     const after = [{ occurrenceId: "after" }];
-    const calls: Array<readonly string[]> = [];
-    let matcherCalls = 0;
-    const stderr = capture();
+    for (const command of ["match", "compare"]) {
+      const calls: Array<readonly string[]> = [];
+      let matcherCalls = 0;
+      const stderr = capture();
 
-    expect(
-      await main(
-        ["scans", "match", "before", "after"],
-        capture().stream,
-        stderr.stream,
-        dependencies({
-          environment: { OPEN_SECURITY_MAX_COST_USD: "1" },
-          onWorkbench: (args): JsonObject => {
-            calls.push(args);
-            return {
-              matchingCached: false,
-              matchingInputs: { before, after },
-            };
-          },
-          onMatch: async () => {
-            matcherCalls += 1;
-            return { matches: [], uncertain: [] };
-          },
-        }),
-      ),
-    ).toBe(2);
-    expect(matcherCalls).toBe(0);
-    expect(calls.map((args) => args[0])).toEqual(["compare-scans"]);
-    expect(stderr.text()).toContain("cannot currently be enforced");
+      expect(
+        await main(
+          ["scans", command, "before", "after"],
+          capture().stream,
+          stderr.stream,
+          dependencies({
+            environment: { OPEN_SECURITY_MAX_COST_USD: "1" },
+            onWorkbench: (args): JsonObject => {
+              calls.push(args);
+              return {
+                matchingCached: false,
+                matchingInputs: { before, after },
+              };
+            },
+            onMatch: async () => {
+              matcherCalls += 1;
+              return { matches: [], uncertain: [] };
+            },
+          }),
+        ),
+      ).toBe(2);
+      expect(matcherCalls).toBe(0);
+      expect(calls.map((args) => args[0])).toEqual(["compare-scans"]);
+      expect(stderr.text()).toContain("cannot currently be enforced");
+    }
   });
 
   test("saves model-free empty matching under a configured scan cost limit", async () => {
