@@ -76,22 +76,28 @@ jobs:
       - name: Audit production dependencies
         run: pnpm --dir sdk/typescript run audit:prod
 
-      - name: Prepare private Linux temporary root
+      - name: Prepare private Linux verification roots
         shell: bash
         run: |
           set -euo pipefail
           private_root="/tmp/open-security-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_JOB}"
-          install -d -m 0700 "$private_root/tmp"
+          install -d -m 0700 "$private_root/home" "$private_root/tmp"
           {
+            echo "OPEN_SECURITY_CI_HOME=$private_root/home"
             echo "TEMP=$private_root/tmp"
             echo "TMP=$private_root/tmp"
             echo "TMPDIR=$private_root/tmp"
           } >> "$GITHUB_ENV"
 
       - name: Verify
+        shell: bash
         run: |
+          set -euo pipefail
           pnpm --dir sdk/typescript run types
-          pnpm --dir sdk/typescript run test
+          (
+            cd sdk/typescript
+            HOME="$OPEN_SECURITY_CI_HOME" bun test --timeout 30000 ./tests-ts
+          )
           pnpm --dir sdk/typescript run format
           pnpm --dir sdk/typescript run build
 

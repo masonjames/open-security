@@ -70,14 +70,15 @@ jobs:
         if: matrix.os == 'ubuntu-latest' && matrix.node == '22.13.0'
         run: pnpm --dir sdk/typescript run audit:prod
 
-      - name: Prepare private Linux temporary root
+      - name: Prepare private Linux verification roots
         if: runner.os == 'Linux'
         shell: bash
         run: |
           set -euo pipefail
           private_root="/tmp/open-security-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_JOB}"
-          install -d -m 0700 "$private_root/tmp"
+          install -d -m 0700 "$private_root/home" "$private_root/tmp"
           {
+            echo "OPEN_SECURITY_CI_HOME=$private_root/home"
             echo "TEMP=$private_root/tmp"
             echo "TMP=$private_root/tmp"
             echo "TMPDIR=$private_root/tmp"
@@ -86,7 +87,17 @@ jobs:
       - name: Typecheck
         run: pnpm --dir sdk/typescript run types
 
+      - name: Test on Linux with a private home
+        if: runner.os == 'Linux'
+        timeout-minutes: 10
+        working-directory: sdk/typescript
+        shell: bash
+        env:
+          HOME: ${{ env.OPEN_SECURITY_CI_HOME }}
+        run: bun test --timeout 30000 ./tests-ts
+
       - name: Test
+        if: runner.os != 'Linux'
         timeout-minutes: 10
         run: pnpm --dir sdk/typescript run test
 
