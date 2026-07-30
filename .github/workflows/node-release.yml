@@ -65,6 +65,11 @@ jobs:
             exit 1
           fi
 
+      - name: Install Linux ACL inspection tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes attr
+
       - name: Install dependencies
         run: pnpm --dir sdk/typescript install --frozen-lockfile
 
