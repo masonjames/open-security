@@ -246,7 +246,6 @@ async function requestOpenRouterJson(
     timedOut = true;
     controller.abort();
   }, options.timeoutMs);
-  timeout.unref?.();
 
   const abortFromCaller = () => controller.abort(options.signal?.reason);
   if (options.signal?.aborted === true) {
