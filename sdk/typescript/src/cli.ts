@@ -22,8 +22,7 @@ import {
   win32,
 } from "node:path";
 import { cwd } from "node:process";
-import { createInterface } from "node:readline";
-import { Readable, Writable as NodeWritable } from "node:stream";
+import { Writable as NodeWritable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import type { ModelReasoningEffort } from "@openai/codex-sdk";
@@ -60,7 +59,12 @@ import {
 } from "./cost.js";
 import {
   CodexSecurityError,
+  ConfigurationError,
+  InvalidTargetError,
+  OutputDirectoryError,
   OutputInsideProtectedRootError,
+  PluginPythonUnavailableError,
+  redactedErrorMessage,
   ScanInterruptedError,
 } from "./errors.js";
 import type { SeverityLevel } from "./models.js";
@@ -112,6 +116,10 @@ const MAX_CODEX_OVERRIDE_VALUE_LENGTH = 64 * 1_024;
 const MAX_CODEX_OVERRIDE_DEPTH = 64;
 const MAX_SKILL_INPUT_BYTES = 1_024 * 1_024;
 const MAX_SKILL_INPUT_COUNT = 64;
+const MAX_SKILL_EVENT_BYTES = 1_024 * 1_024;
+const MAX_SKILL_RESPONSE_BYTES = 256 * 1_024;
+const SKILL_OUTPUT_LIMIT_MESSAGE =
+  "Codex skill output exceeded the 1 MiB event or 256 KiB response safety limit.";
 const WINDOWS_NETWORK_PATH = /^[\\/]{2}/u;
 const WINDOWS_LOCAL_DEVICE_ROOT =
   /^[\\/]{2}[?.][\\/](?:[A-Za-z]:|Volume\{[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\}|GLOBALROOT[\\/]Device[\\/]HarddiskVolume[0-9]+)(?=[\\/]|$)/iu;
@@ -119,6 +127,7 @@ const SCAN_HISTORY_OUTPUT_OPTION =
   /^--(?:format|filter-output|full-output|token-count|token-limit|token-offset)(?:=|$)/u;
 const HIDE_CURSOR = "\u001B[?25l";
 const SHOW_CURSOR = "\u001B[?25h";
+const CHILD_TERMINATION_GRACE_MS = 1_000;
 
 type Writable = Pick<NodeJS.WriteStream, "write"> & {
   readonly isTTY?: boolean;
@@ -447,13 +456,31 @@ export async function runCodexSkillCommand(
     windowsHide: true,
   });
   let requestedSignal: SignalName | null = null;
+  let skillOutputLimitExceeded = false;
+  let forcedTermination: ReturnType<typeof setTimeout> | undefined;
+  let forceStatusCompletion: (() => void) | null = null;
+  let forceCaptureCompletion: (() => void) | null = null;
+  let invocationStatus: Promise<number> | undefined;
+  const requestTermination = (signal: SignalName): void => {
+    requestedSignal = signal;
+    invocation.kill(signal);
+    if (forcedTermination !== undefined) return;
+    forcedTermination = setTimeout(() => {
+      forcedTermination = undefined;
+      if (invocation.exitCode === null && invocation.signalCode === null) {
+        invocation.kill("SIGKILL");
+      }
+      forceCaptureCompletion?.();
+      invocation.stdout?.destroy();
+      invocation.stderr?.destroy();
+      forceStatusCompletion?.();
+    }, CHILD_TERMINATION_GRACE_MS);
+  };
   const onInterrupt = (): void => {
-    requestedSignal = "SIGINT";
-    invocation.kill("SIGINT");
+    requestTermination("SIGINT");
   };
   const onTerminate = (): void => {
-    requestedSignal = "SIGTERM";
-    invocation.kill("SIGTERM");
+    requestTermination("SIGTERM");
   };
   process.on("SIGINT", onInterrupt);
   process.on("SIGTERM", onTerminate);
@@ -465,25 +492,45 @@ export async function runCodexSkillCommand(
     const captured =
       output === undefined || invocation.stdout === null
         ? Promise.resolve(undefined)
-        : readSkillCommandOutput(invocation.stdout);
-    const [status, events] = await Promise.all([
-      new Promise<number>((resolve, reject) => {
-        invocation.once("error", reject);
-        invocation.once(
-          output === undefined ? "exit" : "close",
-          (code, signal) => {
-            resolve(
-              requestedSignal === "SIGINT" || signal === "SIGINT"
-                ? 130
-                : requestedSignal === "SIGTERM" || signal === "SIGTERM"
-                  ? 143
-                  : code ?? 1,
-            );
-          },
+        : Promise.race([
+            readSkillCommandOutput(invocation.stdout, () => {
+              skillOutputLimitExceeded = true;
+              requestTermination("SIGTERM");
+            }),
+            new Promise<undefined>((resolve) => {
+              forceCaptureCompletion = () => resolve(undefined);
+            }),
+          ]);
+    invocationStatus = new Promise<number>((resolve, reject) => {
+      let completed = false;
+      const complete = (
+        code: number | null,
+        signal: NodeJS.Signals | null,
+      ): void => {
+        if (completed) return;
+        completed = true;
+        forceStatusCompletion = null;
+        resolve(
+          requestedSignal === "SIGINT" || signal === "SIGINT"
+            ? 130
+            : requestedSignal === "SIGTERM" || signal === "SIGTERM"
+              ? 143
+              : code ?? 1,
         );
-      }),
-      captured,
-    ]);
+      };
+      forceStatusCompletion = () => complete(null, null);
+      invocation.once("error", (error) => {
+        if (completed) return;
+        completed = true;
+        forceStatusCompletion = null;
+        reject(error);
+      });
+      invocation.once(output === undefined ? "exit" : "close", complete);
+    });
+    const [status, events] = await Promise.all([invocationStatus, captured]);
+    if (skillOutputLimitExceeded) {
+      throw new CodexSecurityError(SKILL_OUTPUT_LIMIT_MESSAGE);
+    }
     if (output === undefined || status === 130 || status === 143) return status;
     if (status !== 0) {
       await writeCliOutput(
@@ -509,9 +556,13 @@ export async function runCodexSkillCommand(
   } catch (error) {
     invocation.stdout?.destroy();
     invocation.stderr?.destroy();
-    invocation.kill();
+    requestTermination("SIGTERM");
+    await invocationStatus?.catch(() => undefined);
     throw error;
   } finally {
+    if (forcedTermination !== undefined) clearTimeout(forcedTermination);
+    forceStatusCompletion = null;
+    forceCaptureCompletion = null;
     process.off("SIGINT", onInterrupt);
     process.off("SIGTERM", onTerminate);
   }
@@ -636,7 +687,7 @@ export async function main(
     try {
       return await select(await dependencies.runWorkbench(args));
     } catch (error) {
-      errorOutput.write(`open-security: ${cliErrorMessage(error)}\n`);
+      errorOutput.write(`open-security: ${redactedErrorMessage(error)}\n`);
       exitCode = 2;
       return undefined;
     }
@@ -851,7 +902,7 @@ export async function main(
           ]);
           scanArguments = scanArgumentsFromRecipe(recipe, args.scanId);
         } catch (error) {
-          const message = cliErrorMessage(error);
+          const message = redactedErrorMessage(error);
           errorOutput.write(`open-security: ${message}\n`);
           exitCode = 2;
           return incurError({
@@ -914,7 +965,7 @@ export async function main(
             format,
           );
         } catch (error) {
-          errorOutput.write(`open-security: ${cliErrorMessage(error)}\n`);
+          errorOutput.write(`open-security: ${redactedErrorMessage(error)}\n`);
           exitCode = 2;
           return undefined;
         }
@@ -1218,7 +1269,7 @@ export async function main(
             failOnSeverity: options.failOnSeverity,
           };
         } catch (error) {
-          errorOutput.write(`open-security: ${cliErrorMessage(error)}\n`);
+          errorOutput.write(`open-security: ${redactedErrorMessage(error)}\n`);
           exitCode = 2;
           return undefined;
         }
@@ -1390,7 +1441,7 @@ export async function main(
             signal: controller.signal,
             onProgress: ({ repository, status, attempt, error }) => {
               errorOutput.write(
-                `open-security: ${repository} ${status} (attempt ${attempt})${error === undefined ? "" : `: ${cliErrorMessage(error)}`}\n`,
+                `open-security: ${repository} ${status} (attempt ${attempt})${error === undefined ? "" : `: ${redactedErrorMessage(error)}`}\n`,
               );
             },
           });
@@ -1402,7 +1453,7 @@ export async function main(
             (error instanceof Error && error.name === "ExitPromptError"
               ? 130
               : 2);
-          errorOutput.write(`open-security: ${cliErrorMessage(error)}\n`);
+          errorOutput.write(`open-security: ${redactedErrorMessage(error)}\n`);
         } finally {
           dependencies.removeSignalListener("SIGINT", onInterrupt);
           dependencies.removeSignalListener("SIGTERM", onTerminate);
@@ -1504,7 +1555,7 @@ export async function main(
           );
         } catch (error) {
           exitCode = 2;
-          errorOutput.write(`open-security: ${cliErrorMessage(error)}\n`);
+          errorOutput.write(`open-security: ${redactedErrorMessage(error)}\n`);
         }
       },
     })
@@ -1540,7 +1591,7 @@ export async function main(
           );
         } catch (error) {
           exitCode = 2;
-          errorOutput.write(`open-security: ${cliErrorMessage(error)}\n`);
+          errorOutput.write(`open-security: ${redactedErrorMessage(error)}\n`);
         }
       },
     })
@@ -1572,7 +1623,9 @@ export async function main(
             ? await dependencies.prepareAuthenticationHome(
                 dependencies.environment,
               )
-            : codexSecurityCredentialHome(dependencies.environment);
+            : await prepareCodexSecurityCredentialHome(
+                dependencies.environment,
+              );
         const authenticationEnvironment = {
           ...dependencies.environment,
           CODEX_HOME: credentialHome,
@@ -1649,7 +1702,9 @@ export async function main(
             ? await dependencies.prepareAuthenticationHome(
                 dependencies.environment,
               )
-            : codexSecurityCredentialHome(dependencies.environment);
+            : await prepareCodexSecurityCredentialHome(
+                dependencies.environment,
+              );
         const authenticationEnvironment = {
           ...dependencies.environment,
           CODEX_HOME: credentialHome,
@@ -1727,7 +1782,7 @@ export async function main(
   if (frameworkExit !== undefined) {
     if (exitCode !== 0) return exitCode;
     errorOutput.write(
-      `open-security: ${cliErrorMessage(incurErrorMessage(frameworkOutput))}\n`,
+      `open-security: ${redactedErrorMessage(incurErrorMessage(frameworkOutput))}\n`,
     );
     return 2;
   }
@@ -1736,7 +1791,7 @@ export async function main(
     await writeCliOutput(output, renderedHistory ?? frameworkOutput);
     return exitCode;
   } catch (error) {
-    errorOutput.write(`open-security: ${cliErrorMessage(error)}\n`);
+    errorOutput.write(`open-security: ${redactedErrorMessage(error)}\n`);
     return 2;
   }
 }
@@ -2335,23 +2390,33 @@ async function runSkill(
 
 export async function readSkillCommandOutput(
   stream: AsyncIterable<Buffer | string>,
+  onLimitExceeded?: () => void,
 ): Promise<{ message?: string; error?: string; malformed: boolean }> {
   let message: string | undefined;
   let error: string | undefined;
   let malformed = false;
+  let exceeded = false;
+  const markExceeded = (): void => {
+    if (exceeded) return;
+    exceeded = true;
+    onLimitExceeded?.();
+  };
 
-  for await (const line of createInterface({ input: Readable.from(stream) })) {
-    if (line.trim().length === 0) continue;
+  const readLine = (bytes: Buffer): void => {
+    const content =
+      bytes.at(-1) === 0x0d ? bytes.subarray(0, bytes.length - 1) : bytes;
+    const line = content.toString("utf8");
+    if (line.trim().length === 0) return;
     let event: unknown;
     try {
       event = JSON.parse(line);
     } catch {
       malformed = true;
-      continue;
+      return;
     }
     if (typeof event !== "object" || event === null) {
       malformed = true;
-      continue;
+      return;
     }
     const value = event as Record<string, unknown>;
     if (value["type"] === "item.completed") {
@@ -2364,7 +2429,11 @@ export async function readSkillCommandOutput(
         "text" in item &&
         typeof item.text === "string"
       ) {
-        message = item.text;
+        if (Buffer.byteLength(item.text, "utf8") > MAX_SKILL_RESPONSE_BYTES) {
+          markExceeded();
+        } else {
+          message = item.text;
+        }
       }
     } else if (value["type"] === "turn.failed") {
       const detail = value["error"];
@@ -2374,15 +2443,63 @@ export async function readSkillCommandOutput(
         "message" in detail &&
         typeof detail.message === "string"
       ) {
-        error = detail.message;
+        if (
+          Buffer.byteLength(detail.message, "utf8") > MAX_SKILL_RESPONSE_BYTES
+        ) {
+          markExceeded();
+        } else {
+          error = detail.message;
+        }
       }
     } else if (
       value["type"] === "error" &&
       typeof value["message"] === "string"
     ) {
-      error = value["message"];
+      if (
+        Buffer.byteLength(value["message"], "utf8") > MAX_SKILL_RESPONSE_BYTES
+      ) {
+        markExceeded();
+      } else {
+        error = value["message"];
+      }
+    }
+  };
+
+  const pending = Buffer.alloc(MAX_SKILL_EVENT_BYTES);
+  let pendingBytes = 0;
+  let discardingOversizedLine = false;
+  for await (const rawChunk of stream) {
+    const chunk = Buffer.isBuffer(rawChunk)
+      ? rawChunk
+      : Buffer.from(rawChunk, "utf8");
+    let start = 0;
+    while (start < chunk.length) {
+      const newline = chunk.indexOf(0x0a, start);
+      const end = newline === -1 ? chunk.length : newline;
+      const segment = chunk.subarray(start, end);
+      if (!discardingOversizedLine) {
+        if (pendingBytes + segment.length > MAX_SKILL_EVENT_BYTES) {
+          markExceeded();
+          discardingOversizedLine = true;
+          pendingBytes = 0;
+        } else if (segment.length > 0) {
+          segment.copy(pending, pendingBytes);
+          pendingBytes += segment.length;
+        }
+      }
+      if (newline === -1) break;
+      if (!discardingOversizedLine) {
+        readLine(pending.subarray(0, pendingBytes));
+      }
+      pendingBytes = 0;
+      discardingOversizedLine = false;
+      start = newline + 1;
     }
   }
+  if (!discardingOversizedLine && pendingBytes > 0) {
+    readLine(pending.subarray(0, pendingBytes));
+  }
+  if (exceeded) throw new CodexSecurityError(SKILL_OUTPUT_LIMIT_MESSAGE);
   return {
     ...(message === undefined ? {} : { message }),
     ...(error === undefined ? {} : { error }),
@@ -2544,7 +2661,7 @@ async function runExport(
     }
     return 0;
   } catch (error) {
-    errorOutput.write(`open-security: ${cliErrorMessage(error)}\n`);
+    errorOutput.write(`open-security: ${redactedErrorMessage(error)}\n`);
     return 2;
   }
 }
@@ -2707,7 +2824,7 @@ async function runScan(
       onOutputArchived: (archiveDir) => {
         progress?.stopTimer();
         errorOutput.write(
-          `Moved existing results to: ${cliErrorMessage(archiveDir)}\n`,
+          `Moved existing results to: ${redactedErrorMessage(archiveDir)}\n`,
         );
       },
       signal: preparationAbortController.signal,
@@ -2770,12 +2887,12 @@ async function runScan(
       },
       onWarning: (warning) => {
         errorOutput.write(
-          `open-security: warning: ${cliErrorMessage(warning)}\n`,
+          `open-security: warning: ${redactedErrorMessage(warning)}\n`,
         );
       },
       onObserverError: (observer, error) => {
         errorOutput.write(
-          `open-security: warning: ${observer} observer failed: ${cliErrorMessage(error)}\n`,
+          `open-security: warning: ${observer} observer failed: ${redactedErrorMessage(error)}\n`,
         );
       },
     };
@@ -2812,7 +2929,7 @@ async function runScan(
   if (failed) {
     const message =
       failure instanceof OutputInsideProtectedRootError
-        ? cliErrorMessage(protectedRootErrorMessage(failure))
+        ? redactedErrorMessage(protectedRootErrorMessage(failure))
         : scanFailureMessage(failure, selectedAuthentication);
     errorOutput.write(`${message}\n`);
     if (failure instanceof ScanInterruptedError) {
@@ -2820,7 +2937,7 @@ async function runScan(
     }
     if (scanDir !== null) {
       errorOutput.write(
-        `Partial output was kept at ${cliErrorMessage(scanDir)}.\n`,
+        `Partial output was kept at ${redactedErrorMessage(scanDir)}.\n`,
       );
     }
     return { exitCode: 2, error: message };
@@ -2866,10 +2983,55 @@ async function runScan(
   return { exitCode: blockingCount > 0 ? 1 : 0, data: result.toJSON() };
 }
 
+// Filesystem and OS syscall failures cannot originate from the model transport,
+// so they must never be rewritten as connectivity or credential advice. Network
+// errno codes are deliberately absent: they are genuine transport failures.
+const LOCAL_SYSCALL_CODES = new Set([
+  "EACCES",
+  "EBUSY",
+  "EEXIST",
+  "EFBIG",
+  "EIO",
+  "EISDIR",
+  "ELOOP",
+  "EMFILE",
+  "ENAMETOOLONG",
+  "ENFILE",
+  "ENOENT",
+  "ENOMEM",
+  "ENOSPC",
+  "ENOTDIR",
+  "ENOTEMPTY",
+  "EPERM",
+  "EROFS",
+  "EXDEV",
+]);
+
+function isLocalScanFailure(error: unknown): boolean {
+  if (
+    error instanceof InvalidTargetError ||
+    error instanceof OutputDirectoryError ||
+    error instanceof ConfigurationError ||
+    error instanceof PluginPythonUnavailableError
+  ) {
+    return true;
+  }
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    typeof (error as { code: unknown }).code === "string" &&
+    LOCAL_SYSCALL_CODES.has((error as { code: string }).code)
+  );
+}
+
 function scanFailureMessage(
   error: unknown,
   authentication: ScanAuthentication | null,
 ): string {
+  // Local filesystem and configuration failures keep their redacted message;
+  // they must not be rewritten as connectivity or credential advice.
+  if (isLocalScanFailure(error)) return redactedErrorMessage(error);
   const openRouter =
     authentication?.method === "api_key" &&
     authentication.source === "OPENROUTER_API_KEY";
@@ -2896,7 +3058,7 @@ function scanFailureMessage(
     case "network_error":
     case "timeout":
     case "unknown":
-      return cliErrorMessage(error);
+      return redactedErrorMessage(error);
   }
 }
 
@@ -2910,7 +3072,9 @@ function scanScope(arguments_: ScanArguments): string | null {
         portable.startsWith("//")
           ? portable.split("/").at(-1) ?? portable
           : portable;
-      return cliErrorMessage(scoped.replaceAll(/[\u0000-\u001F\u007F]/gu, " "));
+      return redactedErrorMessage(
+        scoped.replaceAll(/[\u0000-\u001F\u007F]/gu, " "),
+      );
     });
     return `${displayed.join(", ")}${arguments_.paths.length > displayed.length ? `, +${arguments_.paths.length - displayed.length} more` : ""}`;
   }
@@ -2972,7 +3136,7 @@ function printScanSummary(
           ? 33
           : 36;
   errorOutput.write(
-    `\n  ${paint("REPORT", "1;36")}    ${paint(cliErrorMessage(result.reportPath), 4)}\n\n` +
+    `\n  ${paint("REPORT", "1;36")}    ${paint(redactedErrorMessage(result.reportPath), 4)}\n\n` +
       `  ${paint("FINDINGS", 1)}  ${paint(`${findingCount}${severitySummary === "" ? "" : ` (${severitySummary})`}`, findingColor)}\n` +
       `  ${paint("COVERAGE", 1)}  ${result.coverage.completeness}\n` +
       `  ${paint("ELAPSED", 1)}   ${duration}\n`,
@@ -2988,7 +3152,7 @@ function printScanSummary(
     );
   }
   errorOutput.write(
-    `  ${paint("RESULTS", 1)}   ${cliErrorMessage(result.scanDir)}\n`,
+    `  ${paint("RESULTS", 1)}   ${redactedErrorMessage(result.scanDir)}\n`,
   );
 }
 
@@ -3303,7 +3467,7 @@ function interruptedExit(
   errorOutput.write(
     scanDir === null
       ? "open-security: No partial output was kept.\n"
-      : `open-security: Partial output was kept at ${cliErrorMessage(scanDir)}.\n`,
+      : `open-security: Partial output was kept at ${redactedErrorMessage(scanDir)}.\n`,
   );
   return ctrlC ? 130 : 143;
 }
@@ -3323,34 +3487,13 @@ function invokedAsMain(): boolean {
   }
 }
 
-function cliErrorMessage(error: unknown): string {
-  const message = error instanceof Error ? error.message : String(error);
-  return message
-    .replaceAll(
-      /(\b[A-Za-z0-9_-]{0,64}(?:api[_-]?key|access[_-]?key(?:[_-]?id)?|token|secret|credential|signature|sig|password|passwd)\b(?:\\?["'])?\s*[:=]\s*(?:\\?["'])?)[^\s"',;}&\\\]]+/giu,
-      "$1[redacted]",
-    )
-    .replaceAll(/sk-(?:proj-)?[A-Za-z0-9_*=-]{8,}/gu, "[redacted]")
-    .replaceAll(/(?:github_pat_|gh[pousr]_)[A-Za-z0-9_-]{8,}/giu, "[redacted]")
-    .replaceAll(/npm_[A-Za-z0-9_-]{8,}/giu, "[redacted]")
-    .replaceAll(
-      /(^|%20|[^A-Za-z0-9_])(Bearer|Basic|Token)((?:\s|%20|\+)+)[A-Za-z0-9.%_~+/*=-]{8,}/giu,
-      "$1$2$3[redacted]",
-    )
-    .replaceAll(/((?:https?|ssh|git\+ssh):\/\/)[^\s/@]+@/giu, "$1[redacted]@")
-    .replaceAll(
-      /((?:[?&]|%3F|%26)(?:(?!%3F|%26|%3D)(?:[A-Za-z0-9_.%-]|\[|\])){0,64}(?:api[_-]?key|access(?:[_-]|%5F|%2D)?key(?:(?:[_-]|%5F|%2D)?id)?|token|secret|credential|signature|sig|password|passwd)(?:\]|%5D)?(?:=|%3D))(?:(?!%26)[^&\s])+/giu,
-      "$1[redacted]",
-    );
-}
-
 if (invokedAsMain()) {
   void main().then(
     (exitCode) => {
       process.exitCode = exitCode;
     },
     (error: unknown) => {
-      process.stderr.write(`open-security: ${cliErrorMessage(error)}\n`);
+      process.stderr.write(`open-security: ${redactedErrorMessage(error)}\n`);
       process.exitCode = 2;
     },
   );

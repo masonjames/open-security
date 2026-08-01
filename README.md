@@ -173,7 +173,15 @@ try {
 }
 ```
 
-See [sdk/typescript/README.md](sdk/typescript/README.md) for scan modes, history, exports, CI behavior, and the full SDK surface.
+## Containerized bulk scans
+
+Use the included Docker Compose configuration for noninteractive, resumable
+scans of repositories pinned to immutable Git revisions. See the
+[container quick start](sdk/typescript/README.md#containerized-bulk-scans) for
+authentication, private result storage, and optional Ubuntu AppArmor hardening.
+
+See [sdk/typescript/README.md](sdk/typescript/README.md) for scan modes, history,
+exports, CI behavior, and the full SDK surface.
 
 For complete command help, runtime defaults, native multi-agent worker limits,
 environment variables, deep-scan configuration, and SDK options, also see the
