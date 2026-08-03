@@ -19,6 +19,7 @@ export type {
 } from "./openrouter-models.js";
 export type {
   CodexSecurityMetadata,
+  DeepScanOptions,
   ScanAuthMode,
   ScanAuthentication,
   ScanOptions,

@@ -286,6 +286,7 @@ without printing its value, including when no stored sign-in exists.
 ```bash
 open-security scan /path/to/repository
 open-security scan /path/to/repository --model gpt-5.6-terra
+open-security scan /path/to/repository --model gpt-5.6-terra --effort high
 open-security scan /path/to/repository --path src --path tests
 open-security scan /path/to/repository --knowledge-base /path/to/threat-models --knowledge-base /path/to/architecture.pdf
 open-security scan /path/to/repository --diff origin/main --json
@@ -294,8 +295,10 @@ open-security scan /path/to/repository --output-dir /path/outside/repository/res
 open-security scan /path/to/repository --dry-run
 open-security scan /path/to/repository --fail-on-severity high
 open-security scan /path/to/repository --max-cost 5
+open-security scan /path/to/repository --mode deep --workers 2 --subagents 0 --stop-after-no-new 3 --max-discovery-runs 10
 open-security install-hook
 open-security bulk-scan
+open-security bulk-scan --model gpt-5.6-terra --effort high
 open-security bulk-scan repositories.csv --output-dir /path/outside/repositories/security-scans --workers 4
 open-security scans list /path/to/repository
 open-security scans list --scan-root /path/outside/repository/results
@@ -309,7 +312,9 @@ open-security export /path/outside/repository/results --export-format sarif --ou
 open-security export /path/outside/repository/results --export-format csv --output /path/outside/repository/findings.csv
 open-security export /path/outside/repository/results --export-format json --output /path/outside/repository/findings.json
 open-security validate /path/outside/repository/findings.json "Possible SQL injection in src/query.ts:42"
+open-security validate "Possible SQL injection" --effort high
 open-security patch /path/outside/repository/findings.json "Missing authorization check in src/routes.ts:18"
+open-security patch "Missing authorization check" --effort high
 ```
 
 Run `open-security --version` for the installed CLI version or
@@ -336,6 +341,37 @@ to
 
 Repeat `--knowledge-base PATH` for multiple files or directories. Directories are
 searched recursively for Markdown, text, PDF, and Word (`.docx`) files.
+
+### Configure deep scans
+
+For `scan --mode deep`, `--workers` limits concurrent discovery workers,
+`--subagents` controls each worker's subagents, `--stop-after-no-new` stops after
+that many runs find no new issues, and `--max-discovery-runs` limits total runs.
+These options are also available on SDK scans:
+
+```ts
+await security.run("/path/to/repository", {
+  mode: "deep",
+  workers: 2,
+  subagents: 0,
+  stopAfterNoNew: 3,
+  maxDiscoveryRuns: 10,
+});
+```
+
+Set defaults in `~/.codex/codex-security/config.toml`, or under `$CODEX_HOME`
+when it is configured. Explicit CLI and SDK settings override these defaults:
+
+```toml
+[deep_scan]
+workers = 2
+subagents = 0
+stop_after_no_new = 3
+max_discovery_runs = 10
+```
+
+`scan --workers` controls discovery workers within one deep scan;
+`bulk-scan --workers` controls how many repositories are scanned concurrently.
 
 On macOS/Linux, an existing output directory must be private to the current
 user (`chmod 700`).

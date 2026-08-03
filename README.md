@@ -33,6 +33,7 @@ corepack enable
 pnpm --dir sdk/typescript install --frozen-lockfile
 pnpm --dir sdk/typescript run build
 node sdk/typescript/bin/codex-security.mjs --help
+node sdk/typescript/bin/codex-security.mjs scan . --mode deep --workers 2 --subagents 0 --stop-after-no-new 3 --max-discovery-runs 10
 ```
 
 The package manifest declares `open-security` as the canonical executable and preserves `codex-security` as a backward-compatible alias. The package is not published to npm yet; use the source launcher or a locally packed tarball. The source launcher keeps its upstream filename to reduce merge conflicts.
@@ -157,7 +158,7 @@ The upstream class name is retained for API compatibility:
 ```ts
 import { CodexSecurity } from "@masonjames/open-security";
 
-const security = new CodexSecurity({
+const openRouterSecurity = new CodexSecurity({
   provider: "openrouter",
   codexOverrides: {
     model: "qwen/qwen3.7-flash",
@@ -166,10 +167,24 @@ const security = new CodexSecurity({
 });
 
 try {
-  const result = await security.run(".", { maxCostUsd: 1 });
+  const result = await openRouterSecurity.run(".", { maxCostUsd: 1 });
   console.log(result.reportPath);
 } finally {
-  await security.close();
+  await openRouterSecurity.close();
+}
+
+const deepSecurity = new CodexSecurity({ provider: "openai" });
+try {
+  const result = await deepSecurity.run(".", {
+    mode: "deep",
+    workers: 2,
+    subagents: 0,
+    stopAfterNoNew: 3,
+    maxDiscoveryRuns: 10,
+  });
+  console.log(result.reportPath);
+} finally {
+  await deepSecurity.close();
 }
 ```
 
