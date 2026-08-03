@@ -1345,6 +1345,10 @@ export async function main(
             .describe(
               "Resumable results directory; required with a repository CSV.",
             ),
+          knowledgeBase: z
+            .array(optionValue("--knowledge-base"))
+            .default([])
+            .describe("Read shared security docs for every repository."),
           workers: z
             .number()
             .int()
@@ -1439,7 +1443,7 @@ export async function main(
           if (args.input === undefined) {
             if (!isBulkScanDiscoveryInvocation(argv)) {
               throw new Error(
-                "Run 'open-security bulk-scan [--provider PROVIDER] [--model MODEL] [--reasoning-effort EFFORT | --effort EFFORT]' to discover repositories, or provide a CSV and --output-dir.",
+                "Run 'open-security bulk-scan [--provider PROVIDER] [--model MODEL] [--reasoning-effort EFFORT | --effort EFFORT] [--knowledge-base PATH]' to discover repositories, or provide a CSV and --output-dir.",
               );
             }
             const wizard = await runBulkScanWizard(
@@ -1471,6 +1475,9 @@ export async function main(
             workers: options.workers,
             mode: options.mode,
             maxAttempts: options.maxAttempts,
+            knowledgeBasePaths: options.knowledgeBase.map((path) =>
+              resolve(currentDirectory, path),
+            ),
             config: {
               provider: options.provider,
               pluginPath: options.pluginPath,
@@ -2630,6 +2637,7 @@ function isBulkScanDiscoveryInvocation(argv: readonly string[]): boolean {
     "--model",
     "--reasoning-effort",
     "--effort",
+    "--knowledge-base",
   ]);
   for (let index = 1; index < argv.length; index += 1) {
     const argument = argv[index]!;

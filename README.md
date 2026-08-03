@@ -198,6 +198,9 @@ authentication, private result storage, and optional Ubuntu AppArmor hardening.
 See [sdk/typescript/README.md](sdk/typescript/README.md) for scan modes, history,
 exports, CI behavior, and the full SDK surface.
 
+Pass `--knowledge-base PATH` to share security documents with every repository;
+repeat the option for multiple files or directories.
+
 For complete command help, runtime defaults, native multi-agent worker limits,
 environment variables, deep-scan configuration, and SDK options, also see the
 [official CLI reference](https://learn.chatgpt.com/docs/security/cli/reference).
