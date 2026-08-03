@@ -541,8 +541,14 @@ def begin_deep_scan_for_scan(
         and candidate["deep_scan_owner_thread_id"] is None
         and workspace["thread_id"] is None
     ):
+        require_current_continuation(
+            candidate,
+            args.claim_token,
+            error_message="Deep Scan orchestration is owned by another continuation.",
+        )
         timestamp = now()
-        with connection:
+        connection.execute("BEGIN IMMEDIATE")
+        try:
             claimed_workspace = connection.execute(
                 "UPDATE workspaces SET thread_id = ?, updated_at = ? "
                 "WHERE id = ? AND thread_id IS NULL",
@@ -550,11 +556,16 @@ def begin_deep_scan_for_scan(
             )
             claimed_scan = connection.execute(
                 "UPDATE scans SET deep_scan_owner_thread_id = ?, updated_at = ? "
-                "WHERE id = ? AND deep_scan_owner_thread_id IS NULL",
-                (thread_id, timestamp, scan_id),
+                "WHERE id = ? AND deep_scan_owner_thread_id IS NULL "
+                "AND handoff_status = 'delivered' AND handoff_claim_token IS ?",
+                (thread_id, timestamp, scan_id, candidate["handoff_claim_token"]),
             )
             if claimed_workspace.rowcount != 1 or claimed_scan.rowcount != 1:
                 raise SystemExit("A scan can only be orchestrated from its owning Codex thread.")
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
     scan, _ = require_owned_scan(connection, scan_id, thread_id)
     require_current_continuation(
         scan,
