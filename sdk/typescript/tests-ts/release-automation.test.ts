@@ -1456,34 +1456,37 @@ describe("GitHub release workflow safeguards", () => {
     );
   });
 
-  test("executes the manual release cut against all published versions", () => {
-    const script = workflowStepShell(
-      releaseCutWorkflow,
-      "Resolve the stable package version",
-    );
-    const mocks = [
-      "git() { return 0; }",
-      "npm() { printf '%s\\n' '[\"0.1.1\",\"999999999999999999999999.0.0\"]'; }",
-    ].join("\n");
-    const result = spawnSync("bash", ["-c", `${mocks}\n${script}`], {
-      cwd: fileURLToPath(new URL("../../../", import.meta.url)),
-      encoding: "utf8",
-      env: {
-        ...process.env,
-        BEFORE_SHA: "",
-        GITHUB_EVENT_NAME: "workflow_dispatch",
-        GITHUB_OUTPUT: "/dev/null",
-        GITHUB_REF: "refs/heads/main",
-        GITHUB_SHA: releaseCommit,
-      },
-      timeout: 10_000,
-    });
+  test.skipIf(process.platform === "win32")(
+    "executes the manual release cut against all published versions",
+    () => {
+      const script = workflowStepShell(
+        releaseCutWorkflow,
+        "Resolve the stable package version",
+      );
+      const mocks = [
+        "git() { return 0; }",
+        "npm() { printf '%s\\n' '[\"0.1.1\",\"999999999999999999999999.0.0\"]'; }",
+      ].join("\n");
+      const result = spawnSync("bash", ["-c", `${mocks}\n${script}`], {
+        cwd: fileURLToPath(new URL("../../../", import.meta.url)),
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          BEFORE_SHA: "",
+          GITHUB_EVENT_NAME: "workflow_dispatch",
+          GITHUB_OUTPUT: "/dev/null",
+          GITHUB_REF: "refs/heads/main",
+          GITHUB_SHA: releaseCommit,
+        },
+        timeout: 10_000,
+      });
 
-    expect(result.status).toBe(1);
-    expect(result.stderr).toContain(
-      "Release version must be greater than every published stable version.",
-    );
-  });
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain(
+        "Release version must be greater than every published stable version.",
+      );
+    },
+  );
 
   test.each([
     {

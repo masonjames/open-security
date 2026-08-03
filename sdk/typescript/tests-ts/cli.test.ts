@@ -11,7 +11,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { delimiter, join, normalize } from "node:path";
+import { delimiter, join, normalize, resolve } from "node:path";
 import { Writable } from "node:stream";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { stripVTControlCharacters } from "node:util";
@@ -710,7 +710,7 @@ describe("CLI", () => {
       expect(scanOptions).toMatchObject({
         mode: "deep",
         knowledgeBasePaths: [
-          "/shared/architecture.pdf",
+          resolve(root, "/shared/architecture.pdf"),
           join(root, "shared/threat-models"),
         ],
       });
