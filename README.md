@@ -38,9 +38,9 @@ node sdk/typescript/bin/codex-security.mjs scan . --mode deep --workers 2 --suba
 
 The package manifest declares `open-security` as the canonical executable and preserves `codex-security` as a backward-compatible alias. The package is not published to npm yet; use the source launcher or a locally packed tarball. The source launcher keeps its upstream filename to reduce merge conflicts.
 
-For CI, set `OPENAI_API_KEY` or `CODEX_API_KEY` instead of signing in. Environment API keys are
-passed directly to the current scan and are never stored in Codex's credential
-home or system keyring.
+For CI, set `OPENAI_API_KEY` or `CODEX_API_KEY` instead of signing in.
+Environment API keys are passed directly to the current scan and are never
+stored in Codex's credential home or system keyring.
 
 Local sign-in honors Codex's configured credential backend, including a system
 keyring required by a managed device. Codex Security keeps login and scan
@@ -105,12 +105,14 @@ For CI, set `OPENAI_API_KEY` or `CODEX_API_KEY`. If both a stored ChatGPT sign-i
 | `OPEN_SECURITY_OPENROUTER_RETRY_BASE_DELAY_MS`     | Missing-header exponential retry base (`1000`–`300000`; default `30000`)              |
 | `OPEN_SECURITY_OPENROUTER_MAX_RETRY_DELAY_MS`      | Maximum accepted or calculated retry delay (`1000`–`300000`; default `120000`)        |
 | `OPEN_SECURITY_MAX_COST_USD`                       | Positive live estimated-cost limit for an individual standard scan                    |
+| `OPEN_SECURITY_LOG_LEVEL`                          | Set to `debug` for redacted CLI diagnostics                                            |
 | `OPEN_SECURITY_STATE_DIR`                          | Workbench state directory; preferred fork name                                        |
 | `OPEN_SECURITY_NO_UPDATE_NOTICE`                   | Disable interactive update notices when set                                           |
 | `OPEN_SECURITY_NPM_REGISTRY`                       | Registry base URL used only for update checks                                         |
 | `OPENROUTER_API_KEY`                               | OpenRouter API credential                                                             |
 | `OPENAI_API_KEY`                                   | OpenAI API credential                                                                 |
 | `CODEX_API_KEY`                                    | Backward-compatible OpenAI API credential alias                                       |
+| `CODEX_SECURITY_LOG_LEVEL`                         | Backward-compatible diagnostic log-level alias                                        |
 | `CODEX_SECURITY_STATE_DIR`                         | Backward-compatible state-directory alias                                             |
 
 Explicit CLI or SDK values take precedence over environment defaults. Saved scan recipes record the provider and safe model configuration, but never credentials.
@@ -150,6 +152,19 @@ Use a secret manager or ephemeral environment injection instead of committing ke
 root cause, reuses saved matches, and identifies new, persisting, reopened,
 resolved, or unknown findings. Missing findings remain unknown when coverage is
 incomplete or their original location was not reviewed.
+
+## Verbose diagnostics
+
+Add `--verbose` to print redacted scan diagnostics to stderr:
+
+```bash
+open-security scan . --verbose
+```
+
+`OPEN_SECURITY_LOG_LEVEL=debug` also enables diagnostics;
+`CODEX_SECURITY_LOG_LEVEL=debug` is the backward-compatible alias, and
+`LOG_LEVEL=debug` is the final fallback. JSON results remain on stdout, and
+credentials and provider identifiers remain redacted.
 
 ## TypeScript SDK
 

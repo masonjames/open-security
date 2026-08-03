@@ -248,6 +248,7 @@ interface ScanArguments extends DeepScanOptions {
   auth?: ScanAuthMode;
   provider?: ScanProvider;
   reasoningEffort?: string;
+  verbose?: boolean;
   repository?: string;
   paths: string[];
   knowledgeBasePaths: string[];
@@ -1057,6 +1058,10 @@ export async function main(
             .describe(
               "Model reasoning effort (default: OPEN_SECURITY_REASONING_EFFORT or provider default).",
             ),
+          verbose: z
+            .boolean()
+            .default(false)
+            .describe("Print redacted scan diagnostics to stderr."),
           path: z
             .array(optionValue("--path"))
             .default([])
@@ -1201,6 +1206,7 @@ export async function main(
             auth: options.auth,
             provider: options.provider,
             reasoningEffort: options.reasoningEffort,
+            verbose: options.verbose,
             repository: args.repository,
             paths: options.path,
             knowledgeBasePaths: options.knowledgeBase,
@@ -2738,6 +2744,17 @@ async function runExport(
   }
 }
 
+type VerboseDiagnosticValue = string | number | boolean | null | undefined;
+
+function sanitizeDiagnosticValue(value: unknown): string {
+  return redactedErrorMessage(value)
+    .replaceAll(
+      /(\b(?:tenant(?:[_-]?id)?|org(?:anization)?(?:[_-]?id)?|project(?:[_-]?id)?|(?:x[_-]?)?(?:request|trace|correlation)[_-]?id)\b(?:\\*["'])?\s*[:=]\s*)(?!\[redacted\])(?:(\\*)(['"])(?:(?!(?<!\\)\2\3)(?:\\.|[^\\]))*(?:(?<!\\)\2\3|$)|[^\s"',;&}\]]+)/giu,
+      "$1$2$3[redacted]$2$3",
+    )
+    .replaceAll(/[\u0000-\u001F\u007F\u0085\u2028\u2029]/gu, " ");
+}
+
 async function runScan(
   arguments_: ScanArguments,
   errorOutput: Writable,
@@ -2750,6 +2767,38 @@ async function runScan(
   let progress: Progress | null = null;
   let lastWorkerUpdate = "";
   let phase: string | null = null;
+  const configuredLogLevel =
+    dependencies.environment["OPEN_SECURITY_LOG_LEVEL"]?.trim() ||
+    dependencies.environment["CODEX_SECURITY_LOG_LEVEL"]?.trim() ||
+    dependencies.environment["LOG_LEVEL"]?.trim();
+  const verbose =
+    arguments_.verbose === true ||
+    configuredLogLevel?.toLowerCase() === "debug";
+  const writeAboveProgress = (write: () => void): void => {
+    if (progress === null) {
+      write();
+      return;
+    }
+    progress.writeAboveTimer(write);
+  };
+  const diagnostic = (
+    event: string,
+    fields: Readonly<Record<string, VerboseDiagnosticValue>> = {},
+  ): void => {
+    if (!verbose) return;
+    const attributes = Object.entries(fields).flatMap(([name, value]) =>
+      value === undefined
+        ? []
+        : [
+            `${name}=${JSON.stringify(typeof value === "string" ? sanitizeDiagnosticValue(value) : value)}`,
+          ],
+    );
+    writeAboveProgress(() => {
+      errorOutput.write(
+        `open-security: debug: ${event}${attributes.length === 0 ? "" : ` ${attributes.join(" ")}`}\n`,
+      );
+    });
+  };
   const preparationAbortController = new AbortController();
   const signalListener = (signal: SignalName) => () => {
     if (requestedSignal !== null) {
@@ -2791,6 +2840,9 @@ async function runScan(
     null;
   let result: ScanResult | null = null;
   let preflight: ScanPreflight | null = null;
+  let effectiveModel = DEFAULT_SCAN_MODEL_CONFIGURATION.model;
+  let effectiveReasoningEffort =
+    DEFAULT_SCAN_MODEL_CONFIGURATION.reasoningEffort;
   let selectedAuthentication: ScanAuthentication | null = null;
   let failed = false;
   let failure: unknown;
@@ -2817,6 +2869,12 @@ async function runScan(
           arguments_.effort,
         ),
     };
+    const selectedProfileName = config.codexOverrides?.["profile"];
+    ({ model: effectiveModel, reasoningEffort: effectiveReasoningEffort } =
+      scanModelConfiguration({
+        ...DEFAULT_CODEX_CONFIG,
+        ...config.codexOverrides,
+      }));
     let auth = arguments_.auth;
     selectedAuthentication = scanAuthentication(
       dependencies.environment,
@@ -2860,6 +2918,29 @@ async function runScan(
         );
       }
     }
+    diagnostic("scan.configuration", {
+      cli_version: VERSION,
+      bundled_plugin_version: BUNDLED_PLUGIN_VERSION,
+      codex_version: CODEX_EXECUTABLE_VERSION,
+      codex_sdk_version: CODEX_SDK_VERSION,
+      mode: arguments_.mode,
+      target:
+        arguments_.paths.length > 0
+          ? "paths"
+          : arguments_.diff !== undefined
+            ? "diff"
+            : arguments_.workingTree
+              ? "working_tree"
+              : "repository",
+      requested_auth: auth ?? "auto",
+      dry_run: arguments_.dryRun,
+      profile:
+        typeof selectedProfileName === "string"
+          ? selectedProfileName
+          : undefined,
+      model: effectiveModel,
+      reasoning_effort: effectiveReasoningEffort,
+    });
     progress = new Progress(errorOutput, dependencies, interactive);
     const scope = scanScope(arguments_);
     const runningMessage = (): string =>
@@ -2888,6 +2969,15 @@ async function runScan(
       failureSeverity: arguments_.failOnSeverity,
       maxCostUsd,
       onCost: (cost) => {
+        diagnostic("cost.updated", {
+          model: cost.model,
+          estimated_usd: cost.estimatedUsd,
+          input_tokens: cost.inputTokens,
+          cached_input_tokens: cost.cachedInputTokens,
+          cache_write_input_tokens: cost.cacheWriteInputTokens,
+          output_tokens: cost.outputTokens,
+          max_cost_usd: maxCostUsd,
+        });
         if (maxCostUsd === undefined) return;
         progress?.stopTimer();
         progress?.stage(
@@ -2898,6 +2988,7 @@ async function runScan(
         }
       },
       onOutputArchived: (archiveDir) => {
+        diagnostic("scan.output_archived", { archive_dir: archiveDir });
         progress?.stopTimer();
         errorOutput.write(
           `Moved existing results to: ${redactedErrorMessage(archiveDir)}\n`,
@@ -2906,9 +2997,19 @@ async function runScan(
       signal: preparationAbortController.signal,
       onOutputDirReady: (path) => {
         scanDir = path;
+        diagnostic("scan.output_ready", { scan_dir: path });
       },
       onAuthentication: (authentication) => {
         selectedAuthentication = authentication;
+        diagnostic("authentication.selected", {
+          requested: auth ?? "auto",
+          method: authentication.method,
+          source:
+            authentication.method === "api_key"
+              ? authentication.source
+              : undefined,
+          verified: authentication.verified,
+        });
         progress?.stopTimer();
         if (authentication.method === "api_key") {
           progress?.stage(
@@ -2925,10 +3026,17 @@ async function runScan(
         progress?.startTimer("Preparing scan");
       },
       onScanStarted: () => {
+        diagnostic("scan.started");
         progress?.stopTimer();
         progress?.startTimer(runningMessage());
       },
       onReconnect: (attempt, maxAttempts, details) => {
+        diagnostic("connection.retry", {
+          reason: details?.reason ?? "unknown",
+          attempt,
+          max_attempts: maxAttempts,
+          retry_after_seconds: details?.retryAfterSeconds,
+        });
         progress?.stopTimer();
         const message =
           details?.reason === "rate_limit"
@@ -2954,7 +3062,19 @@ async function runScan(
             : `dispatch:${status.phase}:${status.planned}:${status.started}`;
         if (update === lastWorkerUpdate) return;
         lastWorkerUpdate = update;
-        if (status.kind === "dispatch") phase = scanPhase(status.phase);
+        if (status.kind === "preflight") {
+          diagnostic("worker.preflight", {
+            delegation: status.delegation,
+            configured_slots: status.configuredSlots,
+          });
+        } else {
+          diagnostic("worker.phase", {
+            phase: status.phase,
+            planned: status.planned,
+            started: status.started,
+          });
+          phase = scanPhase(status.phase);
+        }
         const message = workerStatusMessage(status);
         if (message === null || progress === null) return;
         progress.stopTimer();
@@ -2962,14 +3082,22 @@ async function runScan(
         progress.startTimer(runningMessage());
       },
       onWarning: (warning) => {
-        errorOutput.write(
-          `open-security: warning: ${redactedErrorMessage(warning)}\n`,
-        );
+        writeAboveProgress(() => {
+          const message = sanitizeDiagnosticValue(warning);
+          diagnostic("scan.warning", { message });
+          errorOutput.write(`open-security: warning: ${message}\n`);
+        });
       },
       onObserverError: (observer, error) => {
-        errorOutput.write(
-          `open-security: warning: ${observer} observer failed: ${redactedErrorMessage(error)}\n`,
-        );
+        writeAboveProgress(() => {
+          diagnostic("scan.observer_failed", {
+            observer,
+            classification: classifyConnectionFailure(error),
+          });
+          errorOutput.write(
+            `open-security: warning: ${observer} observer failed: ${sanitizeDiagnosticValue(error)}\n`,
+          );
+        });
       },
     };
     if (arguments_.dryRun) {
@@ -2984,16 +3112,29 @@ async function runScan(
     failure = error;
   } finally {
     progress?.stopTimer();
-    await security?.close().catch((error: unknown) => {
-      if (!failed) {
-        failed = true;
-        failure = error;
-      }
-    });
+    if (security !== null) {
+      diagnostic("runtime.cleanup.started");
+      await security.close().then(
+        () => diagnostic("runtime.cleanup.completed"),
+        (error: unknown) => {
+          diagnostic("runtime.cleanup.failed", {
+            classification: classifyConnectionFailure(error),
+          });
+          if (!failed) {
+            failed = true;
+            failure = error;
+          }
+        },
+      );
+    }
     removeSignalListeners();
   }
 
   if (requestedSignal !== null) {
+    diagnostic("scan.interrupted", {
+      signal: requestedSignal,
+      partial_output: scanDir !== null,
+    });
     return {
       exitCode: interruptedExit(requestedSignal, scanDir, errorOutput),
       error:
@@ -3007,6 +3148,12 @@ async function runScan(
       failure instanceof OutputInsideProtectedRootError
         ? redactedErrorMessage(protectedRootErrorMessage(failure))
         : scanFailureMessage(failure, selectedAuthentication);
+    diagnostic("scan.failed", {
+      classification: isLocalScanFailure(failure)
+        ? "local"
+        : classifyConnectionFailure(failure),
+      partial_output: scanDir !== null,
+    });
     errorOutput.write(`${message}\n`);
     if (failure instanceof ScanInterruptedError) {
       return { exitCode: 2, error: message };
@@ -3019,10 +3166,29 @@ async function runScan(
     return { exitCode: 2, error: message };
   }
   if (preflight !== null) {
+    const effectivePreflight: ScanPreflight = {
+      ...preflight,
+      model: effectiveModel,
+      reasoningEffort: effectiveReasoningEffort,
+    };
     progress?.stage("Preflight complete");
-    return { exitCode: 0, data: { dryRun: true, ...preflight } };
+    diagnostic("scan.preflight.completed", {
+      model: effectivePreflight.model,
+      reasoning_effort: effectivePreflight.reasoningEffort,
+      method: effectivePreflight.authentication.method,
+      source:
+        effectivePreflight.authentication.method === "api_key"
+          ? effectivePreflight.authentication.source
+          : undefined,
+      verified: effectivePreflight.authentication.verified,
+    });
+    return { exitCode: 0, data: { dryRun: true, ...effectivePreflight } };
   }
   if (result === null) {
+    diagnostic("scan.failed", {
+      classification: "unknown",
+      message: "Scan completed without a result.",
+    });
     errorOutput.write("scan completed without a result\n");
     return { exitCode: 2, error: "Scan completed without a result." };
   }
@@ -3048,6 +3214,13 @@ async function runScan(
       dependencies.environment["NO_COLOR"] === undefined &&
       dependencies.environment["TERM"] !== "dumb",
   );
+  diagnostic("scan.completed", {
+    coverage: result.coverage.completeness,
+    findings: result.findings.findings.length,
+    scan_id: result.manifest.scan.id,
+    estimated_usd: result.cost?.estimatedUsd,
+    exit_code: incomplete ? 2 : blockingCount > 0 ? 1 : 0,
+  });
   if (incomplete) {
     errorOutput.write(
       threshold === undefined
@@ -3105,9 +3278,15 @@ function scanFailureMessage(
   error: unknown,
   authentication: ScanAuthentication | null,
 ): string {
-  // Local filesystem and configuration failures keep their redacted message;
-  // they must not be rewritten as connectivity or credential advice.
-  if (isLocalScanFailure(error)) return redactedErrorMessage(error);
+  // A local failure keeps its own message. Classification matches bare words
+  // such as "permission denied" anywhere in the text, so an EACCES from a
+  // read-only TMPDIR would otherwise be reported as a credential problem.
+  //
+  // The advice branches below still replace the underlying text rather than
+  // appending it. That is deliberate: upstream authentication and authorization
+  // errors can name the organization or project, which must not reach stderr or
+  // the JSON error field.
+  if (isLocalScanFailure(error)) return sanitizeDiagnosticValue(error);
   const openRouter =
     authentication?.method === "api_key" &&
     authentication.source === "OPENROUTER_API_KEY";
@@ -3134,7 +3313,7 @@ function scanFailureMessage(
     case "network_error":
     case "timeout":
     case "unknown":
-      return redactedErrorMessage(error);
+      return sanitizeDiagnosticValue(error);
   }
 }
 
@@ -3455,6 +3634,7 @@ export class Progress {
   readonly #startedAt: number;
   readonly #interactive: boolean;
   #timer: NodeJS.Timeout | null = null;
+  #timerMessage: string | null = null;
   #timerLineActive = false;
   #cursorHidden = false;
 
@@ -3499,6 +3679,7 @@ export class Progress {
       () => this.#renderTimer(message),
       PROGRESS_REFRESH_MILLISECONDS,
     );
+    this.#timerMessage = message;
   }
 
   public stopTimer(): void {
@@ -3506,6 +3687,7 @@ export class Progress {
       this.#dependencies.clearInterval(this.#timer);
       this.#timer = null;
     }
+    this.#timerMessage = null;
     if (this.#timerLineActive) {
       this.#stream.write("\n");
       this.#timerLineActive = false;
@@ -3513,6 +3695,20 @@ export class Progress {
     if (this.#cursorHidden) {
       this.#stream.write(SHOW_CURSOR);
       this.#cursorHidden = false;
+    }
+  }
+
+  public writeAboveTimer(write: () => void): void {
+    const message = this.#timerMessage;
+    if (message === null) {
+      write();
+      return;
+    }
+    this.stopTimer();
+    try {
+      write();
+    } finally {
+      this.startTimer(message);
     }
   }
 

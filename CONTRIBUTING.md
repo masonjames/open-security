@@ -4,6 +4,10 @@ Open Security is a community-maintained fork of
 [OpenAI's Codex Security](https://github.com/openai/codex-security). Issues and
 pull requests are welcome in this repository.
 
+We welcome bug reports, feature requests, documentation corrections, and
+feedback from open-source maintainers. Support is best effort. Scan only
+repositories you trust and either own or have permission to assess.
+
 The fork keeps inherited runtime identifiers such as `codex-security`, its
 artifact schemas, and legacy environment variables stable. Avoid renaming those
 contracts unless the change includes a compatibility and migration plan. This
@@ -13,11 +17,22 @@ keeps existing scan history usable and makes upstream updates easier to merge.
 
 Search [existing GitHub issues](https://github.com/masonjames/open-security/issues)
 before opening a new one. Include the installed CLI or SDK version, operating
-system, reproduction steps, expected behavior, and the observed result.
+system, reproduction steps, expected behavior, and the observed result. Remove
+credentials, private code, customer data, and security findings before posting.
 
-Remove API keys, access tokens, repository contents, security findings, and
-other sensitive information from public reports. Report security vulnerabilities
-privately as described in [SECURITY.md](SECURITY.md).
+## Suggest a feature or improve the documentation
+
+Open an issue describing the problem and the workflow you want to support.
+Documentation corrections and safe examples are welcome.
+
+## Report a security issue
+
+Report Open Security vulnerabilities privately as described in
+[SECURITY.md](SECURITY.md). Do not post vulnerabilities, exploit details,
+credentials, or sensitive scan results publicly.
+
+If a scan finds a vulnerability in another project, report it to that
+project's maintainers through their security policy.
 
 ## Make a change
 
