@@ -1558,23 +1558,36 @@ describe("GitHub release workflow safeguards", () => {
 
       try {
         const outputPath = join(workspace, "outputs");
-        const result = spawnSync("bash", ["-c", `${mocks}\n${script}`], {
-          cwd: fileURLToPath(new URL("../../../", import.meta.url)),
-          encoding: "utf8",
-          env: {
-            ...process.env,
-            GITHUB_EVENT_NAME: event,
-            GITHUB_OUTPUT: outputPath,
-            GITHUB_REF: "refs/heads/main",
-            GITHUB_SHA: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            MOCK_PREVIOUS_SHA: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-            MOCK_PREVIOUS_VERSION: previousVersion,
-            MOCK_PUBLISHED_VERSIONS: JSON.stringify(publishedVersions),
-            MOCK_RELEASE_VERSION: currentVersion,
-            RELEASE_SHA: releaseCommit,
-          },
-          timeout: 10_000,
-        });
+        const runScript = () =>
+          spawnSync("bash", ["-c", `${mocks}\n${script}`], {
+            cwd: fileURLToPath(new URL("../../../", import.meta.url)),
+            encoding: "utf8",
+            env: {
+              ...process.env,
+              GITHUB_EVENT_NAME: event,
+              GITHUB_OUTPUT: outputPath,
+              GITHUB_REF: "refs/heads/main",
+              GITHUB_SHA: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              MOCK_PREVIOUS_SHA: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              MOCK_PREVIOUS_VERSION: previousVersion,
+              MOCK_PUBLISHED_VERSIONS: JSON.stringify(publishedVersions),
+              MOCK_RELEASE_VERSION: currentVersion,
+              RELEASE_SHA: releaseCommit,
+            },
+            timeout: 10_000,
+          });
+        let result = runScript();
+
+        if (
+          process.platform === "win32" &&
+          result.status === null &&
+          result.signal === null &&
+          (result.error as NodeJS.ErrnoException | undefined)?.code !==
+            "ETIMEDOUT"
+        ) {
+          rmSync(outputPath, { force: true });
+          result = runScript();
+        }
 
         expect(result.stderr).toBe("");
         expect(result.status).toBe(0);
