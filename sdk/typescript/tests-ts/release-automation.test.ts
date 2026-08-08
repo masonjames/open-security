@@ -10,7 +10,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { describe, expect, test } from "bun:test";
+import { beforeAll, describe, expect, test } from "bun:test";
 
 type ReleaseMetadata = Record<string, unknown>;
 
@@ -196,6 +196,177 @@ const releaseLabelsWorkflow = readFileSync(
   ),
   "utf8",
 );
+
+type BashSpawnResult = {
+  status: number | null;
+  signal: NodeJS.Signals | null;
+  error?: Error;
+  stderr?: string | Buffer | null;
+};
+
+type BashSpawnReadiness =
+  | { kind: "ready" }
+  | { kind: "retry"; reason: "windows-null-status" }
+  | {
+      kind: "fatal";
+      reason:
+        | "timeout"
+        | "missing-bash"
+        | "spawn-error"
+        | "signal"
+        | "nonzero-exit"
+        | "null-status";
+    };
+
+function classifyBashSpawn(
+  result: BashSpawnResult,
+  platform: NodeJS.Platform,
+): BashSpawnReadiness {
+  const errorCode = (result.error as NodeJS.ErrnoException | undefined)?.code;
+
+  if (errorCode === "ETIMEDOUT") {
+    return { kind: "fatal", reason: "timeout" };
+  }
+  if (errorCode === "ENOENT") {
+    return { kind: "fatal", reason: "missing-bash" };
+  }
+  if (result.error !== undefined) {
+    return { kind: "fatal", reason: "spawn-error" };
+  }
+  if (result.signal !== null) {
+    return { kind: "fatal", reason: "signal" };
+  }
+  if (result.status === 0) {
+    return { kind: "ready" };
+  }
+  if (result.status !== null) {
+    return { kind: "fatal", reason: "nonzero-exit" };
+  }
+  if (platform === "win32") {
+    return { kind: "retry", reason: "windows-null-status" };
+  }
+  return { kind: "fatal", reason: "null-status" };
+}
+
+function bashSpawnFailure(
+  result: BashSpawnResult,
+  outcome: Exclude<BashSpawnReadiness, { kind: "ready" }>,
+  attempts: number,
+): Error {
+  const errorCode = (result.error as NodeJS.ErrnoException | undefined)?.code;
+  const stderr =
+    typeof result.stderr === "string"
+      ? result.stderr.trim()
+      : result.stderr?.toString("utf8").trim();
+  const details = [
+    `reason=${outcome.reason}`,
+    `attempts=${attempts}`,
+    `status=${String(result.status)}`,
+    `signal=${String(result.signal)}`,
+    errorCode === undefined ? undefined : `error=${errorCode}`,
+    stderr === undefined || stderr === "" ? undefined : `stderr=${stderr}`,
+  ]
+    .filter((detail) => detail !== undefined)
+    .join(", ");
+
+  return new Error(`Bash readiness probe failed: ${details}`);
+}
+
+async function ensureBashSpawnReady(): Promise<void> {
+  const retryDelaysMs = process.platform === "win32" ? [25, 75, 150] : [];
+  let attempts = 0;
+
+  while (true) {
+    attempts += 1;
+    const result = spawnSync("bash", ["-c", "exit 0"], {
+      encoding: "utf8",
+      timeout: 5_000,
+    });
+    const outcome = classifyBashSpawn(result, process.platform);
+
+    if (outcome.kind === "ready") {
+      return;
+    }
+    if (outcome.kind === "fatal") {
+      throw bashSpawnFailure(result, outcome, attempts);
+    }
+
+    const delayMs = retryDelaysMs[attempts - 1];
+    if (delayMs === undefined) {
+      throw bashSpawnFailure(result, outcome, attempts);
+    }
+    await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
+  }
+}
+
+beforeAll(ensureBashSpawnReady);
+
+describe("Bash spawn readiness classification", () => {
+  test.each([
+    {
+      scenario: "accepts a clean exit",
+      result: { status: 0, signal: null },
+      platform: "win32" as const,
+      expected: { kind: "ready" },
+    },
+    {
+      scenario: "retries only the Windows null-status anomaly",
+      result: { status: null, signal: null },
+      platform: "win32" as const,
+      expected: { kind: "retry", reason: "windows-null-status" },
+    },
+    {
+      scenario: "rejects a null status on other platforms",
+      result: { status: null, signal: null },
+      platform: "darwin" as const,
+      expected: { kind: "fatal", reason: "null-status" },
+    },
+    {
+      scenario: "rejects a nonzero shell exit",
+      result: { status: 1, signal: null },
+      platform: "win32" as const,
+      expected: { kind: "fatal", reason: "nonzero-exit" },
+    },
+    {
+      scenario: "rejects signal termination",
+      result: { status: null, signal: "SIGTERM" as NodeJS.Signals },
+      platform: "win32" as const,
+      expected: { kind: "fatal", reason: "signal" },
+    },
+    {
+      scenario: "rejects a timeout",
+      result: {
+        status: null,
+        signal: null,
+        error: Object.assign(new Error("timed out"), { code: "ETIMEDOUT" }),
+      },
+      platform: "win32" as const,
+      expected: { kind: "fatal", reason: "timeout" },
+    },
+    {
+      scenario: "rejects missing Bash",
+      result: {
+        status: null,
+        signal: null,
+        error: Object.assign(new Error("missing"), { code: "ENOENT" }),
+      },
+      platform: "win32" as const,
+      expected: { kind: "fatal", reason: "missing-bash" },
+    },
+    {
+      scenario: "rejects another spawn error",
+      result: {
+        status: null,
+        signal: null,
+        error: Object.assign(new Error("denied"), { code: "EACCES" }),
+      },
+      platform: "win32" as const,
+      expected: { kind: "fatal", reason: "spawn-error" },
+    },
+  ])("$scenario", ({ result, platform, expected }) => {
+    expect(classifyBashSpawn(result, platform)).toEqual(expected);
+  });
+});
 
 function publishedMetadata(): ReleaseMetadata {
   return {
@@ -1558,36 +1729,23 @@ describe("GitHub release workflow safeguards", () => {
 
       try {
         const outputPath = join(workspace, "outputs");
-        const runScript = () =>
-          spawnSync("bash", ["-c", `${mocks}\n${script}`], {
-            cwd: fileURLToPath(new URL("../../../", import.meta.url)),
-            encoding: "utf8",
-            env: {
-              ...process.env,
-              GITHUB_EVENT_NAME: event,
-              GITHUB_OUTPUT: outputPath,
-              GITHUB_REF: "refs/heads/main",
-              GITHUB_SHA: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-              MOCK_PREVIOUS_SHA: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-              MOCK_PREVIOUS_VERSION: previousVersion,
-              MOCK_PUBLISHED_VERSIONS: JSON.stringify(publishedVersions),
-              MOCK_RELEASE_VERSION: currentVersion,
-              RELEASE_SHA: releaseCommit,
-            },
-            timeout: 10_000,
-          });
-        let result = runScript();
-
-        if (
-          process.platform === "win32" &&
-          result.status === null &&
-          result.signal === null &&
-          (result.error as NodeJS.ErrnoException | undefined)?.code !==
-            "ETIMEDOUT"
-        ) {
-          rmSync(outputPath, { force: true });
-          result = runScript();
-        }
+        const result = spawnSync("bash", ["-c", `${mocks}\n${script}`], {
+          cwd: fileURLToPath(new URL("../../../", import.meta.url)),
+          encoding: "utf8",
+          env: {
+            ...process.env,
+            GITHUB_EVENT_NAME: event,
+            GITHUB_OUTPUT: outputPath,
+            GITHUB_REF: "refs/heads/main",
+            GITHUB_SHA: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            MOCK_PREVIOUS_SHA: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            MOCK_PREVIOUS_VERSION: previousVersion,
+            MOCK_PUBLISHED_VERSIONS: JSON.stringify(publishedVersions),
+            MOCK_RELEASE_VERSION: currentVersion,
+            RELEASE_SHA: releaseCommit,
+          },
+          timeout: 10_000,
+        });
 
         expect(result.stderr).toBe("");
         expect(result.status).toBe(0);
