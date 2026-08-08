@@ -24,21 +24,21 @@ from typing import Any
 
 try:
     import fcntl as posix_file_lock
-except ModuleNotFoundError:  # pragma: no cover - exercised through the Windows lock test.
+except ModuleNotFoundError:  # pragma: no cover
     posix_file_lock = None
 
 try:
     import msvcrt as windows_file_lock
-except ModuleNotFoundError:  # pragma: no cover - msvcrt is only available on Windows.
+except ModuleNotFoundError:  # pragma: no cover
     windows_file_lock = None
 
-# Plugin hosts may enable safe-path isolation.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import deep_scan_workbench as deep_scan
 import workbench_native_indexes as native_indexes
 import workbench_progress as progress
 import workbench_remediation as remediation
 import workbench_scan_history as scan_history
+import workbench_scan_usage as scan_usage
 from filesystem_identity import serialize_filesystem_identity as serialize_filesystem_identity
 from filesystem_identity import (
     stored_filesystem_identity_matches as stored_filesystem_identity_matches,
@@ -79,6 +79,7 @@ from workbench_constants import (
     SQLITE_RETRY_ATTEMPTS,
 )
 from workbench_feedback import get_scan_feedback
+from workbench_remediation import remediation_claim_is_active
 from workbench_scan_start import (
     archive_scan,
     compact_timestamp,
@@ -96,7 +97,15 @@ from workbench_scan_start import (
     stored_diff_target,
     validate_archive_guard,
 )
-from workbench_schema import MIGRATIONS, normalize_pre_release_migrations, sql_statements
+from workbench_schema import (
+    MIGRATIONS,
+)
+from workbench_schema import (
+    apply_migrations as apply_schema_migrations,
+)
+from workbench_schema import (
+    sql_statements as sql_statements,
+)
 from workbench_source_excerpt import finding_source_excerpt
 from workbench_target import (
     clean_worktree_content_digest,
@@ -120,13 +129,14 @@ from workbench_target import (
 from workbench_target_state import backfill_security_targets, ensure_security_target
 from workbench_validation import (
     bounded_output_text,
-    capability_preflight_input,
-    capability_preflight_json,
     optional_text,
     parse_scan_cost,
-    require_close_reason,
+    path_within_scope,
+    require_close_note,
     require_occurrence,
     require_uuid,
+    sqlite_busy,
+    user_text,
 )
 
 FINDING_ARTIFACT_DIRECTORIES_LIMIT = 80
@@ -143,23 +153,6 @@ def stale_claim_before(seconds: int = CLAIM_LEASE_SECONDS) -> str:
     return (
         (datetime.now(timezone.utc) - timedelta(seconds=seconds)).isoformat().replace("+00:00", "Z")
     )
-
-
-def remediation_claim_is_active(remediation: sqlite3.Row) -> bool:
-    if remediation["pending_action_claim_token"] is None:
-        return False
-    delivered_at = remediation["pending_action_delivered_at"]
-    claimed_at = delivered_at or remediation["pending_action_claimed_at"]
-    if not isinstance(claimed_at, str):
-        return True
-    try:
-        parsed = datetime.fromisoformat(claimed_at)
-        if parsed.tzinfo is None:
-            return True
-    except ValueError:
-        return True
-    lease_seconds = DELIVERED_ACTION_LEASE_SECONDS if delivered_at else CLAIM_LEASE_SECONDS
-    return parsed > datetime.now(timezone.utc) - timedelta(seconds=lease_seconds)
 
 
 def state_dir() -> Path:
@@ -208,7 +201,6 @@ def acquire_completion_file_lock(descriptor: int) -> None:
     if windows_file_lock is None:
         raise SystemExit("Scan completion requires operating-system file locking support.")
 
-    # Retry seeding and locking the first byte.
     while os.fstat(descriptor).st_size == 0:
         os.lseek(descriptor, 0, os.SEEK_SET)
         try:
@@ -269,75 +261,8 @@ def connect() -> sqlite3.Connection:
     raise AssertionError("SQLite retry loop exhausted unexpectedly.")
 
 
-def sqlite_busy(error: sqlite3.OperationalError) -> bool:
-    return "locked" in str(error).lower() or "busy" in str(error).lower()
-
-
-def setup_preference(connection: sqlite3.Connection) -> dict[str, bool]:
-    row = connection.execute(
-        "SELECT skip_setup_ui FROM setup_preferences WHERE singleton = 1"
-    ).fetchone()
-    return {"skipSetupUi": bool(row["skip_setup_ui"]) if row is not None else False}
-
-
-def record_setup_ui_disabled(connection: sqlite3.Connection, timestamp: str) -> None:
-    connection.execute(
-        """
-        INSERT INTO setup_preferences (singleton, skip_setup_ui, updated_at)
-        VALUES (1, ?, ?)
-        ON CONFLICT(singleton) DO UPDATE SET
-            skip_setup_ui = excluded.skip_setup_ui,
-            updated_at = excluded.updated_at
-        """,
-        (1, timestamp),
-    )
-
-
-def disable_setup_ui(connection: sqlite3.Connection, args: argparse.Namespace) -> dict[str, Any]:
-    workspace_id = require_uuid(args.workspace_id, "workspace-id")
-    try:
-        connection.execute("BEGIN IMMEDIATE")
-        require_workspace(connection, workspace_id)
-        record_setup_ui_disabled(connection, now())
-        connection.commit()
-    except BaseException:
-        connection.rollback()
-        raise
-    return workspace_state(connection, workspace_id)
-
-
 def apply_migrations(connection: sqlite3.Connection) -> None:
-    connection.commit()
-    connection.execute("BEGIN IMMEDIATE")
-    try:
-        connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS schema_migrations (
-                version INTEGER PRIMARY KEY,
-                name TEXT NOT NULL,
-                applied_at TEXT NOT NULL
-            )
-            """
-        )
-        normalize_pre_release_migrations(connection, now())
-        applied = {
-            row["version"] for row in connection.execute("SELECT version FROM schema_migrations")
-        }
-        for version, name, sql in MIGRATIONS:
-            if version in applied:
-                continue
-            for statement in sql_statements(sql):
-                connection.execute(statement)
-            connection.execute(
-                "INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)",
-                (version, name, now()),
-            )
-        if 16 not in applied:
-            backfill_security_targets(connection)
-        connection.commit()
-    except BaseException:
-        connection.rollback()
-        raise
+    apply_schema_migrations(connection, MIGRATIONS, now, backfill_security_targets)
 
 
 def require_target(value: str) -> Path:
@@ -599,8 +524,6 @@ def expected_coverage_mode(scan: sqlite3.Row) -> str:
 
 
 def workbench_completion_binding(scan: sqlite3.Row, completed_at: str) -> dict[str, Any]:
-    """Return deterministic draft fields owned by the selected workbench scan."""
-
     contract = scan_contract(scan)
     target_contract = contract["target"]
     plugin_manifest = read_json_object(
@@ -713,16 +636,6 @@ def verify_manifest_binding(scan: sqlite3.Row, manifest: dict[str, Any]) -> None
             raise SystemExit("scan-manifest.json scope must stay inside the workbench scan scope.")
 
 
-def path_within_scope(path: str, scope: str) -> bool:
-    candidate = PurePosixPath(path)
-    requested = PurePosixPath(scope)
-    if candidate.is_absolute() or ".." in candidate.parts:
-        return False
-    if requested == PurePosixPath("."):
-        return True
-    return candidate == requested or requested in candidate.parents
-
-
 def require_scope(scope: str, mode: str, target: Path) -> str:
     value = scope.strip() or "."
     if "\\" in value:
@@ -817,13 +730,6 @@ def create_workspace(connection: sqlite3.Connection, args: argparse.Namespace) -
                 diff_content_digest = inspected["diffTarget"].get("contentDigest")
         except SystemExit:
             pass
-    preflight_json = capability_preflight_json(
-        capability_preflight_input(
-            args.capability_preflight_json, args.capability_preflight_json_file
-        ),
-        checked_target_path=target_path,
-        checked_mode=args.mode,
-    )
     with connection:
         target_id = (
             ensure_security_target(connection, target_path) if target_path is not None else None
@@ -834,8 +740,8 @@ def create_workspace(connection: sqlite3.Connection, args: argparse.Namespace) -
                 id, thread_id, target_id, target_path, target_title, target_summary,
                 default_scope, default_mode,
                 user_context, diff_target_kind, diff_base_revision, diff_head_revision,
-                diff_content_digest, capability_preflight_json, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                diff_content_digest, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 workspace_id,
@@ -846,66 +752,16 @@ def create_workspace(connection: sqlite3.Connection, args: argparse.Namespace) -
                 optional_text(args.target_summary, maximum=2400),
                 default_scope,
                 args.mode,
-                optional_text(args.user_context),
+                user_text(args.user_context),
                 diff_target_kind,
                 diff_base_revision,
                 diff_head_revision,
                 diff_content_digest,
-                preflight_json,
                 timestamp,
                 timestamp,
             ),
         )
     return workspace_state(connection, workspace_id)
-
-
-def latest_workspace(connection: sqlite3.Connection, thread_id: str) -> dict[str, Any]:
-    thread_id = optional_text(thread_id, maximum=512)
-    if thread_id is None:
-        raise SystemExit("thread-id is required.")
-    row = connection.execute(
-        """
-        SELECT workspaces.id
-        FROM workspaces
-        LEFT JOIN scans ON scans.id = workspaces.active_scan_id
-        WHERE workspaces.thread_id = ?
-        ORDER BY
-            CASE WHEN scans.status = 'running' THEN 0 ELSE 1 END,
-            CASE WHEN scans.status = 'running' THEN
-                MAX(
-                    workspaces.updated_at,
-                    scans.updated_at,
-                    COALESCE((
-                        SELECT MAX(progress.updated_at)
-                        FROM scan_progress AS progress
-                        WHERE progress.scan_id = scans.id
-                    ), '')
-                )
-            ELSE
-                MAX(
-                    workspaces.updated_at,
-                    COALESCE((
-                        SELECT MAX(triage.updated_at)
-                        FROM finding_triage AS triage
-                        JOIN finding_occurrences AS occurrences
-                            ON occurrences.id = triage.occurrence_id
-                        WHERE occurrences.scan_id = scans.id
-                    ), ''),
-                    COALESCE((
-                        SELECT MAX(remediation.updated_at)
-                        FROM finding_remediation_attempts AS remediation
-                        JOIN finding_occurrences AS occurrences
-                            ON occurrences.id = remediation.occurrence_id
-                        WHERE occurrences.scan_id = scans.id
-                    ), '')
-                )
-            END DESC,
-            workspaces.created_at DESC
-        LIMIT 1
-        """,
-        (thread_id,),
-    ).fetchone()
-    return {"workspace": workspace_state(connection, row["id"]) if row is not None else None}
 
 
 def save_workspace(connection: sqlite3.Connection, args: argparse.Namespace) -> dict[str, Any]:
@@ -945,7 +801,7 @@ def save_workspace(connection: sqlite3.Connection, args: argparse.Namespace) -> 
             SET target_id = ?, target_path = ?, target_title = ?, target_summary = ?, default_scope = ?,
                 default_mode = ?, user_context = ?, diff_target_kind = ?,
                 diff_base_revision = ?, diff_head_revision = ?, diff_content_digest = ?,
-                diff_resolution_id = NULL, submitted = 1, updated_at = ?
+                submitted = 1, updated_at = ?
             WHERE id = ? AND active_scan_id IS NULL
             """,
             (
@@ -955,7 +811,7 @@ def save_workspace(connection: sqlite3.Connection, args: argparse.Namespace) -> 
                 target_summary,
                 scope,
                 args.mode,
-                optional_text(args.user_context),
+                user_text(args.user_context),
                 diff_target["kind"] if diff_target else None,
                 diff_target["baseRevision"] if diff_target else None,
                 diff_target["headRevision"] if diff_target else None,
@@ -1107,8 +963,6 @@ def require_state_outside_target(target: str | Path) -> None:
         raise SystemExit(
             "The workbench state directory must be outside the selected target."
         )
-
-
 def scan_target_root(scan_root: str | None, target: Path) -> Path:
     if os.name == "nt":
         raise SystemExit(
@@ -1271,6 +1125,8 @@ def start_scan(connection: sqlite3.Connection, args: argparse.Namespace) -> dict
             target_summary=target_summary,
             scope_file_count=scope_file_count,
             timestamp=timestamp,
+            model=args.model,
+            reasoning_effort=args.reasoning_effort,
         )
         if manages_transaction:
             connection.commit()
@@ -1283,6 +1139,18 @@ def start_scan(connection: sqlite3.Connection, args: argparse.Namespace) -> dict
 
 def start_prompt_only_scan(
     connection: sqlite3.Connection, args: argparse.Namespace
+) -> dict[str, Any]:
+    return _start_prompt_driven_scan(connection, args, headless_standard=False)
+
+
+def start_headless_standard_scan(
+    connection: sqlite3.Connection, args: argparse.Namespace
+) -> dict[str, Any]:
+    return _start_prompt_driven_scan(connection, args, headless_standard=True)
+
+
+def _start_prompt_driven_scan(
+    connection: sqlite3.Connection, args: argparse.Namespace, *, headless_standard: bool
 ) -> dict[str, Any]:
     thread_id = optional_text(args.thread_id, maximum=512)
     if thread_id is None:
@@ -1301,7 +1169,7 @@ def start_prompt_only_scan(
     target_path = str(target)
     scope = inspected["scope"]
     diff_target = inspected["diffTarget"]
-    user_context = optional_text(args.user_context)
+    user_context = user_text(args.user_context)
     target_summary = optional_text(args.target_summary, maximum=2400)
     if diff_target is not None and not target_summary:
         target_summary = diff_target_summary(diff_target)
@@ -1314,10 +1182,6 @@ def start_prompt_only_scan(
 
     connection.execute("BEGIN IMMEDIATE")
     try:
-        if not setup_preference(connection)["skipSetupUi"]:
-            raise SystemExit(
-                "Prompt-only scanning requires the persisted setup UI opt-out preference."
-            )
         current_target = require_remediation_target(target_path)
         current_diff_target = (
             require_diff_target(
@@ -1350,7 +1214,13 @@ def start_prompt_only_scan(
                 AND scans.target_snapshot_digest IS ? AND scans.target_device = ?
                 AND scans.target_inode = ? AND scans.status = 'running'
                 AND scans.handoff_status = 'delivered'
-                AND scans.handoff_claim_token IS NULL
+                AND (
+                    (? = 0 AND scans.handoff_claim_token IS NULL)
+                    OR (
+                        ? = 1 AND scans.handoff_claim_token IS NOT NULL
+                        AND scans.continuation_thread_id = ?
+                    )
+                )
             ORDER BY scans.updated_at DESC, scans.started_at DESC, scans.id LIMIT 1
             """,
             (
@@ -1362,6 +1232,9 @@ def start_prompt_only_scan(
                 target_summary,
                 *diff_identity,
                 *target_identity,
+                int(headless_standard),
+                int(headless_standard),
+                thread_id,
             ),
         ).fetchone()
         if existing is not None:
@@ -1409,7 +1282,21 @@ def start_prompt_only_scan(
             scope_file_count=scope_file_count,
             timestamp=timestamp,
             handoff_status="delivered",
+            model=args.model,
+            reasoning_effort=args.reasoning_effort,
         )
+        if headless_standard:
+            claimed = connection.execute(
+                """
+                UPDATE scans
+                SET handoff_claim_token = ?, continuation_thread_id = ?
+                WHERE id = ? AND status = 'running' AND handoff_status = 'delivered'
+                    AND handoff_claim_token IS NULL AND continuation_thread_id IS NULL
+                """,
+                (str(uuid.uuid4()), thread_id, scan_id),
+            )
+            if claimed.rowcount != 1:
+                raise SystemExit("Codex Security headless scan ownership could not be recorded.")
         connection.commit()
     except BaseException:
         connection.rollback()
@@ -1469,7 +1356,12 @@ def complete_scan(
     cost_json = None if prepare_only else parse_scan_cost(args.cost_json)
     with scan_completion_lock(scan_id):
         return complete_scan_locked(
-            connection, scan_id, args.claim_token, cost_json, prepare_only=prepare_only
+            connection,
+            scan_id,
+            args.claim_token,
+            cost_json,
+            prepare_only=prepare_only,
+            thread_id=getattr(args, "thread_id", None),
         )
 
 
@@ -1499,6 +1391,7 @@ def complete_scan_locked(
     cost_json: str | None,
     *,
     prepare_only: bool = False,
+    thread_id: str | None = None,
 ) -> dict[str, Any]:
     scan = require_scan(connection, scan_id)
     if scan["status"] == "complete":
@@ -1532,10 +1425,13 @@ def complete_scan_locked(
     )
     if scan["recipe_json"] is None:
         deep_scan.require_deep_scan_ready_for_parent_completion(connection, scan)
-    target_warnings = json.loads(scan["completion_warnings_json"])
+    warnings = json.loads(scan["completion_warnings_json"])
+    target_warnings: list[str] = []
     warning = scan_target_warning(scan)
-    if warning is not None and warning not in target_warnings:
+    if warning is not None:
         target_warnings.append(warning)
+        if warning not in warnings:
+            warnings.append(warning)
     scan_dir = require_canonical_scan_directory(Path(scan["scan_dir"]))
     require_private_scan_directory(scan_dir)
     require_safe_scan_parents(
@@ -1586,7 +1482,6 @@ def complete_scan_locked(
     scan_completed_at = completion_binding["completedAt"]
     try:
         for _ in range(3):
-            warnings = list(target_warnings)
             prepared = _prepare_scan_finalization(
                 scan_dir,
                 expected_coverage_mode=expected_coverage_mode(scan),
@@ -1594,9 +1489,10 @@ def complete_scan_locked(
                 completion_warnings=warnings,
             )
             warning = scan_target_warning(scan)
-            if warning is None or warning in target_warnings:
+            if warning is None or warning in warnings:
                 break
             target_warnings.append(warning)
+            warnings.append(warning)
         else:
             raise SystemExit("Scan target changed repeatedly while completion was being prepared.")
         manifest, findings, _ = _write_prepared_scan_finalization(prepared)
@@ -1635,9 +1531,29 @@ def complete_scan_locked(
         except BaseException:
             connection.rollback()
             raise
-        return scan_context(connection, scan["id"])
+        context = scan_context(connection, scan["id"])
+        context["targetWarnings"] = target_warnings
+        return context
     if manifest_digest != prepared_manifest_digest:
         raise SystemExit("The prepared scan manifest changed before completion.")
+
+    if cost_json is None:
+        measured_usage = scan_usage.collect_scan_usage(
+            connection,
+            scan,
+            thread_id=thread_id,
+            completed_at=scan_completed_at,
+        )
+        if measured_usage:
+            measured_cost = json.loads(
+                scan_usage.measured_scan_cost_json(measured_usage)
+            )
+            stored_cost = scan_usage.stored_scan_cost_fields(scan["cost_json"])
+            if "cost" in stored_cost:
+                measured_cost["cost"] = stored_cost["cost"]
+            cost_json = parse_scan_cost(
+                json.dumps(measured_cost, separators=(",", ":"), allow_nan=False)
+            )
     connection.execute("BEGIN IMMEDIATE")
     try:
         timestamp = manifest["scan"]["completedAt"]
@@ -1722,7 +1638,9 @@ def complete_scan_locked(
     except BaseException:
         connection.rollback()
         raise
-    return scan_context(connection, scan["id"])
+    context = scan_context(connection, scan["id"])
+    context["targetWarnings"] = target_warnings
+    return context
 
 
 def require_output_outside_archive_journal(
@@ -1904,6 +1822,7 @@ def register_cli_scan(connection: sqlite3.Connection, args: argparse.Namespace) 
         "contract": scan_contract(scan),
         "scanDir": str(scan_dir),
         "scanId": scan_id,
+        "scopeFileCount": scope_file_count,
         "targetId": target_id,
         "targetRevision": scan["target_revision"],
     }
@@ -2030,6 +1949,7 @@ def fail_scan_locked(
             claim_token,
             error_message="Scan failure is owned by another continuation.",
         )
+        message = optional_text(message, maximum=2400)
         updated = connection.execute(
             """
             UPDATE scans
@@ -2114,7 +2034,7 @@ def set_finding_triage(connection: sqlite3.Connection, args: argparse.Namespace)
     if args.status == "closed" and close_reason is None:
         raise SystemExit("Choose why this finding is being closed.")
     note = optional_text(args.note, maximum=2400)
-    require_close_reason(close_reason, note)
+    require_close_note(close_reason, note)
     connection.execute("BEGIN IMMEDIATE")
     try:
         timestamp = now()
@@ -3084,9 +3004,7 @@ def workspace_state(
     result: dict[str, Any] = {
         "id": workspace["id"],
         "diffTarget": persisted_diff_target,
-        "diffResolutionId": workspace["diff_resolution_id"],
         "mode": workspace["default_mode"],
-        "recentTargets": [],
         "scope": workspace["default_scope"],
         "setup": {"submitted": bool(workspace["submitted"])},
         "setupValidation": {"error": None, "valid": bool(workspace["submitted"])},
@@ -3096,11 +3014,11 @@ def workspace_state(
         "updatedAt": workspace["updated_at"],
         "userContext": workspace["user_context"],
     }
-    if workspace["capability_preflight_json"]:
-        result["capabilityPreflight"] = json.loads(workspace["capability_preflight_json"])
     selected_scan_id = result_scan_id or workspace["active_scan_id"]
     if selected_scan_id:
-        result["results"] = scan_result(connection, require_scan(connection, selected_scan_id))
+        selected_scan = require_scan(connection, selected_scan_id)
+        result["userContext"] = selected_scan["user_context"]
+        result["results"] = scan_result(connection, selected_scan)
         return result
 
     target_metadata = None
@@ -3127,7 +3045,6 @@ def workspace_state(
             except SystemExit:
                 pass
     result["diffTarget"] = validated_diff_target or persisted_diff_target
-    result["recentTargets"] = recent_targets(connection)
     result["setupValidation"] = {
         "error": setup_error,
         "valid": setup_error is None and bool(target_metadata),
@@ -3135,28 +3052,6 @@ def workspace_state(
     if target_metadata:
         result["targetMetadata"] = target_metadata
     return result
-
-
-def recent_targets(connection: sqlite3.Connection) -> list[dict[str, Any]]:
-    targets: list[dict[str, Any]] = []
-    rows = connection.execute(
-        """
-        SELECT target_path, MAX(updated_at) AS last_used_at
-        FROM workspaces
-        WHERE submitted = 1 AND target_path IS NOT NULL
-        GROUP BY target_path
-        ORDER BY last_used_at DESC
-        """
-    )
-    for row in rows:
-        try:
-            inspected = inspect_target(row["target_path"])
-        except SystemExit:
-            continue
-        targets.append(inspected)
-        if len(targets) == 5:
-            break
-    return targets
 
 
 def scan_context(
@@ -3294,15 +3189,12 @@ def scan_result(
         progress_result["independentReviews"] = {
             "active": independent_reviews["active"],
             "completed": independent_reviews["completed"],
+            "consolidating": independent_reviews["consolidating"],
         }
     return {
         "artifacts": artifacts,
         "canceledAt": scan["canceled_at"],
-        **(
-            {"cost": json.loads(scan["cost_json"], parse_constant=reject_non_finite_json)}
-            if scan["cost_json"] is not None
-            else {}
-        ),
+        **scan_usage.stored_scan_cost_fields(scan["cost_json"]),
         "contract": scan_contract(scan),
         "continuationThreadId": scan["continuation_thread_id"],
         "failureMessage": scan["failure_message"],
@@ -3314,8 +3206,10 @@ def scan_result(
         "handoffClaimToken": scan["handoff_claim_token"],
         "handoffStatus": scan["handoff_status"],
         "mode": scan["mode"],
+        "model": scan["model"],
         "diffTarget": stored_diff_target(scan),
         "progress": progress_result,
+        "reasoningEffort": scan["reasoning_effort"],
         "remediationAvailable": remediation_available,
         "remediationUnavailableReason": remediation_unavailable_reason,
         "reportAvailable": "markdownReport" in artifacts,
@@ -3745,7 +3639,7 @@ def available_artifact_path(scan_dir: Path, candidate: Path) -> Path | None:
         resolved.relative_to(resolved_scan_dir)
     except (FileNotFoundError, RuntimeError, SystemExit, ValueError):
         return None
-    if resolved != candidate or not candidate.is_file():
+    if os.path.normcase(resolved) != os.path.normcase(candidate) or not candidate.is_file():
         return None
     return resolved
 
@@ -3880,6 +3774,7 @@ def main() -> None:
             require_canonical_scan_directory=require_canonical_scan_directory,
             safe_segment=safe_segment,
             compact_timestamp=compact_timestamp,
+            scan_completion_lock=scan_completion_lock,
         )
     )
     if args.command == "inspect-target":
@@ -3897,38 +3792,24 @@ def main() -> None:
             state_dir(),
         )
     with closing(connect()) as connection:
-        if args.command == "get-setup-preference":
-            result = setup_preference(connection)
-        elif args.command == "disable-setup-ui":
-            result = disable_setup_ui(connection, args)
-        elif args.command == "create-workspace":
+        if args.command == "create-workspace":
             result = create_workspace(connection, args)
         elif args.command == "get-workspace":
             result = workspace_state(connection, args.workspace_id, thread_id=args.thread_id)
-        elif args.command == "get-latest-workspace":
-            result = latest_workspace(connection, args.thread_id)
-        elif args.command == "list-workspace-scans":
-            result = scan_history.list_workspace_scans(
-                connection, args, require_workspace=require_workspace
-            )
-        elif args.command == "begin-diff-resolution":
-            result = begin_diff_resolution(connection, args)
-        elif args.command == "cancel-diff-resolution":
-            result = cancel_diff_resolution(connection, args)
-        elif args.command == "set-diff-target":
-            result = set_diff_target(connection, args)
         elif args.command == "save-workspace":
             result = save_workspace(connection, args)
-        elif args.command == "set-capability-preflight":
-            result = set_capability_preflight(connection, args)
         elif args.command == "start-scan":
             result = start_scan(connection, args)
         elif args.command == "start-prompt-only-scan":
             result = start_prompt_only_scan(connection, args)
+        elif args.command == "start-headless-standard-scan":
+            result = start_headless_standard_scan(connection, args)
         elif args.command == "begin-deep-scan":
             result = deep_scan.begin_deep_scan(connection, args)
         elif args.command == "get-deep-scan":
             result = deep_scan.get_deep_scan(connection, args)
+        elif args.command == "claim-deep-scan-coordinator":
+            result = deep_scan.claim_deep_scan_coordinator(connection, args)
         elif args.command == "upsert-deep-scan-worker":
             result = deep_scan.upsert_deep_scan_worker(connection, args)
         elif args.command == "claim-deep-scan-dedup":
@@ -3975,22 +3856,14 @@ def main() -> None:
                 read_coverage=coverage_for_comparison,
             )
         elif args.command == "list-global-findings":
-            result = native_indexes.list_global_findings(
-                connection, args, read_coverage=coverage_for_comparison
-            )
+            result = native_indexes.list_global_findings(connection, args)
         elif args.command == "list-repositories":
-            result = native_indexes.list_repositories(
-                connection, args, read_coverage=coverage_for_comparison
-            )
+            result = native_indexes.list_repositories(connection, args)
         elif args.command == "list-findings":
             result = list_findings(connection, args)
-        elif args.command == "update-progress":
-            result = progress.update_progress(
-                connection,
-                args,
-                now=now,
-                require_scan=require_scan,
-                scan_context=scan_context,
+        elif args.command in {"update-progress", "update-scan-context"}:
+            result = progress.update(
+                connection, args, now, require_scan, require_workspace, scan_context
             )
         elif args.command in {"prepare-scan-completion", "complete-scan"}:
             result = complete_scan(

@@ -9,7 +9,7 @@ const PACKAGE_VERSIONS = packageVersions(
 export const VERSION = PACKAGE_VERSIONS.package;
 export const CODEX_SDK_VERSION = PACKAGE_VERSIONS.sdk;
 export const CODEX_EXECUTABLE_VERSION = PACKAGE_VERSIONS.executable;
-export const BUNDLED_PLUGIN_VERSION = "0.1.14" as const;
+export const BUNDLED_PLUGIN_VERSION = "0.1.15" as const;
 export const OPEN_SECURITY_NO_UPDATE_NOTICE_ENV =
   "OPEN_SECURITY_NO_UPDATE_NOTICE" as const;
 export const OPEN_SECURITY_NPM_REGISTRY_ENV =

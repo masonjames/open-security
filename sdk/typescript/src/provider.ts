@@ -1,12 +1,17 @@
 import type { ProcessEnvironment } from "./runtime.js";
 
-export type ScanProvider = "openai" | "openrouter";
+export type ScanProvider =
+  | "openai"
+  | "openrouter"
+  | "fireworks"
+  | "amazon-bedrock";
 export type ProviderAuthMode = "auto" | "chatgpt" | "api-key";
 export type ResolvedProviderAuthMode = Exclude<ProviderAuthMode, "auto">;
 export type ModelProviderSecretEnvironmentVariable =
   | typeof OPENAI_API_KEY_ENV
   | typeof CODEX_API_KEY_ENV
-  | typeof OPENROUTER_API_KEY_ENV;
+  | typeof OPENROUTER_API_KEY_ENV
+  | typeof FIREWORKS_API_KEY_ENV;
 
 export const DEFAULT_SCAN_PROVIDER: ScanProvider = "openai";
 export const DEFAULT_OPENROUTER_REASONING_EFFORT = "high" as const;
@@ -34,12 +39,16 @@ export const OPEN_SECURITY_OPENROUTER_MAX_RETRY_DELAY_MS_ENV =
 export const OPENAI_API_KEY_ENV = "OPENAI_API_KEY" as const;
 export const CODEX_API_KEY_ENV = "CODEX_API_KEY" as const;
 export const OPENROUTER_API_KEY_ENV = "OPENROUTER_API_KEY" as const;
+export const FIREWORKS_API_KEY_ENV = "FIREWORKS_API_KEY" as const;
 export const OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1" as const;
+export const FIREWORKS_BASE_URL =
+  "https://api.fireworks.ai/inference/v1" as const;
 
 export const MODEL_PROVIDER_SECRET_ENV_KEYS = Object.freeze([
   OPENAI_API_KEY_ENV,
   CODEX_API_KEY_ENV,
   OPENROUTER_API_KEY_ENV,
+  FIREWORKS_API_KEY_ENV,
 ] as const);
 
 const OPENAI_API_KEY_ENVIRONMENTS = Object.freeze([
@@ -48,6 +57,9 @@ const OPENAI_API_KEY_ENVIRONMENTS = Object.freeze([
 ] as const);
 const OPENROUTER_API_KEY_ENVIRONMENTS = Object.freeze([
   OPENROUTER_API_KEY_ENV,
+] as const);
+const FIREWORKS_API_KEY_ENVIRONMENTS = Object.freeze([
+  FIREWORKS_API_KEY_ENV,
 ] as const);
 const OPENROUTER_BRIDGE_PROXY_ENVIRONMENTS = Object.freeze([
   "HTTP_PROXY",
@@ -94,9 +106,15 @@ export interface OpenRouterCodexProviderDefinition {
 }
 
 export interface ProviderCodexOverrides {
-  model_provider?: "openrouter";
+  model_provider?: "openrouter" | "fireworks" | "amazon-bedrock";
   model_providers?: {
-    openrouter: OpenRouterCodexProviderDefinition;
+    openrouter?: OpenRouterCodexProviderDefinition;
+    fireworks?: {
+      name: "Fireworks AI";
+      base_url: typeof FIREWORKS_BASE_URL;
+      env_key: typeof FIREWORKS_API_KEY_ENV;
+      wire_api: "responses";
+    };
   };
 }
 
@@ -245,7 +263,24 @@ export function resolveOpenRouterRetryPolicy(
 export function providerCodexOverrides(
   provider: ScanProvider | string,
 ): ProviderCodexOverrides {
-  if (normalizeProvider(provider) === "openai") return {};
+  const normalized = normalizeProvider(provider);
+  if (normalized === "openai") return {};
+  if (normalized === "amazon-bedrock") {
+    return { model_provider: "amazon-bedrock" };
+  }
+  if (normalized === "fireworks") {
+    return {
+      model_provider: "fireworks",
+      model_providers: {
+        fireworks: {
+          name: "Fireworks AI",
+          base_url: FIREWORKS_BASE_URL,
+          env_key: FIREWORKS_API_KEY_ENV,
+          wire_api: "responses",
+        },
+      },
+    };
+  }
   return {
     model_provider: "openrouter",
     model_providers: {
@@ -259,6 +294,17 @@ export function providerCodexOverrides(
   };
 }
 
+/** Returns the user-facing name for a normalized scan provider. */
+export function providerDisplayName(
+  provider: ScanProvider | string,
+): "OpenAI" | "OpenRouter" | "Fireworks AI" | "Amazon Bedrock" {
+  const normalized = normalizeProvider(provider);
+  if (normalized === "openrouter") return "OpenRouter";
+  if (normalized === "fireworks") return "Fireworks AI";
+  if (normalized === "amazon-bedrock") return "Amazon Bedrock";
+  return "OpenAI";
+}
+
 /** Rejects authentication modes that cannot work with the selected provider. */
 export function validateProviderAuthMode(
   provider: ScanProvider | string,
@@ -266,9 +312,9 @@ export function validateProviderAuthMode(
 ): asserts authMode is ProviderAuthMode {
   const normalizedProvider = normalizeProvider(provider);
   const normalizedAuthMode = normalizeAuthMode(authMode);
-  if (normalizedProvider === "openrouter" && normalizedAuthMode === "chatgpt") {
+  if (normalizedProvider !== "openai" && normalizedAuthMode === "chatgpt") {
     throw new ProviderConfigurationError(
-      "OpenRouter does not support ChatGPT authentication; set OPENROUTER_API_KEY and use auto or api-key authentication.",
+      `${providerDisplayName(normalizedProvider)} does not support ChatGPT authentication; use its environment credentials with auto or api-key authentication.`,
     );
   }
 }
@@ -278,10 +324,15 @@ export function providerEnvironmentCredential(
   provider: ScanProvider | string,
   environment: ProcessEnvironment = process.env,
 ): ProviderEnvironmentCredential | null {
+  const normalized = normalizeProvider(provider);
   const names =
-    normalizeProvider(provider) === "openrouter"
+    normalized === "openrouter"
       ? OPENROUTER_API_KEY_ENVIRONMENTS
-      : OPENAI_API_KEY_ENVIRONMENTS;
+      : normalized === "fireworks"
+        ? FIREWORKS_API_KEY_ENVIRONMENTS
+        : normalized === "openai"
+          ? OPENAI_API_KEY_ENVIRONMENTS
+          : [];
   for (const environmentVariable of names) {
     const value = canonicalEnvironmentValue(environment, environmentVariable);
     if (value !== undefined) return { environmentVariable, value };
@@ -302,7 +353,12 @@ export function providerAuthentication(
   const environment = options.environment ?? process.env;
   const credential = providerEnvironmentCredential(provider, environment);
 
-  if (provider === "openrouter" || requestedMode === "api-key") {
+  if (provider === "amazon-bedrock") {
+    throw new ProviderConfigurationError(
+      "Amazon Bedrock authentication is resolved through the AWS credential chain.",
+    );
+  }
+  if (provider !== "openai" || requestedMode === "api-key") {
     return {
       provider,
       requestedMode,
@@ -312,7 +368,9 @@ export function providerAuthentication(
         credential?.environmentVariable ??
         (provider === "openrouter"
           ? OPENROUTER_API_KEY_ENV
-          : OPENAI_API_KEY_ENV),
+          : provider === "fireworks"
+            ? FIREWORKS_API_KEY_ENV
+            : OPENAI_API_KEY_ENV),
       credentialsAvailable: credential !== null,
     };
   }
@@ -347,7 +405,11 @@ export function modelProviderExecutionEnvironment(
   const selectedNames =
     normalizedProvider === "openrouter"
       ? OPENROUTER_API_KEY_ENVIRONMENTS
-      : OPENAI_API_KEY_ENVIRONMENTS;
+      : normalizedProvider === "fireworks"
+        ? FIREWORKS_API_KEY_ENVIRONMENTS
+        : normalizedProvider === "openai"
+          ? OPENAI_API_KEY_ENVIRONMENTS
+          : [];
   const isolated = filterEnvironment(
     environment,
     (name) => !isEnvironmentName(name, MODEL_PROVIDER_SECRET_ENV_KEYS),
@@ -464,9 +526,16 @@ function noProxyExclusions(environment: ProcessEnvironment): string[] {
 function normalizeProvider(value: string | undefined): ScanProvider {
   const normalized = value?.trim().toLowerCase();
   if (!normalized) return DEFAULT_SCAN_PROVIDER;
-  if (normalized === "openai" || normalized === "openrouter") return normalized;
+  if (
+    normalized === "openai" ||
+    normalized === "openrouter" ||
+    normalized === "fireworks" ||
+    normalized === "amazon-bedrock"
+  ) {
+    return normalized;
+  }
   throw new ProviderConfigurationError(
-    `Unsupported model provider: ${value}. Expected openai or openrouter.`,
+    `Unsupported model provider: ${value}. Expected openai, openrouter, fireworks, or amazon-bedrock.`,
   );
 }
 

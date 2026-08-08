@@ -47,9 +47,11 @@ import {
 } from "./bulk-scan-discovery.js";
 import {
   DEFAULT_CODEX_CONFIG,
+  isExternalModelProvider,
   mergedCodexConfig,
   scanModelConfiguration,
   type CodexSecurityConfig,
+  type ExternalModelProvider,
   type JsonObject,
   type JsonValue,
 } from "./config.js";
@@ -57,6 +59,7 @@ import {
   formatUsd,
   rejectUnsupportedScanCostLimit,
   scanCostLimitFromEnvironment,
+  type ScanCost,
 } from "./cost.js";
 import {
   CodexSecurityError,
@@ -99,7 +102,13 @@ import {
   renderScanHistory,
   type HistoryCommand,
 } from "./scan-history-renderer.js";
-import type { ScanWorkerPhase, ScanWorkerStatus } from "./worker-progress.js";
+import { ScanDashboard } from "./scan-dashboard.js";
+import type {
+  ScanPhase,
+  ScanProgress,
+  ScanWorkerPhase,
+  ScanWorkerStatus,
+} from "./worker-progress.js";
 import { DiffTarget, type ScanMode, type ScanTarget } from "./targets.js";
 import {
   BUNDLED_PLUGIN_VERSION,
@@ -175,12 +184,15 @@ const VALUE_OPTIONS = new Set([
   "--reasoning-effort",
   "--path",
   "--knowledge-base",
+  "--scan-prompt-file",
+  "--post-scan-prompt-file",
   "--diff",
   "--head",
   "--base",
   "--mode",
   "--model",
   "--effort",
+  "--provider",
   "--output-dir",
   "--plugin-path",
   "--python",
@@ -202,6 +214,12 @@ const VALUE_OPTIONS = new Set([
   "--scan-root",
   "--reason",
 ]);
+const PROVIDER_OPTION = z
+  .enum(["openai", "openrouter", "fireworks", "amazon-bedrock"])
+  .optional()
+  .describe(
+    "Inference provider for scans (default: OPEN_SECURITY_PROVIDER or openai).",
+  );
 
 function optionValue(flag: string) {
   return z.string().min(1, `${flag} must not be empty.`);
@@ -245,6 +263,25 @@ const DEEP_SCAN_OPTION_SCHEMAS = {
     .describe("Maximum deep-scan discovery runs."),
 };
 
+async function readPromptFiles(
+  directory: string,
+  scanPromptFile?: string,
+  postScanPromptFile?: string,
+): Promise<Pick<ScanOptions, "scanPrompt" | "postScanPrompt">> {
+  const [scanPrompt, postScanPrompt] = await Promise.all([
+    scanPromptFile === undefined
+      ? undefined
+      : readFile(resolve(directory, scanPromptFile), "utf8"),
+    postScanPromptFile === undefined
+      ? undefined
+      : readFile(resolve(directory, postScanPromptFile), "utf8"),
+  ]);
+  return {
+    ...(scanPrompt?.trim() ? { scanPrompt } : {}),
+    ...(postScanPrompt?.trim() ? { postScanPrompt } : {}),
+  };
+}
+
 interface ScanArguments extends DeepScanOptions {
   auth?: ScanAuthMode;
   provider?: ScanProvider;
@@ -253,6 +290,8 @@ interface ScanArguments extends DeepScanOptions {
   repository?: string;
   paths: string[];
   knowledgeBasePaths: string[];
+  scanPromptFile?: string;
+  postScanPromptFile?: string;
   diff?: string;
   workingTree: boolean;
   head?: string;
@@ -268,6 +307,7 @@ interface ScanArguments extends DeepScanOptions {
   codexOverrides?: JsonObject;
   failOnSeverity?: FailureSeverity;
   maxCostUsd?: number;
+  headless?: boolean;
   dryRun: boolean;
   parentScanId?: string;
   expectedPluginVersion?: string;
@@ -1055,12 +1095,6 @@ export async function main(
             .describe(
               "Select ChatGPT, OPENAI_API_KEY/CODEX_API_KEY, or automatic authentication.",
             ),
-          provider: z
-            .enum(["openai", "openrouter"])
-            .optional()
-            .describe(
-              "Model provider (default: OPEN_SECURITY_PROVIDER or openai).",
-            ),
           reasoningEffort: optionValue("--reasoning-effort")
             .optional()
             .describe(
@@ -1082,6 +1116,12 @@ export async function main(
             .describe(
               "Add security-context files or directories; repeat for multiple paths.",
             ),
+          scanPromptFile: optionValue("--scan-prompt-file")
+            .optional()
+            .describe("Append scan instructions from FILE."),
+          postScanPromptFile: optionValue("--post-scan-prompt-file")
+            .optional()
+            .describe("Run instructions from FILE after a validated scan."),
           diff: optionValue("--diff")
             .optional()
             .describe("Scan committed Git changes from BASE to --head."),
@@ -1106,6 +1146,7 @@ export async function main(
               `Model to use (OpenAI default: ${DEFAULT_SCAN_MODEL_CONFIGURATION.model}).`,
             ),
           effort: effortOption(),
+          provider: PROVIDER_OPTION,
           outputDir: optionValue("--output-dir")
             .optional()
             .describe(
@@ -1134,6 +1175,12 @@ export async function main(
             .positive()
             .optional()
             .describe("Stop the scan if estimated USD cost exceeds AMOUNT."),
+          headless: z
+            .boolean()
+            .default(false)
+            .describe(
+              "Use plain text progress instead of the interactive dashboard.",
+            ),
           dryRun: z
             .boolean()
             .default(false)
@@ -1212,12 +1259,13 @@ export async function main(
         const outcome = await runScan(
           {
             auth: options.auth,
-            provider: options.provider,
             reasoningEffort: options.reasoningEffort,
             verbose: options.verbose,
             repository: args.repository,
             paths: options.path,
             knowledgeBasePaths: options.knowledgeBase,
+            scanPromptFile: options.scanPromptFile,
+            postScanPromptFile: options.postScanPromptFile,
             diff: options.diff,
             workingTree: options.workingTree,
             head: options.head,
@@ -1229,6 +1277,7 @@ export async function main(
             maxDiscoveryRuns: options.maxDiscoveryRuns,
             model: options.model,
             effort: options.effort,
+            provider: options.provider,
             outputDir: options.outputDir,
             archiveExisting: options.archiveExisting,
             pluginPath: options.pluginPath,
@@ -1236,6 +1285,7 @@ export async function main(
             codex: options.codex,
             failOnSeverity: options.failOnSeverity,
             maxCostUsd: options.maxCost,
+            headless: options.headless,
             dryRun: options.dryRun,
           },
           errorOutput,
@@ -1375,16 +1425,16 @@ export async function main(
             .enum(["standard", "deep"])
             .default("standard")
             .describe("Default scan mode for repositories without a CSV mode."),
-          provider: z
-            .enum(["openai", "openrouter"])
+          scanPromptFile: optionValue("--scan-prompt-file")
             .optional()
-            .describe(
-              "Model provider for each repository (default: OPEN_SECURITY_PROVIDER or openai).",
-            ),
+            .describe("Append instructions from FILE to every scan."),
+          postScanPromptFile: optionValue("--post-scan-prompt-file")
+            .optional()
+            .describe("Run FILE after each completed, validated scan."),
           model: optionValue("--model")
             .optional()
             .describe(
-              `Model for each repository (OpenAI default: ${DEFAULT_SCAN_MODEL_CONFIGURATION.model}; required for OpenRouter).`,
+              `Model for each repository (OpenAI default: ${DEFAULT_SCAN_MODEL_CONFIGURATION.model}; required for non-OpenAI providers).`,
             ),
           reasoningEffort: optionValue("--reasoning-effort")
             .optional()
@@ -1392,6 +1442,7 @@ export async function main(
               "Reasoning effort for each repository (default: OPEN_SECURITY_REASONING_EFFORT or provider default).",
             ),
           effort: effortOption(),
+          provider: PROVIDER_OPTION,
           maxAttempts: z
             .number()
             .int()
@@ -1451,13 +1502,18 @@ export async function main(
             "bulk scans because workers and retries require a campaign-wide aggregate budget",
           );
           const currentDirectory = dependencies.currentDirectory();
+          const prompts = await readPromptFiles(
+            currentDirectory,
+            options.scanPromptFile,
+            options.postScanPromptFile,
+          );
           let inputPath: string;
           let outputDir: string;
           let githubHost: string | undefined;
           if (args.input === undefined) {
             if (!isBulkScanDiscoveryInvocation(argv)) {
               throw new Error(
-                "Run 'open-security bulk-scan [--provider PROVIDER] [--model MODEL] [--reasoning-effort EFFORT | --effort EFFORT] [--knowledge-base PATH]' to discover repositories, or provide a CSV and --output-dir.",
+                "Run 'open-security bulk-scan [--provider PROVIDER] [--model MODEL] [--reasoning-effort EFFORT | --effort EFFORT] [--codex KEY=VALUE] [--knowledge-base PATH] [--scan-prompt-file FILE] [--post-scan-prompt-file FILE]' to discover repositories, or provide a CSV and --output-dir.",
               );
             }
             const wizard = await runBulkScanWizard(
@@ -1492,6 +1548,7 @@ export async function main(
             knowledgeBasePaths: options.knowledgeBase.map((path) =>
               resolve(currentDirectory, path),
             ),
+            ...prompts,
             config: {
               provider: options.provider,
               pluginPath: options.pluginPath,
@@ -1501,17 +1558,21 @@ export async function main(
                 options.model,
                 options.reasoningEffort,
                 options.effort,
+                options.provider,
               ),
             },
             createSecurity: dependencies.createSecurity,
             signal: controller.signal,
-            onProgress: ({ repository, status, attempt, error }) => {
+            onProgress: ({ repository, status, attempt, error, warning }) => {
+              const detail = error ?? warning;
               errorOutput.write(
-                `open-security: ${repository} ${status} (attempt ${attempt})${error === undefined ? "" : `: ${redactedErrorMessage(error)}`}\n`,
+                `open-security: ${repository} ${status} (attempt ${attempt})${detail === undefined ? "" : `: ${redactedErrorMessage(detail)}`}\n`,
               );
             },
           });
-          exitCode = interruptedExitCode() ?? (result.failed > 0 ? 2 : 0);
+          exitCode =
+            interruptedExitCode() ??
+            (result.failed > 0 || result.incomplete > 0 ? 2 : 0);
           return { ...result };
         } catch (error) {
           exitCode =
@@ -2652,6 +2713,9 @@ function isBulkScanDiscoveryInvocation(argv: readonly string[]): boolean {
     "--reasoning-effort",
     "--effort",
     "--knowledge-base",
+    "--codex",
+    "--scan-prompt-file",
+    "--post-scan-prompt-file",
   ]);
   for (let index = 1; index < argv.length; index += 1) {
     const argument = argv[index]!;
@@ -2773,8 +2837,14 @@ async function runScan(
   let requestedSignal: SignalName | null = null;
   let firstSignalAt = 0;
   let progress: Progress | null = null;
+  let dashboard: ScanDashboard | null = null;
   let lastWorkerUpdate = "";
+  let lastProgressUpdate = "";
+  let workerCapacity: { planned: number; started: number } | null = null;
+  let fileProgress: ScanProgress | null = null;
+  let runningCost: Readonly<ScanCost> | null = null;
   let phase: string | null = null;
+  const targetWarnings: string[] = [];
   const configuredLogLevel =
     dependencies.environment["OPEN_SECURITY_LOG_LEVEL"]?.trim() ||
     dependencies.environment["CODEX_SECURITY_LOG_LEVEL"]?.trim() ||
@@ -2819,6 +2889,7 @@ async function runScan(
         return;
       }
       requestedSignal = signal;
+      dashboard?.stop();
       progress?.stopTimer();
       if (progress?.interactive === true) {
         try {
@@ -2864,6 +2935,11 @@ async function runScan(
     const maxCostUsd =
       arguments_.maxCostUsd ??
       scanCostLimitFromEnvironment(dependencies.environment);
+    const prompts = await readPromptFiles(
+      dependencies.currentDirectory(),
+      arguments_.scanPromptFile,
+      arguments_.postScanPromptFile,
+    );
     const config: CodexSecurityConfig = {
       provider,
       pluginPath: arguments_.pluginPath,
@@ -2875,14 +2951,16 @@ async function runScan(
           arguments_.model,
           arguments_.reasoningEffort,
           arguments_.effort,
+          arguments_.provider,
         ),
     };
     const selectedProfileName = config.codexOverrides?.["profile"];
+    const effectiveConfiguration = {
+      ...DEFAULT_CODEX_CONFIG,
+      ...config.codexOverrides,
+    };
     ({ model: effectiveModel, reasoningEffort: effectiveReasoningEffort } =
-      scanModelConfiguration({
-        ...DEFAULT_CODEX_CONFIG,
-        ...config.codexOverrides,
-      }));
+      scanModelConfiguration(effectiveConfiguration));
     let auth = arguments_.auth;
     selectedAuthentication = scanAuthentication(
       dependencies.environment,
@@ -2950,22 +3028,71 @@ async function runScan(
       model: effectiveModel,
       reasoning_effort: effectiveReasoningEffort,
     });
-    progress = new Progress(errorOutput, dependencies, interactive);
-    const scope = scanScope(arguments_);
-    const runningMessage = (): string =>
-      phase === null
-        ? scope === null
-          ? "Running scan"
-          : `Running scan: ${scope}`
-        : `Running scan: ${phase}${scope === null ? "" : ` (${scope})`}`;
-    progress.startTimer(
-      arguments_.dryRun ? "Validating scan inputs" : "Preparing scan",
+    progress = new Progress(
+      errorOutput,
+      dependencies,
+      interactive &&
+        !arguments_.headless &&
+        dependencies.environment["CI"] === undefined &&
+        dependencies.environment["TERM"] !== "dumb",
     );
+    if (progress.interactive && !arguments_.dryRun && !verbose) {
+      dashboard = new ScanDashboard(errorOutput, {
+        repository,
+        model: scanModelConfiguration(await mergedCodexConfig(config)),
+        ...(arguments_.maxCostUsd === undefined
+          ? {}
+          : { maxCostUsd: arguments_.maxCostUsd }),
+        clock: dependencies,
+        color: dependencies.environment["NO_COLOR"] === undefined,
+        sanitize: redactedErrorMessage,
+        input: process.stdin,
+        onInterrupt,
+      });
+    }
+    const scope = scanScope(arguments_);
+    const runningMessage = (): string => {
+      const stage =
+        phase === null
+          ? scope === null
+            ? "Running scan"
+            : `Running scan: ${scope}`
+          : `Running scan: ${phase}${scope === null ? "" : ` (${scope})`}`;
+      const details: string[] = [];
+      if (workerCapacity !== null) {
+        details.push(
+          `Workers: ${workerCapacity.started}/${workerCapacity.planned}`,
+        );
+      }
+      if (fileProgress !== null && fileProgress.filesTotal > 0) {
+        details.push(
+          `Files: ${fileProgress.filesCompleted.toLocaleString("en-US")}/${fileProgress.filesTotal.toLocaleString("en-US")}`,
+        );
+      }
+      if (runningCost !== null) {
+        const tokens = formatTokenUsage({
+          input_tokens: runningCost.inputTokens,
+          cached_input_tokens: runningCost.cachedInputTokens,
+          output_tokens: runningCost.outputTokens,
+        });
+        if (tokens !== null) details.push(`Tokens: ${tokens}`);
+        details.push(`Cost: ${formatUsd(runningCost.estimatedUsd)}`);
+      }
+      return details.length === 0 ? stage : `${stage} | ${details.join(" | ")}`;
+    };
+    if (dashboard === null) {
+      progress.startTimer(
+        arguments_.dryRun ? "Validating scan inputs" : "Preparing scan",
+      );
+    } else {
+      dashboard.start();
+    }
     security = dependencies.createSecurity(config);
     const options: ScanOptions = {
       auth,
       target,
       knowledgeBasePaths: arguments_.knowledgeBasePaths,
+      ...prompts,
       mode: arguments_.mode,
       workers: arguments_.workers,
       subagents: arguments_.subagents,
@@ -2987,17 +3114,38 @@ async function runScan(
           output_tokens: cost.outputTokens,
           max_cost_usd: maxCostUsd,
         });
-        if (maxCostUsd === undefined) return;
+        runningCost = cost;
+        if (dashboard !== null) {
+          dashboard.setCost(cost);
+          return;
+        }
         progress?.stopTimer();
-        progress?.stage(
-          `Estimated cost: ${formatUsd(cost.estimatedUsd)} of ${formatUsd(maxCostUsd)} limit`,
-        );
-        if (cost.estimatedUsd <= maxCostUsd) {
+        if (maxCostUsd === undefined) {
+          const tokens = formatTokenUsage({
+            input_tokens: cost.inputTokens,
+            cached_input_tokens: cost.cachedInputTokens,
+            output_tokens: cost.outputTokens,
+          });
+          progress?.stage(
+            `${tokens === null ? "" : `Tokens: ${tokens}. `}Estimated cost: ${formatUsd(cost.estimatedUsd)} USD.`,
+          );
+        } else {
+          progress?.stage(
+            `Estimated cost: ${formatUsd(cost.estimatedUsd)} of ${formatUsd(maxCostUsd)} limit`,
+          );
+        }
+        if (maxCostUsd === undefined || cost.estimatedUsd <= maxCostUsd) {
           progress?.startTimer(runningMessage());
         }
       },
       onOutputArchived: (archiveDir) => {
         diagnostic("scan.output_archived", { archive_dir: archiveDir });
+        if (dashboard !== null) {
+          dashboard.note(
+            `Moved existing results to: ${redactedErrorMessage(archiveDir)}`,
+          );
+          return;
+        }
         progress?.stopTimer();
         errorOutput.write(
           `Moved existing results to: ${redactedErrorMessage(archiveDir)}\n`,
@@ -3014,28 +3162,56 @@ async function runScan(
           requested: auth ?? "auto",
           method: authentication.method,
           source:
-            authentication.method === "api_key"
+            authentication.method !== "stored_credentials"
               ? authentication.source
               : undefined,
           verified: authentication.verified,
         });
+        if (dashboard !== null) {
+          dashboard.note(
+            authentication.method === "api_key"
+              ? `Using API key from ${authentication.source}`
+              : authentication.method === "aws_credentials"
+                ? `Using AWS credentials from ${authentication.source}`
+                : "Using stored Codex credentials",
+          );
+          return;
+        }
         progress?.stopTimer();
         if (authentication.method === "api_key") {
           progress?.stage(
             `Authentication: API key from ${authentication.source}.`,
           );
-          if (authentication.source !== "OPENROUTER_API_KEY") {
+          if (
+            authentication.source === "OPENAI_API_KEY" ||
+            authentication.source === "CODEX_API_KEY"
+          ) {
             progress?.stage(
               "To use your ChatGPT sign-in, retry with --auth chatgpt.",
             );
           }
+        } else if (authentication.method === "aws_credentials") {
+          progress?.stage(
+            `Authentication: AWS credentials from ${authentication.source}.`,
+          );
         } else {
           progress?.stage("Authentication: stored Codex credentials.");
         }
         progress?.startTimer("Preparing scan");
       },
+      onTrustedAccessStatus: (status) => {
+        if (status === "granted") {
+          errorOutput.write(
+            "open-security: ✓ Your account has Trusted Access for Cyber.\n",
+          );
+        }
+      },
       onScanStarted: () => {
         diagnostic("scan.started");
+        if (dashboard !== null) {
+          dashboard.setStage(phase ?? "Scanning repository");
+          return;
+        }
         progress?.stopTimer();
         progress?.startTimer(runningMessage());
       },
@@ -3061,8 +3237,39 @@ async function runScan(
                 : details?.reason === "authorization"
                   ? `Model access interrupted; retrying (${attempt}/${maxAttempts}).`
                   : `Codex connection interrupted; retrying (${attempt}/${maxAttempts})`;
+        if (dashboard !== null) {
+          dashboard.note(message);
+          return;
+        }
         progress?.stage(message);
         progress?.startTimer(runningMessage());
+      },
+      onActivity: (activity) => {
+        if (dashboard === null) return;
+        dashboard.record(activity);
+        if (activity.paths.length > 0 && phase === "preflight") {
+          dashboard.setStage("inspecting repository files");
+        }
+      },
+      onProgress: (update) => {
+        const key = `${update.phase}:${update.filesCompleted}:${update.filesTotal}`;
+        if (key === lastProgressUpdate) return;
+        lastProgressUpdate = key;
+        fileProgress = update;
+        const previousPhase = phase;
+        phase = scanPhase(update.phase);
+        if (dashboard !== null) {
+          dashboard.setFiles(update);
+          dashboard.setStage(phase);
+          if (previousPhase !== phase) dashboard.note(`Started ${phase}`);
+          return;
+        }
+        if (progress === null) return;
+        progress.stopTimer();
+        progress.stage(
+          `Scan phase: ${phase}${update.filesTotal === 0 ? "" : ` (${update.filesCompleted.toLocaleString("en-US")}/${update.filesTotal.toLocaleString("en-US")} files)`}.`,
+        );
+        progress.startTimer(runningMessage());
       },
       onWorkerStatus: (status) => {
         const update =
@@ -3082,31 +3289,45 @@ async function runScan(
             planned: status.planned,
             started: status.started,
           });
+          workerCapacity = { planned: status.planned, started: status.started };
           phase = scanPhase(status.phase);
         }
         const message = workerStatusMessage(status);
+        if (dashboard !== null) {
+          if (status.kind === "dispatch") {
+            dashboard.setStage(scanPhase(status.phase));
+          }
+          if (message !== null) dashboard.note(message);
+          return;
+        }
         if (message === null || progress === null) return;
         progress.stopTimer();
         progress.stage(message);
         progress.startTimer(runningMessage());
       },
-      onWarning: (warning) => {
+      onWarning: (warning, details) => {
+        const message = sanitizeDiagnosticValue(warning);
+        if (details?.kind === "target_changed") {
+          targetWarnings.push(message);
+        }
         writeAboveProgress(() => {
-          const message = sanitizeDiagnosticValue(warning);
           diagnostic("scan.warning", { message });
           errorOutput.write(`open-security: warning: ${message}\n`);
         });
       },
       onObserverError: (observer, error) => {
-        writeAboveProgress(() => {
-          diagnostic("scan.observer_failed", {
-            observer,
-            classification: classifyConnectionFailure(error),
-          });
-          errorOutput.write(
-            `open-security: warning: ${observer} observer failed: ${sanitizeDiagnosticValue(error)}\n`,
-          );
+        diagnostic("scan.observer_failed", {
+          observer,
+          classification: classifyConnectionFailure(error),
         });
+        const warning = `${observer} observer failed: ${sanitizeDiagnosticValue(error)}`;
+        if (dashboard === null) {
+          writeAboveProgress(() => {
+            errorOutput.write(`open-security: warning: ${warning}\n`);
+          });
+        } else {
+          dashboard.note(`Warning: ${warning}`);
+        }
       },
     };
     if (arguments_.dryRun) {
@@ -3115,11 +3336,11 @@ async function runScan(
       result = await security.run(repository, options);
       scanDir = result.scanDir;
     }
-    progress.stopTimer();
   } catch (error) {
     failed = true;
     failure = error;
   } finally {
+    dashboard?.stop();
     progress?.stopTimer();
     if (security !== null) {
       diagnostic("runtime.cleanup.started");
@@ -3193,7 +3414,7 @@ async function runScan(
       reasoning_effort: effectivePreflight.reasoningEffort,
       method: effectivePreflight.authentication.method,
       source:
-        effectivePreflight.authentication.method === "api_key"
+        effectivePreflight.authentication.method !== "stored_credentials"
           ? effectivePreflight.authentication.source
           : undefined,
       verified: effectivePreflight.authentication.verified,
@@ -3220,8 +3441,12 @@ async function runScan(
   const blockingCount = result.findings.findings.filter(({ severity }) =>
     blockingSeverities.has(severity.level),
   ).length;
+  const scanData =
+    targetWarnings.length === 0
+      ? result.toJSON()
+      : { ...result.toJSON(), warnings: targetWarnings };
   const incomplete = result.coverage.completeness !== "complete";
-  progress?.stage("Scan complete");
+  progress?.stage(`Scan complete · ${result.manifest.scan.id.slice(0, 8)}`);
   printScanSummary(
     result,
     progress,
@@ -3235,17 +3460,24 @@ async function runScan(
     findings: result.findings.findings.length,
     scan_id: result.manifest.scan.id,
     estimated_usd: result.cost?.estimatedUsd,
-    exit_code: incomplete ? 2 : blockingCount > 0 ? 1 : 0,
+    exit_code:
+      targetWarnings.length > 0 || incomplete ? 2 : blockingCount > 0 ? 1 : 0,
   });
+  if (targetWarnings.length > 0) {
+    errorOutput.write(
+      "open-security: Scan target changed during execution; results do not represent the current checkout.\n",
+    );
+    return { exitCode: 2, data: scanData };
+  }
   if (incomplete) {
     errorOutput.write(
       threshold === undefined
         ? `open-security: Scan coverage is ${result.coverage.completeness}; results may be incomplete.\n`
         : `open-security: Cannot evaluate the failure policy: coverage is ${result.coverage.completeness}.\n`,
     );
-    return { exitCode: 2, data: result.toJSON() };
+    return { exitCode: 2, data: scanData };
   }
-  return { exitCode: blockingCount > 0 ? 1 : 0, data: result.toJSON() };
+  return { exitCode: blockingCount > 0 ? 1 : 0, data: scanData };
 }
 
 // Filesystem and OS syscall failures cannot originate from the model transport,
@@ -3306,23 +3538,47 @@ function scanFailureMessage(
   const openRouter =
     authentication?.method === "api_key" &&
     authentication.source === "OPENROUTER_API_KEY";
+  const externalApiKey =
+    authentication?.method === "api_key" &&
+    authentication.source !== "OPENAI_API_KEY" &&
+    authentication.source !== "CODEX_API_KEY";
   switch (classifyConnectionFailure(error)) {
     case "unauthorized":
-      return openRouter
-        ? "Authentication failed using OPENROUTER_API_KEY. Provide a valid OpenRouter API key."
-        : authentication?.method === "api_key"
-          ? `Authentication failed using ${authentication.source}. ` +
+      if (authentication?.method === "aws_credentials") {
+        return (
+          `Authentication failed using AWS credentials from ${authentication.source}. ` +
+          "Check your Amazon Bedrock bearer token or AWS credential chain."
+        );
+      }
+      if (openRouter) {
+        return "Authentication failed using OPENROUTER_API_KEY. Provide a valid OpenRouter API key.";
+      }
+      if (externalApiKey) {
+        return `Authentication failed using ${authentication.source}. Provide a valid provider API key.`;
+      }
+      return authentication?.method === "api_key"
+        ? `Authentication failed using ${authentication.source}. ` +
             "Your ChatGPT sign-in was not used. " +
             "Retry with '--auth chatgpt' or provide a valid API key."
-          : "Authentication failed using stored ChatGPT credentials. " +
+        : "Authentication failed using stored ChatGPT credentials. " +
             "Sign in again with 'open-security login' or provide a valid API key.";
     case "forbidden":
-      return openRouter
-        ? "OPENROUTER_API_KEY cannot access the configured OpenRouter model. Choose an available model or use a key with model access."
-        : authentication?.method === "api_key"
-          ? `The API key from ${authentication.source} cannot access the configured model. ` +
+      if (authentication?.method === "aws_credentials") {
+        return (
+          `The AWS credentials from ${authentication.source} cannot access the configured Amazon Bedrock model. ` +
+          "Check your AWS identity and Bedrock model permissions."
+        );
+      }
+      if (openRouter) {
+        return "OPENROUTER_API_KEY cannot access the configured OpenRouter model. Choose an available model or use a key with model access.";
+      }
+      if (externalApiKey) {
+        return `The API key from ${authentication.source} cannot access the configured model. Choose an available model or use a key with model access.`;
+      }
+      return authentication?.method === "api_key"
+        ? `The API key from ${authentication.source} cannot access the configured model. ` +
             "Retry with '--auth chatgpt' or use an API key with model access."
-          : "The stored ChatGPT credentials cannot access the configured model. " +
+        : "The stored ChatGPT credentials cannot access the configured model. " +
             "Use an account or API key with model access.";
     case "rate_limited":
       return "The configured account reached its rate limit. Wait and retry.";
@@ -3354,12 +3610,16 @@ function scanScope(arguments_: ScanArguments): string | null {
   return null;
 }
 
-function scanPhase(value: ScanWorkerPhase): string {
+function scanPhase(value: ScanWorkerPhase | ScanPhase): string {
   return {
+    preflight: "preflight",
+    threat_model: "building threat model",
+    discovery: "reviewing files",
     ranking: "ranking scan targets",
     file_review: "reviewing files",
     validation: "validating findings",
     attack_path: "analyzing attack paths",
+    reporting: "writing report",
   }[value];
 }
 
@@ -3539,6 +3799,7 @@ export function parseCodexOverrides(
   model?: string,
   reasoningEffort?: string,
   effort?: ModelReasoningEffort,
+  provider?: "openai" | "amazon-bedrock" | ExternalModelProvider,
 ): JsonObject {
   if (reasoningEffort !== undefined && effort !== undefined) {
     throw new CodexSecurityError(
@@ -3563,6 +3824,16 @@ export function parseCodexOverrides(
     const literal = separator < 0 ? "" : value.slice(separator + 1);
     if (key.length === 0 || literal.length === 0) {
       throw new CodexSecurityError("--codex expects KEY=VALUE");
+    }
+    if (
+      (isExternalModelProvider(provider) || provider === "amazon-bedrock") &&
+      (key === "model_provider" ||
+        key === "model_providers" ||
+        key.startsWith("model_providers."))
+    ) {
+      throw new CodexSecurityError(
+        "--provider conflicts with --codex model_provider",
+      );
     }
     if (
       Buffer.byteLength(key, "utf8") > MAX_CODEX_OVERRIDE_KEY_LENGTH ||
@@ -3612,9 +3883,25 @@ export function parseCodexOverrides(
           `${effortFlag} conflicts with --codex model_reasoning_effort`,
         );
       }
+      if (
+        (isExternalModelProvider(provider) || provider === "amazon-bedrock") &&
+        key === "model_provider"
+      ) {
+        throw new CodexSecurityError(
+          "--provider conflicts with --codex model_provider",
+        );
+      }
       throw new CodexSecurityError("Duplicate --codex key");
     }
     cursor[final] = parsed;
+  }
+  if (
+    (isExternalModelProvider(provider) || provider === "amazon-bedrock") &&
+    !("model" in result)
+  ) {
+    throw new CodexSecurityError(
+      `--model is required when using --provider ${provider}`,
+    );
   }
   return result;
 }

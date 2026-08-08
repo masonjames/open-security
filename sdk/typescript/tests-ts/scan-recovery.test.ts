@@ -248,6 +248,54 @@ async function completeScan(
 }
 
 describeScans("malformed scan artifact recovery", () => {
+  test("rejoins a headless scan after its running context changes", async () => {
+    const fixture = await startDraftScan();
+    const threadId = "context-rejoin-regression";
+    const startArguments = [
+      "start-headless-standard-scan",
+      "--thread-id",
+      threadId,
+      "--target-path",
+      fixture.repository,
+      "--scope",
+      ".",
+      "--user-context",
+      "original security focus",
+    ];
+    const created = await workbench(fixture, startArguments);
+    const scan = created["scan"] as {
+      scanId: string;
+      handoffClaimToken: string;
+      userContext: string;
+    };
+
+    const updated = await workbench(fixture, [
+      "update-scan-context",
+      "--scan-id",
+      scan.scanId,
+      "--user-context",
+      "updated security focus",
+      "--thread-id",
+      threadId,
+      "--claim-token",
+      scan.handoffClaimToken,
+    ]);
+    expect(updated["scan"]).toMatchObject({
+      scanId: scan.scanId,
+      userContext: "updated security focus",
+    });
+    expect(updated["workspace"]).toMatchObject({
+      userContext: "updated security focus",
+    });
+
+    const retried = await workbench(fixture, startArguments);
+    expect(retried["startDisposition"]).toBe("joined");
+    expect(retried["scan"]).toMatchObject({
+      scanId: scan.scanId,
+      userContext: "updated security focus",
+    });
+  });
+
   test("returns the authoritative directory snapshot contract at registration", async () => {
     const fixture = await startDraftScan();
     const registration = fixture.registration;
@@ -395,6 +443,31 @@ describeScans("malformed scan artifact recovery", () => {
     );
   });
 
+  test("preserves target-drift classification from prepared completion", async () => {
+    const fixture = await startDraftScan();
+    const source = join(fixture.repository, "src", "extract.py");
+    const original = await readFile(source, "utf8");
+    await writeFile(source, "# target changed during scan\n");
+
+    const prepared = await workbench(fixture, [
+      "prepare-scan-completion",
+      "--scan-id",
+      fixture.scanId,
+    ]);
+    const warning =
+      "Directory contents changed while the scan was running; results were saved for the original snapshot.";
+    expect(prepared["targetWarnings"]).toEqual([warning]);
+
+    await writeFile(source, original);
+    const completed = await workbench(fixture, [
+      "complete-scan",
+      "--scan-id",
+      fixture.scanId,
+    ]);
+    expect((completed["scan"] as ScanSummary).warnings).toContain(warning);
+    expect(completed["targetWarnings"]).toEqual([]);
+  });
+
   test("marks rejected prepared scans as failed without publishing completion", async () => {
     const fixture = await startDraftScan();
     await workbench(fixture, [
@@ -470,9 +543,15 @@ describeScans("malformed scan artifact recovery", () => {
 
     expect((prepared["scan"] as ScanSummary).progress.status).toBe("running");
     expect((prepared["scan"] as ScanSummary).warnings).toEqual([warning]);
-    const completed = await completeScan(fixture, false);
+    const completion = await workbench(fixture, [
+      "complete-scan",
+      "--scan-id",
+      fixture.scanId,
+    ]);
+    const completed = completion["scan"] as ScanSummary;
     expect(completed.progress.status).toBe("complete");
     expect(completed.warnings).toEqual([warning]);
+    expect(completion["targetWarnings"]).toEqual([]);
     const saved = await workbench(fixture, [
       "get-scan",
       "--scan-id",
@@ -1031,5 +1110,29 @@ describeScans("malformed scan artifact recovery", () => {
 
     await expect(completeScan(fixture)).rejects.toThrow("inventoryStrategy");
     expect(await readFile(path, "utf8")).toBe(original);
+  });
+
+  test("keeps a repairable prepare-scan-completion contract failure resumable", async () => {
+    const command = "prepare-scan-completion" as const;
+    const fixture = await startDraftScan();
+    const path = join(fixture.scanDir, "coverage.json");
+    const document = await readJson<CoverageDocument>(path);
+    const validInventoryStrategy = document.inventoryStrategy;
+    document.inventoryStrategy = "";
+    await writeJson(path, document);
+
+    await expect(
+      workbench(fixture, [command, "--scan-id", fixture.scanId]),
+    ).rejects.toThrow("inventoryStrategy");
+    const pending = await workbench(fixture, [
+      "get-scan",
+      "--scan-id",
+      fixture.scanId,
+    ]);
+    expect((pending["scan"] as ScanSummary).progress.status).toBe("running");
+
+    document.inventoryStrategy = validInventoryStrategy;
+    await writeJson(path, document);
+    expect((await completeScan(fixture)).findingCount).toBe(1);
   });
 });

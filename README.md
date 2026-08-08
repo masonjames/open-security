@@ -7,12 +7,18 @@ Open Security is a provider-flexible security scanner CLI and TypeScript SDK. It
 
 **See the [Codex Security documentation](https://learn.chatgpt.com/docs/security/cli)** for more details.
 
+Some cybersecurity requests and protected findings require approval through
+Trusted Access for Cyber. To apply or check your access, visit
+[chatgpt.com/cyber](https://chatgpt.com/cyber).
+
 ## Current provider support
 
 | Provider   | Authentication                                        | Model selection                       | Pricing source                                         |
 | ---------- | ----------------------------------------------------- | ------------------------------------- | ------------------------------------------------------ |
-| OpenRouter | `OPENROUTER_API_KEY`                                  | Explicit OpenRouter model ID          | Public `/models` and exact-model `/endpoints` catalogs |
-| OpenAI     | ChatGPT sign-in, `OPENAI_API_KEY`, or `CODEX_API_KEY` | Existing OpenAI defaults or `--model` | Built-in published rates                               |
+| OpenRouter     | `OPENROUTER_API_KEY`                                  | Explicit OpenRouter model ID          | Public `/models` and exact-model `/endpoints` catalogs |
+| Fireworks AI   | `FIREWORKS_API_KEY`                                   | Explicit Fireworks model ID           | Provider catalog                                       |
+| Amazon Bedrock | AWS credential chain or Bedrock bearer token            | Explicit Bedrock model ID             | Built-in published OpenAI model rates                  |
+| OpenAI         | ChatGPT sign-in, `OPENAI_API_KEY`, or `CODEX_API_KEY` | Existing OpenAI defaults or `--model` | Built-in published rates                               |
 
 OpenRouter uses a fixed `https://openrouter.ai/api/v1` Responses API upstream. Standard scans route the pinned Codex runtime through a temporary loopback bridge that caps oversized output reservations before forwarding them to that upstream. Codex receives a random bridge-only credential; the real OpenRouter key remains in the host process and is substituted only on the validated upstream request. Users cannot override the provider table through raw Codex settings; this keeps the authentication boundary and endpoint predictable.
 
@@ -33,6 +39,8 @@ corepack enable
 pnpm --dir sdk/typescript install --frozen-lockfile
 pnpm --dir sdk/typescript run build
 node sdk/typescript/bin/codex-security.mjs --help
+node sdk/typescript/bin/codex-security.mjs scan . --model gpt-5.6-terra --effort high
+node sdk/typescript/bin/codex-security.mjs scan . --scan-prompt-file scan.md --post-scan-prompt-file follow-up.md
 node sdk/typescript/bin/codex-security.mjs scan . --mode deep --workers 2 --subagents 0 --stop-after-no-new 3 --max-discovery-runs 10
 ```
 
@@ -41,6 +49,23 @@ The package manifest declares `open-security` as the canonical executable and pr
 For CI, set `OPENAI_API_KEY` or `CODEX_API_KEY` instead of signing in.
 Environment API keys are passed directly to the current scan and are never
 stored in Codex's credential home or system keyring.
+
+To use another inference provider, set its API key and select a model:
+
+```bash
+export OPENROUTER_API_KEY="<your-openrouter-api-key>"
+open-security scan . --provider openrouter --model anthropic/claude-sonnet-4.5
+
+export FIREWORKS_API_KEY="<your-fireworks-api-key>"
+open-security scan . --provider fireworks --model accounts/fireworks/models/qwen3-235b-a22b
+
+export AWS_BEARER_TOKEN_BEDROCK="<your-bedrock-api-key>"
+export AWS_REGION="us-east-2"
+open-security scan . --provider amazon-bedrock --model openai.gpt-5.6-luna
+```
+
+Amazon Bedrock also supports standard AWS access keys, profiles, web identity,
+container credentials, and the default AWS credential chain.
 
 Local sign-in honors Codex's configured credential backend, including a system
 keyring required by a managed device. Codex Security keeps login and scan
@@ -215,6 +240,11 @@ exports, CI behavior, and the full SDK surface.
 
 Pass `--knowledge-base PATH` to share security documents with every repository;
 repeat the option for multiple files or directories.
+
+Use `--scan-prompt-file PATH` to add shared scan instructions, and add a `prompt`
+CSV column for repository-specific instructions. Use
+`--post-scan-prompt-file PATH` to run a follow-up after each completed,
+validated scan.
 
 For complete command help, runtime defaults, native multi-agent worker limits,
 environment variables, deep-scan configuration, and SDK options, also see the

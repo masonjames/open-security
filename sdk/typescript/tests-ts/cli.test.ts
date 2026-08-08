@@ -36,7 +36,13 @@ import {
   VERSION,
 } from "../src/index.js";
 import { main, parseCodexOverrides, Progress } from "../src/cli.js";
-import { DEFAULT_CODEX_CONFIG, scanModelConfiguration } from "../src/config.js";
+import { scanPreflightCodexConfig } from "../src/api.js";
+import {
+  DEFAULT_CODEX_CONFIG,
+  FIREWORKS_CODEX_PROVIDER,
+  OPENROUTER_CODEX_PROVIDER,
+  scanModelConfiguration,
+} from "../src/config.js";
 import {
   FakeSignals,
   REDACTED_CREDENTIALS,
@@ -116,7 +122,11 @@ describe("CLI", () => {
           model: { type: "string" },
           verbose: { type: "boolean" },
           effort: { enum: ["minimal", "low", "medium", "high", "xhigh"] },
+          provider: {
+            enum: ["openai", "openrouter", "fireworks", "amazon-bedrock"],
+          },
           failOnSeverity: { enum: ["critical", "high", "medium", "low"] },
+          headless: { type: "boolean" },
         },
       },
     });
@@ -281,6 +291,18 @@ describe("CLI", () => {
     const readme = await readFile(new URL("../README.md", import.meta.url), {
       encoding: "utf8",
     });
+    const publicReadme = await readFile(
+      new URL("../../../README.md", import.meta.url),
+      { encoding: "utf8" },
+    );
+
+    for (const documentation of [readme, publicReadme]) {
+      expect(documentation).toContain(
+        "Some cybersecurity requests and protected findings require approval through\n" +
+          "Trusted Access for Cyber. To apply or check your access, visit\n" +
+          "[chatgpt.com/cyber](https://chatgpt.com/cyber).",
+      );
+    }
 
     for (const setting of [
       "OPENAI_API_KEY",
@@ -777,6 +799,80 @@ describe("CLI", () => {
     }
   });
 
+  test.each([
+    [
+      "OpenRouter",
+      "openrouter",
+      "anthropic/claude-sonnet-4.5",
+      OPENROUTER_CODEX_PROVIDER,
+    ],
+    [
+      "Fireworks AI",
+      "fireworks",
+      "accounts/fireworks/models/qwen3-235b-a22b",
+      FIREWORKS_CODEX_PROVIDER,
+    ],
+  ] as const)(
+    "routes bulk scans through %s",
+    async (_name, provider, model, _providerConfig) => {
+      const root = await mkdtemp(join(tmpdir(), `codex-security-${provider}-`));
+      try {
+        await multiscanInventory(root);
+        let config: CodexSecurityConfig | undefined;
+        const missingModelError = capture();
+        expect(
+          await main(
+            [
+              "bulk-scan",
+              "repositories.csv",
+              "--output-dir",
+              "results",
+              "--provider",
+              provider,
+            ],
+            capture().stream,
+            missingModelError.stream,
+            dependencies({
+              currentDirectory: root,
+              onConfig: (value) => (config = value),
+            }),
+          ),
+        ).toBe(2);
+        expect(missingModelError.text()).toContain(
+          `--model is required when using --provider ${provider}`,
+        );
+        expect(config).toBeUndefined();
+        expect(
+          await main(
+            [
+              "bulk-scan",
+              "repositories.csv",
+              "--output-dir",
+              "results",
+              "--provider",
+              provider,
+              "--model",
+              model,
+              "--json",
+            ],
+            capture().stream,
+            capture().stream,
+            dependencies({
+              currentDirectory: root,
+              onConfig: (value) => (config = value),
+            }),
+          ),
+        ).toBe(0);
+        expect(config).toEqual({
+          provider,
+          codexOverrides: { model },
+        });
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
+
   test("preserves the bulk-scan failure summary and redacts progress errors", async () => {
     const root = await mkdtemp(join(tmpdir(), "codex-security-cli-multiscan-"));
     try {
@@ -841,6 +937,15 @@ describe("CLI", () => {
         "openrouter",
         "--knowledge-base",
         "/shared/threat-models",
+      ],
+      ["bulk-scan", "--provider", "openrouter"],
+      ["bulk-scan", "--provider=openrouter", "--model", "openai/gpt-5.4"],
+      ["bulk-scan", "--provider", "fireworks"],
+      [
+        "bulk-scan",
+        "--provider=fireworks",
+        "--model",
+        "accounts/fireworks/models/qwen3-235b-a22b",
       ],
     ] as const) {
       const stdout = capture();
@@ -1427,6 +1532,9 @@ describe("CLI", () => {
       ["--json"],
       ["--format", "json"],
       ["--format", "jsonl"],
+      ["--headless", "--json"],
+      ["--headless", "--format", "json"],
+      ["--headless", "--format", "jsonl"],
     ]) {
       const stdout = capture();
       const stderr = capture(true);
@@ -1452,6 +1560,209 @@ describe("CLI", () => {
       expect(stderr.text()).not.toContain("\r");
       expect(timers).toBe(0);
     }
+  });
+
+  test("uses plain scan progress in headless, CI, and noninteractive terminals", async () => {
+    for (const { options, environment, isTTY } of [
+      { options: ["--headless"], environment: {}, isTTY: true },
+      { options: [], environment: { CI: "true" }, isTTY: true },
+      { options: [], environment: { TERM: "dumb" }, isTTY: true },
+      { options: [], environment: {}, isTTY: false },
+    ]) {
+      const stdout = capture();
+      const stderr = capture(isTTY);
+      const result = fakeResult([], "complete", {
+        input_tokens: 1_250,
+        cached_input_tokens: 200,
+        output_tokens: 30,
+      });
+      let timers = 0;
+      const deps = dependencies({
+        environment,
+        result,
+        costUpdates: [result.cost!],
+        scanProgress: [
+          { phase: "discovery", filesCompleted: 3, filesTotal: 8 },
+        ],
+        workerStatuses: [
+          { kind: "dispatch", phase: "file_review", planned: 2, started: 2 },
+        ],
+      });
+      deps.setInterval = () => {
+        timers += 1;
+        return {} as NodeJS.Timeout;
+      };
+
+      expect(
+        await main(
+          ["scan", ".", ...options],
+          stdout.stream,
+          stderr.stream,
+          deps,
+        ),
+      ).toBe(0);
+      expect(stderr.text()).toContain("[00:00] Preparing scan");
+      expect(stderr.text()).toContain(
+        "Scan phase: reviewing files (3/8 files).",
+      );
+      expect(stderr.text()).toContain(
+        "Scan phase: reviewing files (2 workers).",
+      );
+      expect(stderr.text()).toContain(
+        "Running scan: reviewing files | Workers: 2/2 | Files: 3/8 | Tokens: 1,250 input, 200 cached, 30 output | Cost: $0.00625",
+      );
+      expect(stderr.text()).not.toContain("CODEX SECURITY");
+      expect(stderr.text()).not.toContain("\u001B");
+      expect(stderr.text()).not.toContain("\r");
+      expect(timers).toBe(0);
+    }
+  });
+
+  test("uses plain progress when rerunning scans in CI", async () => {
+    const stdout = capture();
+    const stderr = capture(true);
+
+    expect(
+      await main(
+        ["scans", "rerun", "scan-original"],
+        stdout.stream,
+        stderr.stream,
+        dependencies({
+          environment: { CI: "true" },
+          onWorkbench: () => ({
+            recipe: {
+              repository: "/original/repository",
+              target: { kind: "repository", paths: [] },
+              mode: "standard",
+              config: {},
+            },
+          }),
+          scanProgress: [
+            { phase: "discovery", filesCompleted: 3, filesTotal: 8 },
+          ],
+        }),
+      ),
+    ).toBe(0);
+    expect(stderr.text()).toContain("[00:00] Preparing scan");
+    expect(stderr.text()).toContain("Scan phase: reviewing files (3/8 files).");
+    expect(stderr.text()).not.toContain("\u001B");
+    expect(stderr.text()).not.toContain("\r");
+  });
+
+  test("keeps terminal scans in one live dashboard", async () => {
+    const stdout = capture();
+    const stderr = capture(true);
+    const result = fakeResult([], "complete", {
+      input_tokens: 17_985,
+      cached_input_tokens: 10_496,
+      output_tokens: 236,
+    });
+
+    expect(
+      await main(
+        [
+          "scan",
+          "/code/juice-shop",
+          "--model",
+          "gpt-5.6-terra",
+          "--codex",
+          'model_reasoning_effort="low"',
+          "--max-cost",
+          "2",
+        ],
+        stdout.stream,
+        stderr.stream,
+        dependencies({
+          environment: { NO_COLOR: "1" },
+          result,
+          activities: [
+            {
+              id: "read-1",
+              kind: "command",
+              status: "running",
+              description:
+                'nl -ba "$CODEX_SECURITY_REPOSITORY/routes/login.ts"',
+              paths: ["routes/login.ts"],
+            },
+            {
+              id: "worker-1:read-1",
+              kind: "command",
+              status: "running",
+              description:
+                'rg -n "password" "$CODEX_SECURITY_REPOSITORY/routes/login.ts"',
+              paths: ["routes/login.ts"],
+              worker: 1,
+            },
+            {
+              id: "worker-1:thinking-1",
+              kind: "reasoning",
+              status: "completed",
+              description: "Following the login request into the SQL query.",
+              paths: [],
+              worker: 1,
+            },
+            {
+              id: "worker-1:message-1",
+              kind: "message",
+              status: "completed",
+              description: "The request reaches the query without validation.",
+              paths: [],
+              worker: 1,
+            },
+            {
+              id: "request-1",
+              kind: "command",
+              status: "running",
+              description:
+                'curl -H "Authorization: Bearer sk-proj-SYNTHETIC_OPENAI_VALUE_123"',
+              paths: [],
+            },
+          ],
+          costUpdates: [result.cost!],
+          scanProgress: [
+            { phase: "preflight", filesCompleted: 0, filesTotal: 1_258 },
+            { phase: "discovery", filesCompleted: 3, filesTotal: 1_258 },
+          ],
+          workerStatuses: [
+            { kind: "dispatch", phase: "file_review", planned: 6, started: 3 },
+          ],
+        }),
+      ),
+    ).toBe(0);
+
+    const text = stripVTControlCharacters(stderr.text());
+    expect(text).toContain(
+      "CODEX SECURITY  ·  juice-shop  ·  gpt-5.6-terra (low)",
+    );
+    expect(text).not.toContain("ACTIVITY");
+    expect(text).not.toContain("events · live");
+    expect(text).not.toContain("WORKERS");
+    expect(text).toContain("routes/login.ts");
+    expect(text).toMatch(/\[\d{2}:\d{2}:\d{2}\]/u);
+    expect(text).toContain(
+      'worker 1 · rg -n "password" "$CODEX_SECURITY_REPOSITORY/routes/login.ts"',
+    );
+    expect(text).toContain(
+      "worker 1 · Following the login request into the SQL query.",
+    );
+    expect(text).toContain(
+      "worker 1 · The request reaches the query without validation.",
+    );
+    expect(text).not.toContain("thinking ·");
+    expect(text).not.toContain("said ·");
+    expect(text).toContain('curl -H "Authorization: Bearer [redacted]"');
+    expect(text).not.toContain("SYNTHETIC_OPENAI_VALUE_123");
+    expect(text).not.toContain("Building the file inventory");
+    expect(text).not.toContain("Running a scan command");
+    expect(text).toContain("3 / 1,258 reviewed");
+    expect(text).not.toContain("opened");
+    expect(text).not.toContain("3 / 6 active");
+    expect(text).toContain("17,985 in · 10,496 cached · 236 out");
+    expect(text).toContain("/ $2.00");
+    expect(stderr.text()).toContain("\u001B[?1049h");
+    expect(stderr.text()).toContain("\u001B[?1049l");
+    expect(text).not.toContain("Running scan: preflight");
+    expect(text).not.toContain("Estimated cost: $0.0248865 of $2.00 limit");
   });
 
   test("rejects structured modes before starting interactive Codex commands", async () => {
@@ -1655,10 +1966,19 @@ describe("CLI", () => {
     expect(help.text()).toContain("--subagents <number>");
     expect(help.text()).toContain("--stop-after-no-new <number>");
     expect(help.text()).toContain("--max-discovery-runs <number>");
+    expect(help.text()).toContain("--headless");
+    expect(help.text()).toContain(
+      "Use plain text progress instead of the interactive dashboard.",
+    );
     expect(help.text()).toContain("--model <string>");
     expect(help.text()).toContain("open-security scan . --model gpt-5.6-terra");
-    expect(help.text()).toContain("--provider <openai|openrouter>");
+    expect(help.text()).toContain(
+      "--provider <openai|openrouter|fireworks|amazon-bedrock>",
+    );
     expect(help.text()).toContain("--reasoning-effort <string>");
+    expect(help.text()).toContain(
+      `Model to use (OpenAI default: ${DEFAULT_SCAN_MODEL_CONFIGURATION.model}).`,
+    );
     expect(help.text()).toContain("--effort <minimal|low|medium|high|xhigh>");
     expect(help.text()).toContain(
       "Model reasoning effort (default: OPEN_SECURITY_REASONING_EFFORT or provider default).",
@@ -1672,6 +1992,9 @@ describe("CLI", () => {
     );
     expect(help.text()).toContain("default: Codex Security state");
     expect(help.text()).toContain("open-security scan . --model gpt-5.6-terra");
+    expect(help.text()).toContain(
+      "open-security scan . --model gpt-5.6-terra --effort high",
+    );
     expect(help.text()).not.toContain("openai:gpt");
     expect(help.text()).not.toContain("codex-security scan . --path src,tests");
     expect(help.text()).toContain("--format <toon|json|yaml|md|jsonl>");
@@ -1691,7 +2014,9 @@ describe("CLI", () => {
     ).toBe(0);
     expect(help.text()).toContain("--model <string>");
     expect(help.text()).toContain("Model for each repository");
-    expect(help.text()).toContain("--provider <openai|openrouter>");
+    expect(help.text()).toContain(
+      "--provider <openai|openrouter|fireworks|amazon-bedrock>",
+    );
     expect(help.text()).toContain("--reasoning-effort <string>");
     expect(help.text()).toContain("--effort <minimal|low|medium|high|xhigh>");
     expect(help.text()).toContain(
@@ -1867,6 +2192,60 @@ describe("CLI", () => {
     }
   });
 
+  test.each([
+    ["openrouter", "anthropic/claude-sonnet-4.5"],
+    ["fireworks", "accounts/fireworks/models/gpt-oss-120b"],
+  ] as const)(
+    "keeps %s provider selection separate from Codex overrides",
+    async (provider, model) => {
+      let config: CodexSecurityConfig | undefined;
+      expect(
+        await main(
+          ["scan", ".", "--provider", provider, "--model", model],
+          capture().stream,
+          capture().stream,
+          dependencies({
+            environment:
+              provider === "openrouter"
+                ? { OPENROUTER_API_KEY: "synthetic-openrouter-key" }
+                : { FIREWORKS_API_KEY: "synthetic-fireworks-key" },
+            onConfig: (value) => (config = value),
+          }),
+        ),
+      ).toBe(0);
+      expect(config).toEqual({
+        provider,
+        codexOverrides: { model },
+      });
+    },
+  );
+
+  test("keeps Amazon Bedrock provider selection separate from Codex overrides", async () => {
+    let config: CodexSecurityConfig | undefined;
+    expect(
+      await main(
+        [
+          "scan",
+          ".",
+          "--provider",
+          "amazon-bedrock",
+          "--model",
+          "openai.gpt-5.6-luna",
+        ],
+        capture().stream,
+        capture().stream,
+        dependencies({
+          environment: { AWS_BEARER_TOKEN_BEDROCK: "synthetic-bedrock" },
+          onConfig: (value) => (config = value),
+        }),
+      ),
+    ).toBe(0);
+    expect(config).toEqual({
+      provider: "amazon-bedrock",
+      codexOverrides: { model: "openai.gpt-5.6-luna" },
+    });
+  });
+
   test("parses repeatable options and every scan target through Incur", async () => {
     const pathOutput = capture();
     let pathOptions: unknown;
@@ -1995,6 +2374,25 @@ describe("CLI", () => {
     expect(() => parseCodexOverrides([], undefined, "high", "medium")).toThrow(
       "--reasoning-effort and --effort cannot be used together",
     );
+
+    for (const provider of [
+      "openrouter",
+      "fireworks",
+      "amazon-bedrock",
+    ] as const) {
+      expect(() =>
+        parseCodexOverrides([], undefined, undefined, undefined, provider),
+      ).toThrow(`--model is required when using --provider ${provider}`);
+      expect(() =>
+        parseCodexOverrides(
+          ['model_provider="other"'],
+          undefined,
+          undefined,
+          undefined,
+          provider,
+        ),
+      ).toThrow("--provider conflicts with --codex model_provider");
+    }
   });
 
   test("redacts malformed and bounded --codex overrides", () => {
@@ -2085,6 +2483,14 @@ describe("CLI", () => {
         "--knowledge-base must not be empty",
       ],
       [["scan", ".", "--model="], "--model must not be empty"],
+      [
+        ["scan", ".", "--provider", "openrouter"],
+        "--model is required when using --provider openrouter",
+      ],
+      [
+        ["scan", ".", "--provider", "fireworks"],
+        "--model is required when using --provider fireworks",
+      ],
       [
         ["scan", ".", "--effort", "ultra"],
         "--effort must be minimal, low, medium, high, or xhigh",
@@ -2567,6 +2973,67 @@ describe("CLI", () => {
     expect(configuration).toContain('model="gpt-5.6-terra"');
     expect(configuration).toContain('reasoning_effort="high"');
   });
+
+  test.each([
+    [
+      "Amazon Bedrock",
+      "amazon-bedrock",
+      "openai.gpt-5.6-luna",
+      { aws: { region: "us-east-2", profile: "security-prod" } },
+      { AWS_BEARER_TOKEN_BEDROCK: "synthetic-bedrock-bearer" },
+    ],
+    [
+      "OpenRouter",
+      "openrouter",
+      "anthropic/claude-sonnet-4.5",
+      OPENROUTER_CODEX_PROVIDER,
+      { OPENROUTER_API_KEY: "synthetic-openrouter-key" },
+    ],
+    [
+      "Fireworks AI",
+      "fireworks",
+      "accounts/fireworks/models/qwen3-235b-a22b",
+      FIREWORKS_CODEX_PROVIDER,
+      { FIREWORKS_API_KEY: "synthetic-fireworks-key" },
+    ],
+  ] as const)(
+    "reruns profile-selected %s scans with their saved provider configuration",
+    async (_name, provider, model, providerConfig, environment) => {
+      const savedConfig = scanPreflightCodexConfig({
+        model_provider: "openai",
+        profile: "selected",
+        profiles: { selected: { model, model_provider: provider } },
+        model_providers: { [provider]: providerConfig },
+      });
+      let rerunConfig: CodexSecurityConfig | undefined;
+
+      expect(
+        await main(
+          ["scans", "rerun", "scan-original", "--json"],
+          capture().stream,
+          capture().stream,
+          dependencies({
+            environment,
+            onConfig: (value) => (rerunConfig = value),
+            onWorkbench: () => ({
+              recipe: {
+                repository: "/original/repository",
+                target: { kind: "repository", paths: [] },
+                mode: "standard",
+                config: savedConfig,
+              },
+            }),
+          }),
+        ),
+      ).toBe(0);
+      expect(rerunConfig?.codexOverrides).toMatchObject({
+        model_provider: "openai",
+        profile: "selected",
+        profiles: { selected: { model, model_provider: provider } },
+        model_providers: { [provider]: providerConfig },
+      });
+    },
+  );
 
   test("enables verbose diagnostics through CODEX_SECURITY_LOG_LEVEL", async () => {
     const stdout = capture();
@@ -3577,6 +4044,7 @@ describe("CLI", () => {
       cached_input_tokens: 200,
       output_tokens: 30,
     });
+    result.manifest.scan.id = "12345678-abcd-4567-abcd-1234567890ab";
     result.manifest.scan.completedAt = "2026-01-01T00:06:37Z";
 
     expect(
@@ -3588,7 +4056,8 @@ describe("CLI", () => {
       ),
     ).toBe(0);
     expect(stdout.text()).toBe("");
-    expect(stderr.text()).toContain("Scan complete");
+    expect(stderr.text()).toContain("Scan complete · 12345678");
+    expect(stderr.text()).not.toContain(result.manifest.scan.id);
     expect(stderr.text()).toContain(
       [
         `  REPORT    ${result.reportPath}`,
@@ -3688,28 +4157,65 @@ describe("CLI", () => {
     }
   });
 
-  test("prints scan completion warnings without failing the scan", async () => {
-    const stdout = capture();
-    const stderr = capture();
-    const deps = dependencies();
-    deps.createSecurity = () => ({
-      run: async (_repository, options) => {
-        options?.onWarning?.(
-          "Repository HEAD changed while the scan was running; results were saved for the original revision.",
-        );
-        return fakeResult();
-      },
-      close: async () => {},
-      preflight: async () => fakePreflight(),
-    });
+  test("fails stale scans and includes target warnings in machine-readable results", async () => {
+    for (const warning of [
+      "Repository HEAD changed while the scan was running; results were saved for the original revision.",
+      "Directory contents changed while the scan was running; results were saved for the original snapshot.",
+      "Working-tree contents changed while the scan was running; results were saved for the original snapshot.",
+      "The scanned Git repository became unavailable while the scan was running; results were saved for the original revision.",
+      "The scan target became unavailable while the scan was running; results were saved for the original revision or snapshot.",
+      "Repository HEAD changed while the scan was running; findings belong to the previous checkout.",
+      "Completed findings no longer describe the selected source tree.",
+    ]) {
+      const stdout = capture();
+      const stderr = capture();
+      const deps = dependencies();
+      deps.createSecurity = () => ({
+        run: async (_repository, options) => {
+          options?.onWarning?.(warning, { kind: "target_changed" });
+          return fakeResult();
+        },
+        close: async () => {},
+        preflight: async () => fakePreflight(),
+      });
 
-    expect(
-      await main(["scan", ".", "--json"], stdout.stream, stderr.stream, deps),
-    ).toBe(0);
-    expect(JSON.parse(stdout.text())).toEqual(fakeResult().toJSON());
-    expect(stderr.text()).toContain(
-      "open-security: warning: Repository HEAD changed while the scan was running; results were saved for the original revision.",
-    );
+      expect(
+        await main(["scan", ".", "--json"], stdout.stream, stderr.stream, deps),
+      ).toBe(2);
+      expect(JSON.parse(stdout.text())).toEqual({
+        ...fakeResult().toJSON(),
+        warnings: [warning],
+      });
+      expect(stderr.text()).toContain(`open-security: warning: ${warning}`);
+      expect(stderr.text()).toContain(
+        "Scan target changed during execution; results do not represent the current checkout.",
+      );
+    }
+  });
+
+  test("preserves non-target warnings without failing the scan", async () => {
+    for (const warning of [
+      "Recovered finding: normalized its semantic anchor.",
+      "Repository HEAD changed while the scan was running; informational retry recovered.",
+    ]) {
+      const stdout = capture();
+      const stderr = capture();
+      const deps = dependencies();
+      deps.createSecurity = () => ({
+        run: async (_repository, options) => {
+          options?.onWarning?.(warning);
+          return fakeResult();
+        },
+        close: async () => {},
+        preflight: async () => fakePreflight(),
+      });
+
+      expect(
+        await main(["scan", ".", "--json"], stdout.stream, stderr.stream, deps),
+      ).toBe(0);
+      expect(JSON.parse(stdout.text())).toEqual(fakeResult().toJSON());
+      expect(stderr.text()).toContain(`open-security: warning: ${warning}`);
+    }
   });
 
   test("emits redacted scan warnings in verbose diagnostics", async () => {
@@ -3743,6 +4249,107 @@ describe("CLI", () => {
       "open-security: warning: Repository HEAD changed during the scan: [redacted]",
     );
     expect(stderr.text()).not.toContain("SYNTHETIC_WARNING_SECRET");
+  });
+
+  test("prints granted trusted cyber access without warning or corrupting JSON scans", async () => {
+    const stdout = capture();
+    const stderr = capture();
+    const deps = dependencies();
+    deps.createSecurity = () => ({
+      run: async (_repository, options) => {
+        options?.onTrustedAccessStatus?.("granted");
+        return fakeResult();
+      },
+      close: async () => {},
+      preflight: async () => fakePreflight(),
+    });
+
+    expect(
+      await main(["scan", ".", "--json"], stdout.stream, stderr.stream, deps),
+    ).toBe(0);
+    expect(JSON.parse(stdout.text())).toEqual(fakeResult().toJSON());
+    expect(stderr.text()).toContain(
+      "open-security: ✓ Your account has Trusted Access for Cyber.\n",
+    );
+    expect(stderr.text()).not.toContain("warning:");
+  });
+
+  test("prints trusted cyber access guidance without failing or corrupting JSON scans", async () => {
+    const stdout = capture();
+    const stderr = capture();
+    const deps = dependencies();
+    deps.createSecurity = () => ({
+      run: async (_repository, options) => {
+        options?.onWarning?.(
+          "Some cybersecurity requests or findings may be refused because your account does not have Trusted Access for Cyber. Apply at https://chatgpt.com/cyber.",
+        );
+        return fakeResult();
+      },
+      close: async () => {},
+      preflight: async () => fakePreflight(),
+    });
+
+    expect(
+      await main(["scan", ".", "--json"], stdout.stream, stderr.stream, deps),
+    ).toBe(0);
+    expect(JSON.parse(stdout.text())).toEqual(fakeResult().toJSON());
+    expect(stderr.text()).toContain(
+      "open-security: warning: Some cybersecurity requests or findings may be refused because your account does not have Trusted Access for Cyber.",
+    );
+    expect(stderr.text()).toContain("Apply at https://chatgpt.com/cyber.");
+  });
+
+  test("prints unverified trusted cyber access guidance without corrupting JSON scans", async () => {
+    const stdout = capture();
+    const stderr = capture();
+    const deps = dependencies();
+    deps.createSecurity = () => ({
+      run: async (_repository, options) => {
+        options?.onWarning?.(
+          "Some cybersecurity requests or findings may be refused because your Trusted Access for Cyber status could not be verified. Check your access or apply at https://chatgpt.com/cyber.",
+        );
+        return fakeResult();
+      },
+      close: async () => {},
+      preflight: async () => fakePreflight(),
+    });
+
+    expect(
+      await main(["scan", ".", "--json"], stdout.stream, stderr.stream, deps),
+    ).toBe(0);
+    expect(JSON.parse(stdout.text())).toEqual(fakeResult().toJSON());
+    expect(stderr.text()).toContain(
+      "open-security: warning: Some cybersecurity requests or findings may be refused because your Trusted Access for Cyber status could not be verified.",
+    );
+    expect(stderr.text()).toContain(
+      "Check your access or apply at https://chatgpt.com/cyber.",
+    );
+  });
+
+  test("prints organizational trusted cyber access guidance without corrupting JSON scans", async () => {
+    for (const warning of [
+      "Some cybersecurity requests or findings may be refused because your API organization does not have Trusted Access for Cyber. Apply at https://openai.com/form/enterprise-trusted-access-for-cyber/.",
+      "Some cybersecurity requests or findings may be refused because Trusted Access for Cyber for your API organization could not be verified. Check your organization's access or apply at https://openai.com/form/enterprise-trusted-access-for-cyber/.",
+    ]) {
+      const stdout = capture();
+      const stderr = capture();
+      const deps = dependencies();
+      deps.createSecurity = () => ({
+        run: async (_repository, options) => {
+          options?.onWarning?.(warning);
+          return fakeResult();
+        },
+        close: async () => {},
+        preflight: async () => fakePreflight(),
+      });
+
+      expect(
+        await main(["scan", ".", "--json"], stdout.stream, stderr.stream, deps),
+      ).toBe(0);
+      expect(JSON.parse(stdout.text())).toEqual(fakeResult().toJSON());
+      expect(stderr.text()).toContain(`open-security: warning: ${warning}\n`);
+      expect(stderr.text()).not.toContain("chatgpt.com/cyber");
+    }
   });
 
   test("reports isolated observer failures without failing the scan", async () => {
@@ -3859,6 +4466,78 @@ describe("CLI", () => {
       "Running scan: reviewing files (src, tests)",
     );
     expect(stderr.text()).not.toContain("% complete");
+  });
+
+  test("shows live stage, files, workers, tokens, and cost without a budget", async () => {
+    const stdout = capture();
+    const stderr = capture();
+    const result = fakeResult([], "complete", {
+      input_tokens: 1_250,
+      cached_input_tokens: 200,
+      output_tokens: 30,
+    });
+
+    expect(
+      await main(
+        ["scan", ".", "--json"],
+        stdout.stream,
+        stderr.stream,
+        dependencies({
+          result,
+          costUpdates: [result.cost!],
+          scanProgress: [
+            { phase: "discovery", filesCompleted: 0, filesTotal: 8 },
+            { phase: "discovery", filesCompleted: 3, filesTotal: 8 },
+          ],
+          workerStatuses: [
+            { kind: "dispatch", phase: "file_review", planned: 6, started: 4 },
+          ],
+        }),
+      ),
+    ).toBe(0);
+    expect(JSON.parse(stdout.text())).toEqual(result.toJSON());
+    expect(stderr.text()).toContain(
+      "Tokens: 1,250 input, 200 cached, 30 output. Estimated cost: $0.00625 USD.",
+    );
+    expect(stderr.text()).toContain("Scan phase: reviewing files (0/8 files).");
+    expect(stderr.text()).toContain("Scan phase: reviewing files (3/8 files).");
+    expect(stderr.text()).toContain(
+      "Running scan: reviewing files | Workers: 4/6 | Files: 3/8 | Tokens: 1,250 input, 200 cached, 30 output | Cost: $0.00625",
+    );
+  });
+
+  test("deduplicates live file progress and reports later scan phases", async () => {
+    const stdout = capture();
+    const stderr = capture();
+    const discovery = {
+      phase: "discovery",
+      filesCompleted: 8,
+      filesTotal: 8,
+    } as const;
+
+    expect(
+      await main(
+        ["scan", ".", "--json"],
+        stdout.stream,
+        stderr.stream,
+        dependencies({
+          scanProgress: [
+            discovery,
+            discovery,
+            { phase: "validation", filesCompleted: 8, filesTotal: 8 },
+            { phase: "reporting", filesCompleted: 8, filesTotal: 8 },
+          ],
+        }),
+      ),
+    ).toBe(0);
+    expect(JSON.parse(stdout.text())).toEqual(fakeResult().toJSON());
+    expect(
+      stderr.text().match(/Scan phase: reviewing files \(8\/8 files\)/g),
+    ).toHaveLength(1);
+    expect(stderr.text()).toContain(
+      "Scan phase: validating findings (8/8 files).",
+    );
+    expect(stderr.text()).toContain("Scan phase: writing report (8/8 files).");
   });
 
   test("prints a truthful completion summary without changing JSON results", async () => {

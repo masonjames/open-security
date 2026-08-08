@@ -1,6 +1,6 @@
 {
   "name": "codex-security",
-  "version": "0.1.14",
+  "version": "0.1.15",
   "description": "Open Security workflows for provider-flexible security scans, analysis, and investigation.",
   "author": {
     "name": "Mason James"

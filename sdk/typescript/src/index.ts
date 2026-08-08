@@ -1,6 +1,7 @@
 export { CodexSecurity } from "./api.js";
 export { estimateScanCost } from "./cost.js";
 export type { ModelPricingNanodollars, ScanCost } from "./cost.js";
+export type { ScanActivity, ScanActivityStatus } from "./scan-activity.js";
 export {
   assertOpenRouterScanCapabilities,
   fetchOpenRouterModel,
@@ -26,6 +27,8 @@ export type {
   ScanPreflight,
   ScanPreflightModelCatalog,
   ScanReconnectDetails,
+  ScanTrustedAccessStatus,
+  ScanWarningDetails,
 } from "./api.js";
 export {
   DEFAULT_OPENROUTER_MAX_OUTPUT_TOKENS,
@@ -58,7 +61,12 @@ export type {
   ProviderSelection,
   ScanProvider,
 } from "./provider.js";
-export type { ScanWorkerPhase, ScanWorkerStatus } from "./worker-progress.js";
+export type {
+  ScanPhase,
+  ScanProgress,
+  ScanWorkerPhase,
+  ScanWorkerStatus,
+} from "./worker-progress.js";
 export { CodexLoginHandle } from "./auth.js";
 export type { AccountStatus, LoginResult } from "./auth.js";
 
