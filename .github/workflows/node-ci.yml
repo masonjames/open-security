@@ -117,7 +117,7 @@ jobs:
         working-directory: sdk/typescript
         run: pnpm run test
 
-      - name: Test on Windows with private ACLs
+      - name: Test supported Windows surface
         if: runner.os == 'Windows'
         timeout-minutes: 10
         working-directory: sdk/typescript
@@ -127,7 +127,24 @@ jobs:
           TMP: ${{ steps.windows-temp.outputs.path }}
           TMPDIR: ${{ steps.windows-temp.outputs.path }}
           CODEX_SECURITY_ALLOW_MACHINE_POLICY_TEST: ${{ runner.environment == 'github-hosted' && 'true' || 'false' }}
-        run: pnpm run test
+        run: |
+          set -euo pipefail
+          # Production remains fail-closed on Windows until private DACL
+          # validation is implemented. These end-to-end files require a
+          # writable private scan root, while runtime.test.ts covers the
+          # Windows rejection boundary explicitly.
+          test_files=()
+          while IFS= read -r test_file; do
+            test_files+=("$test_file")
+          done < <(
+            find ./tests-ts -type f -name '*.test.ts' \
+              ! -path './tests-ts/api-events.test.ts' \
+              ! -path './tests-ts/api.test.ts' \
+              ! -path './tests-ts/contract.test.ts' \
+              -print | sort
+          )
+          test "${#test_files[@]}" -gt 0
+          bun test --timeout 30000 "${test_files[@]}"
 
       - name: Check formatting
         run: pnpm --dir sdk/typescript run format
