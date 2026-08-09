@@ -3821,6 +3821,7 @@ describe("runtime directories and plugin Python boundary", () => {
         CODEX_SECURITY_STATE_DIR: join(root, "explicit-state"),
       }),
     ).toBe(join(root, "explicit-state"));
+    if (process.platform === "win32") return;
     const scanRoot = await preparePersistentScanRoot(
       join(root, "state"),
       "repository with spaces",
@@ -3828,9 +3829,7 @@ describe("runtime directories and plugin Python boundary", () => {
     expect(scanRoot).toBe(
       join(root, "state", "scans", "repository-with-spaces"),
     );
-    if (process.platform !== "win32") {
-      expect((await stat(scanRoot)).mode & 0o777).toBe(0o700);
-    }
+    expect((await stat(scanRoot)).mode & 0o777).toBe(0o700);
   });
 
   test("expands a tilde CODEX_HOME when discovering preflight configuration", async () => {

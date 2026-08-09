@@ -70,7 +70,7 @@ describe("TypeScript package skeleton", () => {
     }
   });
 
-  test("uses the default test timeout consistently across CI platforms", async () => {
+  test("uses the default test timeout consistently across supported CI surfaces", async () => {
     const packageJson = JSON.parse(
       await readFile(new URL("../package.json", import.meta.url), "utf8"),
     );
@@ -82,7 +82,19 @@ describe("TypeScript package skeleton", () => {
     expect(packageJson.scripts.test).toBe(
       "bun test --timeout 30000 ./tests-ts",
     );
-    expect(ciWorkflow.match(/run: pnpm run test\n/g)).toHaveLength(3);
+    expect(ciWorkflow.match(/run: pnpm run test\n/g)).toHaveLength(2);
+    expect(ciWorkflow).toContain(
+      "bun test --timeout 30000 ./tests-ts/release-automation.test.ts",
+    );
+    expect(ciWorkflow).toContain('bun test --timeout 30000 "${test_files[@]}"');
+    for (const scanDependentTest of [
+      "api-events.test.ts",
+      "api.test.ts",
+      "contract.test.ts",
+      "deep-scan-workbench.test.ts",
+    ]) {
+      expect(ciWorkflow).toContain(`! -path './tests-ts/${scanDependentTest}'`);
+    }
     expect(ciWorkflow).not.toContain("--timeout 60000");
   });
 

@@ -133,6 +133,9 @@ jobs:
           # validation is implemented. These end-to-end files require a
           # writable private scan root, while runtime.test.ts covers the
           # Windows rejection boundary explicitly.
+          # Run the Bash-heavy workflow safeguards before the broader suite so
+          # concurrent subprocess tests cannot starve the readiness probe.
+          bun test --timeout 30000 ./tests-ts/release-automation.test.ts
           test_files=()
           while IFS= read -r test_file; do
             test_files+=("$test_file")
@@ -141,6 +144,8 @@ jobs:
               ! -path './tests-ts/api-events.test.ts' \
               ! -path './tests-ts/api.test.ts' \
               ! -path './tests-ts/contract.test.ts' \
+              ! -path './tests-ts/deep-scan-workbench.test.ts' \
+              ! -path './tests-ts/release-automation.test.ts' \
               -print | sort
           )
           test "${#test_files[@]}" -gt 0
